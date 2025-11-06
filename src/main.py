@@ -9,13 +9,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import HTMLResponse
 from sqlalchemy_utils import database_exists, create_database
 
-from src.auth.manager import get_user_manager
 from src.config import settings
 from src.database import Base, engine, get_async_session
-from src.auth.auth_config import fastapi_users, auth_backend, current_user, \
-    refresh_backend, get_refresh_strategy, get_access_strategy
-from src.auth.schemas import UserRead, UserCreate, TokenPair
+from src.auth.auth_config import (fastapi_users, auth_backend, current_user,
+                                  get_access_strategy)
+from src.auth.schemas import UserRead, UserCreate
 from src.auth.models import User, Role
+from sqlalchemy import select
 
 from fastapi import Response, status
 from fastapi.responses import JSONResponse
@@ -92,31 +92,12 @@ app.add_middleware(
 auth_router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
-@auth_router.post("/refresh", response_model=TokenPair)
-async def refresh_token(
-        response: Response,
-        user: models.UP = Depends(current_user)
-):
-    # Генерируем новую пару токенов
-    access_token = await auth_backend.login(strategy=get_access_strategy(), user=user)
-    refresh_token = await refresh_backend.login(strategy=get_refresh_strategy(), user=user)
-
-    # Устанавливаем куки
-    await auth_backend.transport.get_login_response(access_token, response)
-    await refresh_backend.transport.get_login_response(refresh_token, response)
-
-    return JSONResponse(
-        status_code=status.HTTP_200_OK,
-        content={"message": "Tokens have been updated successfully!"},
-    )
-
-
 @auth_router.post("/access-token")
 async def get_access_token(
         response: Response,
         user: models.UP = Depends(current_user)
 ):
-    # Генерируем только access токен
+    # Генерируем access токен
     access_token = await auth_backend.login(strategy=get_access_strategy(), user=user)
     await auth_backend.transport.get_login_response(access_token, response)
     return JSONResponse(
@@ -130,9 +111,8 @@ async def logout(
         response: Response,
         user: models.UP = Depends(current_user),
 ):
-    # Удаляем куки с токенами
+    # Удаляем куки с токеном
     await auth_backend.transport.get_logout_response(response)
-    await refresh_backend.transport.get_logout_response(response)
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content={"message": "Successfully logged out"},
@@ -146,11 +126,7 @@ router = APIRouter(
     tags=["Authorization"]
 )
 
-
-async def is_admin(user: User = Depends(current_user), session: AsyncSession = Depends(get_async_session)
-                   ) -> bool:
-    await session.refresh(user, ["role"])  # Явно обновляем связь
-    return user.role.name == "admin"
+from sqlalchemy.orm import selectinload
 
 
 @router.get("/protected-user", response_class=HTMLResponse)
@@ -164,8 +140,22 @@ async def protected_user_route(request: Request, user: User = Depends(current_us
     )
 
 
-@router.get("/protected-admin", response_class=HTMLResponse, dependencies=[Depends(is_admin)])
-async def protected_admin_route(request: Request, user: User = Depends(current_user)):
+@router.get("/protected-admin", response_class=HTMLResponse)
+async def protected_admin_route(
+        request: Request,
+        user: User = Depends(current_user),
+        session: AsyncSession = Depends(get_async_session)
+):
+    stmt = select(Role).where(Role.id == user.role_id)
+    result = await session.execute(stmt)
+    role = result.scalar_one()
+
+    if role.name != "admin":
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"detail": "Not enough permissions"}
+        )
+
     return templates.TemplateResponse(
         "converter_for_admin.html",
         {
@@ -201,8 +191,8 @@ async def protected_user_route(request: Request, user: User = Depends(current_us
 
 
 
-@router.post("/convert-for-admin", response_class=HTMLResponse, dependencies=[Depends(is_admin)])
-async def protected_admin_route(request: Request, user: User = Depends(current_user), from_: str = Form(...), to: str = Form(...), amount: str = Form(...)):
+@router.post("/convert-for-admin", response_class=HTMLResponse)
+async def protected_admin_route(request: Request, user: User = Depends(current_user), session: AsyncSession = Depends(get_async_session), from_: str = Form(...), to: str = Form(...), amount: str = Form(...)):
     """
     :param from_:
         This option is intended for the currency we are converting.
@@ -216,6 +206,15 @@ async def protected_admin_route(request: Request, user: User = Depends(current_u
     :return:
         json response
     """
+    stmt = select(Role).where(Role.id == user.role_id)
+    result = await session.execute(stmt)
+    role = result.scalar_one()
+
+    if role.name != "admin":
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"detail": "Not enough permissions"}
+        )
     try:
         url = f"https://api.apilayer.com/currency_data/convert?to={to}&from={from_}&amount={amount}"
         headers = {"apikey": settings.CURRENCY_API_KEY}
@@ -224,15 +223,6 @@ async def protected_admin_route(request: Request, user: User = Depends(current_u
         return templates.TemplateResponse("converter_for_admin.html", {"request": request, "user": user, "result": result})
     except Exception as error:
         return templates.TemplateResponse("converter_for_admin.html", {"request": request, "error": str(error)})
-
-"""
-Если пользователь не аутентифицирован, current_user в is_admin() выбросит 401 Unauthorized;
-Затем выполняется проверка user.role.name == "admin";
-Если проверка не проходит, возвращается 403 Forbidden;
-
-FastAPI автоматически возвращает 403 Forbidden, если зависимость в dependencies=[...] вернула False.
-Это часть встроенной логики Depends() для удобства реализации RBAC (Role Based Access Control (рус. Управление доступом на основе ролей)).
-"""
 
 app.include_router(router)
 

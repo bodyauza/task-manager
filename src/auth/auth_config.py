@@ -3,8 +3,6 @@ from fastapi_users.authentication import (AuthenticationBackend,
                                           CookieTransport, JWTStrategy)
 from src.config import settings
 
-from fastapi import Request
-
 # Транспорт для access токена
 cookie_transport = CookieTransport(
     cookie_name="access_token",
@@ -13,14 +11,6 @@ cookie_transport = CookieTransport(
     cookie_httponly=True  # Защита от XSS
 )
 
-# Транспорт для refresh токена
-refresh_cookie_transport = CookieTransport(
-    cookie_name="refresh_token",
-    cookie_max_age=settings.refresh_exp,
-    cookie_secure=True,
-    cookie_httponly=True,
-    cookie_samesite="strict"  # Защита от CSRF
-)
 
 # Стратегия аутентификации для access токена (короткоживущий)
 def get_access_strategy() -> JWTStrategy:
@@ -30,39 +20,19 @@ def get_access_strategy() -> JWTStrategy:
         algorithm=settings.algorithm
     )
 
-# Стратегия аутентификации для refresh токена (долгоживущий)
-def get_refresh_strategy() -> JWTStrategy:
-    return JWTStrategy(
-        secret=settings.refresh_secret,
-        lifetime_seconds=settings.refresh_exp,
-        algorithm=settings.algorithm
-    )
-
 auth_backend = AuthenticationBackend(
     name="access_jwt",
     transport=cookie_transport,
     get_strategy=get_access_strategy,
 )
 
-refresh_backend = AuthenticationBackend(
-    name="refresh_jwt",
-    transport=refresh_cookie_transport,
-    get_strategy=get_refresh_strategy,
-)
-
-
-async def get_enabled_backends(request: Request):
-    # Для маршрутов обновления токенов используем только refresh токен
-    if request.url.path in ["/auth/refresh", "/auth/access-token", "/auth/logout"]:
-        return [refresh_backend]
-    return [auth_backend, refresh_backend]
 
 from src.auth.manager import get_user_manager
 from src.auth.models import User
 
 fastapi_users = FastAPIUsers[User, int](
     get_user_manager,
-    [auth_backend, refresh_backend],
+    [auth_backend]
 )
 
 # Создание dependency для получения текущего пользователя
@@ -70,4 +40,4 @@ fastapi_users = FastAPIUsers[User, int](
 # @router.get("/protected-route")
 # async def protected_route(user: User = Depends(current_user)):
 
-current_user = fastapi_users.current_user(active=True, get_enabled_backends=get_enabled_backends)
+current_user = fastapi_users.current_user(active=True)

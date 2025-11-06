@@ -8,10 +8,8 @@ class Settings(BaseSettings):
     app_name: str
     admin_email: str
     access_secret: str
-    refresh_secret: str
     algorithm: str
     access_exp: int
-    refresh_exp: int
 
     reset_password_secret: str
     email_verification_secret: str

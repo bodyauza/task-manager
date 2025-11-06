@@ -1,6 +1,7 @@
 from datetime import datetime
 from fastapi_users_db_sqlalchemy import SQLAlchemyBaseUserTable
 from sqlalchemy import JSON, TIMESTAMP, Boolean, ForeignKey, Integer, String
+from sqlalchemy import ARRAY, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from src.database import Base
 
@@ -9,7 +10,8 @@ class Role(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
-    permissions: Mapped[dict] = mapped_column(JSON)
+    # Для PostgreSQL. Пример: {"authorization", "access to the currency conversion page for users"}
+    permissions: Mapped[list[str]] = mapped_column(ARRAY(String(100)))
 
 
 class User(SQLAlchemyBaseUserTable[int], Base):
