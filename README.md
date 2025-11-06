@@ -116,3 +116,30 @@ uvicorn main:app --reload
 ```
 
 Access the interactive Swagger UI documentation at: [http://localhost:8000/docs](http://localhost:8000/docs)
+
+### 7. To run all tests of the project, run the command:
+```
+pytest
+```
+#### Additional useful commands:
+
+Run tests from a specific file:
+```
+pytest tests/test_main.py
+```
+Stop on the first failed test:
+```
+pytest -x
+```
+Rerun only failed tests:
+```
+pytest --lf
+```
+Run tests changed since the last commit (if `pytest-xdist` is installed):
+```
+pytest --last-failed
+```
+Run tests with execution time measurements:
+```
+pytest --durations=5
+```
