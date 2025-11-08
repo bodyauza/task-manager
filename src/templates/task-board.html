@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Task Manager - Real-Time App</title>
+    <style>
+        /* Сброс стандартных отступов и установка box-sizing для всех элементов */
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+
+        /* Основные стили для body */
+        body {
+            background-color: #f5f5f5;
+            color: #333;
+            line-height: 1.6;
+            padding: 20px;
+        }
+
+        /* Контейнер с сеткой для расположения элементов */
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        /* Адаптивность для мобильных устройств */
+        @media (max-width: 768px) {
+            .container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Стили для карточек */
+        .card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        /* Стили для заголовков */
+        h1, h2, h3 {
+            color: #2c3e50;
+            margin-bottom: 15px;
+        }
+
+        /* Специфичный стиль для главного заголовка */
+        h1 {
+            text-align: center;
+            grid-column: 1 / -1;
+        }
+
+        /* Группа формы с отступом снизу */
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        /* Стили для меток */
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 600;
+        }
+
+        /* Стили для полей ввода и текстовых областей */
+        input[type="text"],
+        textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+
+        /* Специфичные стили для текстовых областей */
+        textarea {
+            min-height: 100px;
+            resize: vertical;
+        }
+
+        /* Базовые стили для кнопок */
+        button {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background-color 0.3s;
+        }
+
+        /* Эффект при наведении на кнопку */
+        button:hover {
+            background-color: #2980b9;
+        }
+
+        /* Стили для кнопки удаления */
+        button.delete {
+            background-color: #e74c3c;
+        }
+
+        button.delete:hover {
+            background-color: #c0392b;
+        }
+
+        /* Стили для кнопки обновления */
+        button.update {
+            background-color: #f39c12;
+        }
+
+        button.update:hover {
+            background-color: #d35400;
+        }
+
+        /* Стили для списка задач */
+        .task-list {
+            list-style: none;
+        }
+
+        /* Стили для элемента задачи */
+        .task-item {
+            border: 1px solid #eee;
+            border-radius: 4px;
+            padding: 15px;
+            margin-bottom: 10px;
+            background-color: #f9f9f9;
+        }
+
+        /* Стили для завершенной задачи */
+        .task-item.completed {
+            background-color: #d4edda;
+            border-color: #c3e6cb;
+        }
+
+        /* Заголовок задачи с flexbox для выравнивания */
+        .task-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        /* Стили для названия задачи */
+        .task-title {
+            font-weight: bold;
+            font-size: 18px;
+        }
+
+        /* Стили для статуса задачи */
+        .task-status {
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        /* Стили для статуса "завершено" */
+        .status-completed {
+            background-color: #28a745;
+            color: white;
+        }
+
+        /* Стили для статуса "в процессе" */
+        .status-pending {
+            background-color: #ffc107;
+            color: #212529;
+        }
+
+        /* Контейнер для кнопок действий с задачей */
+        .task-actions {
+            display: flex;
+            gap: 5px;
+            margin-top: 10px;
+        }
+
+        /* Стили для кнопок действий */
+        .task-actions button {
+            padding: 5px 10px;
+            font-size: 14px;
+        }
+
+        /* Стили для пагинации */
+        .pagination {
+            display: flex;
+            justify-content: center;
+            margin-top: 15px;
+            gap: 5px;
+        }
+
+        .pagination button {
+            padding: 5px 10px;
+        }
+
+        /* Стиль для активной кнопки пагинации */
+        .pagination button.active {
+            background-color: #2c3e50;
+        }
+
+        /* Стили для области сообщений WebSocket */
+        #messages {
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            height: 200px;
+            overflow-y: auto;
+            padding: 10px;
+            background-color: #f8f9fa;
+            margin-bottom: 15px;
+        }
+
+        /* Стили для отдельного сообщения */
+        .message {
+            padding: 5px 0;
+            border-bottom: 1px solid #eee;
+        }
+
+        /* Убираем границу у последнего сообщения */
+        .message:last-child {
+            border-bottom: none;
+        }
+
+        /* Общие стили для статуса соединения */
+        .connection-status {
+            padding: 8px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+            text-align: center;
+            font-weight: bold;
+        }
+
+        /* Стили для статуса "подключено" */
+        .status-connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+
+        /* Стили для статуса "отключено" */
+        .status-disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+
+        /* Стили для статуса "подключается" */
+        .status-connecting {
+            background-color: #fff3cd;
+            color: #856404;
+        }
+
+        /* Стили для кнопки очистки истории */
+        button.clear-history {
+            background-color: #6c757d;
+            margin-top: 10px;
+        }
+
+        button.clear-history:hover {
+            background-color: #5a6268;
+        }
+    </style>
+</head>
+<body>
+    <!-- ИЗМЕНЕНИЕ 1: Добавляем скрытый элемент для передачи user.id из шаблона в JavaScript -->
+    <input type="hidden" id="userId" value="{{ user }}">
+
+    <!-- Основной контейнер с сеткой -->
+    <div class="container">
+        <!-- Главный заголовок -->
+        <h1>Task Manager - Real-Time App</h1>
+
+        <!-- Карточка WebSocket соединения -->
+        <div class="card">
+            <h2>WebSocket Connection</h2>
+            <!-- Элемент для отображения статуса соединения -->
+            <div id="status" class="connection-status status-connecting">Status: Connecting...</div>
+            <!-- Контейнер для отображения сообщений WebSocket -->
+            <div id="messages"></div>
+            <!-- Форма для отправки сообщений через WebSocket -->
+            <div class="form-group">
+                <input type="text" id="messageInput" placeholder="Введите сообщение для WebSocket">
+                <button onclick="sendMessage()">Отправить сообщение</button>
+            </div>
+            <!-- Кнопка для очистки истории чата -->
+            <div class="form-group">
+                <button class="clear-history" onclick="clearChatHistory()">Очистить историю чата</button>
+            </div>
+        </div>
+
+        <!-- Карточка создания новой задачи -->
+        <div class="card">
+            <h2>Create New Task</h2>
+            <!-- Форма для создания задачи -->
+            <form id="createTaskForm">
+                <div class="form-group">
+                    <label for="title">Title:</label>
+                    <input type="text" id="title" required>
+                </div>
+                <div class="form-group">
+                    <label for="description">Description:</label>
+                    <textarea id="description" required></textarea>
+                </div>
+                <button type="submit">Create Task</button>
+            </form>
+        </div>
+
+        <!-- Карточка получения задачи по ID -->
+        <div class="card">
+            <h2>Get Task by ID</h2>
+            <!-- Форма для ввода ID задачи -->
+            <div class="form-group">
+                <input type="number" id="taskIdInput" placeholder="Enter task ID">
+                <button onclick="getTaskById()">Get Task</button>
+            </div>
+            <!-- Контейнер для отображения результата -->
+            <div id="singleTaskResult"></div>
+        </div>
+
+        <!-- Карточка списка задач с пагинацией -->
+        <div class="card">
+            <h2>Task List</h2>
+            <!-- Кнопка загрузки задач -->
+            <div class="form-group">
+                <button onclick="loadTasks()">Load Tasks</button>
+            </div>
+            <!-- Контейнер для отображения списка задач -->
+            <div id="taskList"></div>
+            <!-- Контейнер для пагинации -->
+            <div id="pagination" class="pagination"></div>
+        </div>
+    </div>
+
+    <script>
+        // ИЗМЕНЕНИЕ 2: Получаем user.id из скрытого поля, переданного из шаблона
+        const userId = document.getElementById('userId').value;
+
+        // Переменная для хранения WebSocket соединения
+        let socket;
+        // Получаем ссылки на DOM элементы
+        const messagesDiv = document.getElementById("messages");
+        const statusDiv = document.getElementById("status");
+        // Переменные для пагинации
+        let currentPage = 1;
+        const tasksPerPage = 5;
+        // Ключ для хранения истории чата в LocalStorage
+        const CHAT_HISTORY_KEY = 'websocket_chat_history';
+
+        // Функция загрузки истории чата из LocalStorage
+        function loadChatHistory() {
+            try {
+                // Получаем историю чата из LocalStorage
+                const savedHistory = localStorage.getItem(CHAT_HISTORY_KEY);
+                if (savedHistory) {
+                    // Парсим сохраненную историю
+                    const history = JSON.parse(savedHistory);
+                    // Очищаем текущие сообщения
+                    messagesDiv.innerHTML = '';
+                    // Добавляем каждое сообщение из истории
+                    history.forEach(message => {
+                        addMessageToDisplay(message);
+                    });
+                    console.log('История чата загружена из LocalStorage');
+                }
+            } catch (error) {
+                console.error('Ошибка при загрузке истории чата:', error);
+            }
+        }
+
+        // Функция сохранения истории чата в LocalStorage
+        function saveChatHistory() {
+            try {
+                // Собираем все текущие сообщения
+                const messageElements = messagesDiv.querySelectorAll('.message');
+                const messages = Array.from(messageElements).map(el => el.textContent);
+                // Сохраняем в LocalStorage
+                localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(messages));
+            } catch (error) {
+                console.error('Ошибка при сохранении истории чата:', error);
+            }
+        }
+
+        // Функция очистки истории чата
+        function clearChatHistory() {
+            // Очищаем LocalStorage
+            localStorage.removeItem(CHAT_HISTORY_KEY);
+            // Очищаем отображение сообщений
+            messagesDiv.innerHTML = '';
+            console.log('История чата очищена');
+        }
+
+        // Функция добавления сообщения в отображение (без сохранения)
+        function addMessageToDisplay(message) {
+            const messageElement = document.createElement("div");
+            messageElement.className = "message";
+            messageElement.textContent = message;
+            messagesDiv.appendChild(messageElement);
+            // Прокручиваем к последнему сообщению
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        // Функция добавления сообщения в чат и сохранения в историю
+        function addMessage(message) {
+            // Добавляем сообщение в отображение
+            addMessageToDisplay(message);
+            // Сохраняем обновленную историю
+            saveChatHistory();
+        }
+
+        // Функция подключения к WebSocket серверу
+        function connectWebSocket() {
+            try {
+                // ИЗМЕНЕНИЕ 3: Используем динамический user.id вместо фиксированного "1"
+                socket = new WebSocket(`ws://localhost:8000/ws/tasks/${userId}`);
+
+                // Обработчик события открытия соединения
+                socket.onopen = function(event) {
+                    statusDiv.textContent = "Status: Connected";
+                    statusDiv.className = "connection-status status-connected";
+                    addMessage("System: Connected to server");
+                };
+
+                // Обработчик входящих сообщений от сервера
+                socket.onmessage = function(event) {
+                    addMessage("Server: " + event.data);
+                };
+
+                // Обработчик закрытия соединения
+                socket.onclose = function(event) {
+                    statusDiv.textContent = "Status: Disconnected";
+                    statusDiv.className = "connection-status status-disconnected";
+                    // Добавляем сообщение о разрыве соединения
+                    addMessage("System: Connection closed");
+                    clearChatHistory();
+                    console.log('Соединение закрыто, история удалена');
+                    setTimeout(connectWebSocket, 3000);
+                };
+
+                // Обработчик ошибок соединения
+                socket.onerror = function(error) {
+                    statusDiv.textContent = "Status: Error";
+                    statusDiv.className = "connection-status status-disconnected";
+                    addMessage("System: Connection error");
+                };
+
+            } catch (error) {
+                addMessage("System: Failed to connect - " + error);
+                // Попробовать переподключиться через 3 секунды при ошибке
+                setTimeout(connectWebSocket, 3000);
+            }
+        }
+
+        // Функция отправки сообщения через WebSocket
+        function sendMessage() {
+            const messageInput = document.getElementById("messageInput");
+            const message = messageInput.value.trim();
+
+            if (message && socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(message);
+                addMessage("You: " + message);
+                messageInput.value = "";
+            } else if (!message) {
+                alert("Please enter a message");
+            } else {
+                alert("WebSocket is not connected");
+            }
+        }
+
+        // Базовый URL API
+        const apiBase = 'http://localhost:8000';
+
+        // Обработчик отправки формы создания задачи
+        document.getElementById('createTaskForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+
+            // Получаем значения из формы
+            const title = document.getElementById('title').value;
+            const description = document.getElementById('description').value;
+
+            try {
+                // Отправляем POST запрос для создания задачи
+                const response = await fetch(`${apiBase}/create-task/`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        title: title,
+                        description: description
+                    })
+                });
+
+                if (response.ok) {
+                    const task = await response.json();
+                    addMessage(`Task created: ${task.title}`);
+                    // Очищаем форму
+                    document.getElementById('createTaskForm').reset();
+                    // Обновляем список задач
+                    loadTasks();
+                } else {
+                    const error = await response.json();
+                    alert(`Error creating task: ${error.detail}`);
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Failed to create task');
+            }
+        });
+
+        // Функция получения задачи по ID
+        async function getTaskById() {
+            const taskId = document.getElementById('taskIdInput').value;
+
+            if (!taskId) {
+                alert('Please enter a task ID');
+                return;
+            }
+
+            try {
+                // Отправляем GET запрос для получения задачи по ID
+                const response = await fetch(`${apiBase}/tasks/${taskId}`);
+
+                if (response.ok) {
+                    const task = await response.json();
+                    displaySingleTask(task);
+                } else if (response.status === 404) {
+                    document.getElementById('singleTaskResult').innerHTML = '<p>Task not found</p>';
+                } else {
+                    const error = await response.json();
+                    alert(`Error: ${error.detail}`);
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Failed to fetch task');
+            }
+        }
+
+        // Функция отображения одной задачи
+        function displaySingleTask(task) {
+            const taskElement = document.createElement('div');
+            taskElement.className = `task-item ${task.completed ? 'completed' : ''}`;
+            taskElement.innerHTML = `
+                <div class="task-header">
+                    <div class="task-title">${task.title}</div>
+                    <span class="task-status ${task.completed ? 'status-completed' : 'status-pending'}">
+                        ${task.completed ? 'Completed' : 'Pending'}
+                    </span>
+                </div>
+                <div class="task-description">${task.description}</div>
+                <div class="task-actions">
+                    <button class="update" onclick="updateTaskPrompt(${task.id}, '${task.title}', '${task.description}', ${task.completed})">Update</button>
+                    <button class="delete" onclick="deleteTask(${task.id})">Delete</button>
+                </div>
+            `;
+
+            document.getElementById('singleTaskResult').innerHTML = '';
+            document.getElementById('singleTaskResult').appendChild(taskElement);
+        }
+
+        // Функция загрузки задач с пагинацией
+        async function loadTasks(page = 1) {
+            currentPage = page;
+            // Вычисляем сколько задач пропустить
+            const skip = (page - 1) * tasksPerPage;
+
+            try {
+                // Отправляем GET запрос для получения списка задач
+                const response = await fetch(`${apiBase}/tasks/?skip=${skip}&limit=${tasksPerPage}`);
+
+                if (response.ok) {
+                    const tasks = await response.json();
+                    displayTasks(tasks);
+                    updatePagination();
+                } else {
+                    const error = await response.json();
+                    alert(`Error loading tasks: ${error.detail}`);
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Failed to load tasks');
+            }
+        }
+
+        // Функция отображения списка задач
+        function displayTasks(tasks) {
+            const taskList = document.getElementById('taskList');
+            taskList.innerHTML = '';
+
+            if (tasks.length === 0) {
+                taskList.innerHTML = '<p>No tasks found</p>';
+                return;
+            }
+
+            const taskListElement = document.createElement('ul');
+            taskListElement.className = 'task-list';
+
+            // Создаем HTML для каждой задачи
+            tasks.forEach(task => {
+                const taskItem = document.createElement('li');
+                taskItem.className = `task-item ${task.completed ? 'completed' : ''}`;
+                taskItem.innerHTML = `
+                    <div class="task-header">
+                        <div class="task-title">${task.title}</div>
+                        <span class="task-status ${task.completed ? 'status-completed' : 'status-pending'}">
+                            ${task.completed ? 'Completed' : 'Pending'}
+                        </span>
+                    </div>
+                    <div class="task-description">${task.description}</div>
+                    <div class="task-actions">
+                        <button class="update" onclick="updateTaskPrompt(${task.id}, '${task.title}', '${task.description}', ${task.completed})">Update</button>
+                        <button class="delete" onclick="deleteTask(${task.id})">Delete</button>
+                    </div>
+                `;
+                taskListElement.appendChild(taskItem);
+            });
+
+            taskList.appendChild(taskListElement);
+        }
+
+        // Функция обновления пагинации
+        function updatePagination() {
+            // В реальном приложении здесь нужно получать общее количество задач из API
+            const pagination = document.getElementById('pagination');
+            pagination.innerHTML = '';
+
+            // Создаем кнопки пагинации (для демонстрации 3 страницы)
+            for (let i = 1; i <= 3; i++) {
+                const pageButton = document.createElement('button');
+                pageButton.textContent = i;
+                pageButton.className = i === currentPage ? 'active' : '';
+                pageButton.onclick = () => loadTasks(i);
+                pagination.appendChild(pageButton);
+            }
+        }
+
+        // Функция для запроса данных обновления через prompt
+        function updateTaskPrompt(id, currentTitle, currentDescription, currentCompleted) {
+            const newTitle = prompt('Enter new title:', currentTitle);
+            if (newTitle === null) return;
+
+            const newDescription = prompt('Enter new description:', currentDescription);
+            if (newDescription === null) return;
+
+            const newCompleted = confirm('Is the task completed?');
+
+            updateTask(id, newTitle, newDescription, newCompleted);
+        }
+
+        // Функция обновления задачи
+        async function updateTask(id, title, description, completed) {
+            try {
+                // Отправляем PUT запрос для обновления задачи
+                const response = await fetch(`${apiBase}/update-task/${id}`, {
+                    method: 'PUT',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        title: title,
+                        description: description,
+                        completed: completed
+                    })
+                });
+
+                if (response.ok) {
+                    const task = await response.json();
+                    addMessage(`Task updated: ${task.title}`);
+                    // Обновляем отображение
+                    loadTasks(currentPage);
+                    // Если просматриваем эту задачу, обновляем и её
+                    if (document.getElementById('taskIdInput').value == id) {
+                        getTaskById();
+                    }
+                } else {
+                    const error = await response.json();
+                    alert(`Error updating task: ${error.detail}`);
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Failed to update task');
+            }
+        }
+
+        // Функция удаления задачи
+        async function deleteTask(id) {
+            if (!confirm('Are you sure you want to delete this task?')) {
+                return;
+            }
+
+            try {
+                // Отправляем DELETE запрос для удаления задачи
+                const response = await fetch(`${apiBase}/delete-task/${id}`, {
+                    method: 'DELETE'
+                });
+
+                if (response.ok) {
+                    const task = await response.json();
+                    addMessage(`Task deleted: ${task.title}`);
+                    // Обновляем отображение
+                    loadTasks(currentPage);
+                    document.getElementById('singleTaskResult').innerHTML = '';
+                } else {
+                    const error = await response.json();
+                    alert(`Error deleting task: ${error.detail}`);
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Failed to delete task');
+            }
+        }
+
+        // Инициализация при загрузке страницы
+        window.addEventListener('load', function() {
+            // Загружаем историю чата из LocalStorage
+            loadChatHistory();
+            // Подключаемся к WebSocket
+            connectWebSocket();
+            // Загружаем задачи
+            loadTasks(1);
+
+            // Обработчик Enter для отправки сообщений
+            document.getElementById("messageInput").addEventListener("keypress", function(event) {
+                if (event.key === "Enter") {
+                    sendMessage();
+                }
+            });
+
+            // Обработчик Enter для поиска задачи по ID
+            document.getElementById("taskIdInput").addEventListener("keypress", function(event) {
+                if (event.key === "Enter") {
+                    getTaskById();
+                }
+            });
+
+            // Обработчик перед закрытием страницы
+            window.addEventListener('beforeunload', function() {
+                // Сохраняем историю перед закрытием страницы
+                saveChatHistory();
+            });
+        });
+    </script>
+</body>
+</html>

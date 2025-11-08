@@ -3,21 +3,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Form, Depends, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy_utils import database_exists, create_database
 from sqlalchemy import select
 from starlette.responses import HTMLResponse
 
+from src.auth.endpoints import auth_router
 from src.auth.user_schemas import UserRead, UserCreate
 from src.database import Base, engine, get_async_session
-from src.auth.auth_config import (fastapi_users, auth_backend, current_user,
-                                  get_access_strategy)
+from src.auth.auth_config import (fastapi_users, auth_backend, current_user)
 from src.auth.models import User, Task
-
-from fastapi import Response, status
-from fastapi.responses import JSONResponse
-from fastapi_users import models
 
 from typing import List, Set
 
@@ -27,14 +21,7 @@ from src.task_logic.task_schemas import TaskResponse, TaskCreate, TaskUpdate
 
 templates = Jinja2Templates(directory="templates")
 
-async def create_clients_db():
-    print("До create_all:", Base.metadata.tables.keys())
-    sync_url = engine.url.set(drivername="postgresql+psycopg2")
-    sync_engine = create_engine(sync_url)
-
-    if not database_exists(sync_engine.url):
-        create_database(sync_engine.url)
-    sync_engine.dispose()  # закрываем синхронное соединение
+async def create_tables():
     try:
         async with engine.begin() as conn:
             # Синхронно создает все таблицы из моделей, наследующих Base
@@ -47,7 +34,7 @@ async def create_clients_db():
 # Инициализация FastAPI с lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await create_clients_db()
+    await create_tables()
     yield
 
 app = FastAPI(
@@ -89,52 +76,21 @@ app.add_middleware(
                    "Authorization"],
 )
 
-
 # Добавляем новые маршруты для работы с токенами
-auth_router = APIRouter(prefix="/auth", tags=["Authentication"])
-
-
-@auth_router.post("/access-token")
-async def get_access_token(
-        response: Response,
-        user: models.UP = Depends(current_user)
-):
-    # Генерируем access токен
-    access_token = await auth_backend.login(strategy=get_access_strategy(), user=user)
-    await auth_backend.transport.get_login_response(access_token, response)
-    return JSONResponse(
-        status_code=status.HTTP_200_OK,
-        content={"message": "Access token successfully updated!"},
-    )
-
-
-@auth_router.post("/logout")
-async def logout(
-        response: Response,
-        user: models.UP = Depends(current_user),
-):
-    # Удаляем куки с токеном
-    await auth_backend.transport.get_logout_response(response)
-    return JSONResponse(
-        status_code=status.HTTP_200_OK,
-        content={"message": "Successfully logged out"},
-    )
-
-
 app.include_router(auth_router)
 
-# Добавляем новые маршруты для авторизации
+# Добавляем новые маршруты для работы с задачами
 router = APIRouter(
-    tags=["Authorization"]
+    tags=["Working with tasks"]
 )
 
 
 """
-- `GET /api/v1/tasks/`: Получение списка задач (защищённая конечная точка).
-- `POST /api/v1/tasks/`: Создание новой задачи (защищённая конечная точка).
-- `GET /api/v1/tasks/{task_id}`: Получить определённую задачу (защищённая конечная точка).
-- `PUT /api/v1/tasks/{task_id}`: Обновить определённую задачу (защищённая конечная точка).
-- `DELETE /api/v1/tasks/{task_id}`: Удалить определённую задачу (защищённая конечная точка).
+- `GET http://localhost:8000/tasks/`: Получение списка задач (защищённая конечная точка).
+- `POST http://localhost:8000/create-task/`: Создание новой задачи (защищённая конечная точка).
+- `GET http://localhost:8000/tasks/{task_id}`: Получить определённую задачу (защищённая конечная точка).
+- `PUT http://localhost:8000/update-task/{task_id}`: Обновить определённую задачу (защищённая конечная точка).
+- `DELETE http://localhost:8000/delete-task/{task_id}`: Удалить определённую задачу (защищённая конечная точка).
 
 WebSocket — протокол связи поверх TCP-соединения (см. Модель OSI), предназначенный для обмена сообщениями между браузером и веб-сервером,
 используя постоянное соединение:
@@ -181,17 +137,18 @@ INFO:     127.0.0.1:2310 - "GET /websocket-test HTTP/1.1" 200 OK
 INFO:     ('127.0.0.1', 3897) - "WebSocket /ws/tasks/1" [accepted]
 INFO:     connection open
 """
-@router.get("/websocket-test", response_class=HTMLResponse)
-async def protected_user_route(request: Request):
+@router.get("/task-board", response_class=HTMLResponse)
+async def protected_user_route(request: Request, user: User = Depends(current_user)):
     return templates.TemplateResponse(
-        "websocket_conn.html",
+        "task-board.html",
         {
-            "request": request
+            "request": request,
+            "user": user.id
         }
     )
 
 # Создание новой задачи
-@router.post("/tasks/", response_model=TaskResponse)
+@router.post("/create-task/", response_model=TaskResponse)
 async def create_task(task: TaskCreate, user: User = Depends(current_user), db: AsyncSession = Depends(get_async_session)):
     # Создаем объект задачи, добавляя ID владельца
     db_task = Task(**task.model_dump(), owner_id=user.id)
@@ -227,7 +184,7 @@ async def read_task(task_id: int, db: AsyncSession = Depends(get_async_session))
     return task
 
 # Обновление задачи
-@router.put("/tasks/{task_id}", response_model=TaskResponse)
+@router.put("/update-task/{task_id}", response_model=TaskResponse)
 async def update_task(task_id: int, task_update: TaskUpdate, db: AsyncSession = Depends(get_async_session)):
     # Поиск задачи для обновления
     stmt = select(Task).where(Task.id == task_id)
@@ -249,7 +206,7 @@ async def update_task(task_id: int, task_update: TaskUpdate, db: AsyncSession = 
     return db_task
 
 # Удаление задачи
-@router.delete("/tasks/{task_id}", response_model=TaskResponse)
+@router.delete("/delete-task/{task_id}", response_model=TaskResponse)
 async def delete_task(task_id: int, db: AsyncSession = Depends(get_async_session)):
     # Поиск задачи для удаления
     stmt = select(Task).where(Task.id == task_id)

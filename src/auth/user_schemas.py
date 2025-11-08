@@ -1,7 +1,6 @@
 from typing import Optional
 
 from fastapi_users import schemas
-from pydantic import BaseModel
 
 # Модели Pydantic для автоматической валидации получаемых данных (DTO).
 
