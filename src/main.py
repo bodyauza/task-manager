@@ -1,33 +1,35 @@
 from contextlib import asynccontextmanager
 
-import requests
 from fastapi import FastAPI, Request, Form, Depends, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession
-from starlette.responses import HTMLResponse
 from sqlalchemy_utils import database_exists, create_database
+from sqlalchemy import select
+from starlette.responses import HTMLResponse
 
-from src.config import settings
+from src.auth.user_schemas import UserRead, UserCreate
 from src.database import Base, engine, get_async_session
 from src.auth.auth_config import (fastapi_users, auth_backend, current_user,
                                   get_access_strategy)
-from src.auth.schemas import UserRead, UserCreate
-from src.auth.models import User, Role
-from sqlalchemy import select
+from src.auth.models import User, Task
 
 from fastapi import Response, status
 from fastapi.responses import JSONResponse
 from fastapi_users import models
 
+from typing import List, Set
+
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+
+from src.task_logic.task_schemas import TaskResponse, TaskCreate, TaskUpdate
 
 templates = Jinja2Templates(directory="templates")
 
 async def create_clients_db():
     print("До create_all:", Base.metadata.tables.keys())
-    # Создаем временный синхронный движок для проверки/создания БД
-    sync_url = engine.url.set(drivername="postgresql+psycopg2")  # меняем на синхронный драйвер
+    sync_url = engine.url.set(drivername="postgresql+psycopg2")
     sync_engine = create_engine(sync_url)
 
     if not database_exists(sync_engine.url):
@@ -121,112 +123,152 @@ async def logout(
 
 app.include_router(auth_router)
 
-
+# Добавляем новые маршруты для авторизации
 router = APIRouter(
     tags=["Authorization"]
 )
 
-from sqlalchemy.orm import selectinload
 
+"""
+- `GET /api/v1/tasks/`: Получение списка задач (защищённая конечная точка).
+- `POST /api/v1/tasks/`: Создание новой задачи (защищённая конечная точка).
+- `GET /api/v1/tasks/{task_id}`: Получить определённую задачу (защищённая конечная точка).
+- `PUT /api/v1/tasks/{task_id}`: Обновить определённую задачу (защищённая конечная точка).
+- `DELETE /api/v1/tasks/{task_id}`: Удалить определённую задачу (защищённая конечная точка).
 
-@router.get("/protected-user", response_class=HTMLResponse)
-async def protected_user_route(request: Request, user: User = Depends(current_user)):
+WebSocket — протокол связи поверх TCP-соединения (см. Модель OSI), предназначенный для обмена сообщениями между браузером и веб-сервером,
+используя постоянное соединение:
+
+  - Использует собственный протокол `ws://` или `wss://` поверх TCP-соединения.
+  - Соединение остается открытым, позволяя серверу и клиенту обмениваться данными в реальном времени без повторных запросов.
+  - Сервер может самостоятельно инициировать отправку данных клиенту (например, уведомления, чаты, онлайн-игры).
+  - Данные передаются в виде кадров (frames) с минимальными накладными расходами.
+"""
+
+# Множество для хранения активных WebSocket подключений
+active_connections: Set[WebSocket] = set()
+
+# Функция для отправки сообщения всем подписанным пользователям
+async def publish_message(client_id, message):
+    for connection in active_connections:
+        await connection.send_text(f"Client with {client_id} wrote {message}!")
+
+# Для получения обновлений статуса задачи в режиме реального времени
+# используйте WebSocket-подключения к `"ws://localhost:8000/ws/tasks/{client_id}`.
+# Пример клиентской стороны для подписки на обновление статуса задачи:
+# const socket = new WebSocket("ws://localhost:8000/ws/tasks/{client_id}")
+@app.websocket("/ws/tasks/{client_id}")
+async def websocket_endpoint(client_id: int, websocket: WebSocket):
+    # Принимаем WebSocket соединение
+    await websocket.accept()
+    # Добавляем соединение в множество активных
+    active_connections.add(websocket)
+    try:
+        # Бесконечный цикл для приема сообщений от клиента
+        while True:
+            # Ожидаем текстовое сообщение от клиента
+            message = await websocket.receive_text()
+            # Рассылаем сообщение всем подключенным клиентам
+            await publish_message(client_id, message)
+    except WebSocketDisconnect:
+        # При отключении клиента удаляем его из активных соединений
+        active_connections.remove(websocket)
+
+"""
+Тест подключения к WebSocket:
+
+INFO:     127.0.0.1:2310 - "GET /websocket-test HTTP/1.1" 200 OK
+INFO:     ('127.0.0.1', 3897) - "WebSocket /ws/tasks/1" [accepted]
+INFO:     connection open
+"""
+@router.get("/websocket-test", response_class=HTMLResponse)
+async def protected_user_route(request: Request):
     return templates.TemplateResponse(
-        "converter.html",
+        "websocket_conn.html",
         {
-            "request": request,
-            "user": user
+            "request": request
         }
     )
 
+# Создание новой задачи
+@router.post("/tasks/", response_model=TaskResponse)
+async def create_task(task: TaskCreate, user: User = Depends(current_user), db: AsyncSession = Depends(get_async_session)):
+    # Создаем объект задачи, добавляя ID владельца
+    db_task = Task(**task.model_dump(), owner_id=user.id)
+    # Добавляем задачу в сессию
+    db.add(db_task)
+    # Сохраняем изменения в базе данных
+    await db.commit()
+    # Обновляем объект из базы (получаем сгенерированный ID и т.д.)
+    await db.refresh(db_task)
+    # Рассылаем уведомление всем активным WebSocket клиентам
+    for connection in active_connections:
+        await connection.send_text(f"New task created: {db_task.title}")
+    return db_task
 
-@router.get("/protected-admin", response_class=HTMLResponse)
-async def protected_admin_route(
-        request: Request,
-        user: User = Depends(current_user),
-        session: AsyncSession = Depends(get_async_session)
-):
-    stmt = select(Role).where(Role.id == user.role_id)
-    result = await session.execute(stmt)
-    role = result.scalar_one()
+# Получение списка задач с пагинацией
+@router.get("/tasks/", response_model=List[TaskResponse])
+async def read_tasks(skip: int = 0, limit: int = 10, db: AsyncSession = Depends(get_async_session)):
+    # Запрос задач с пропуском и ограничением количества
+    stmt = select(Task).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    tasks = result.scalars().all()
+    return tasks
 
-    if role.name != "admin":
-        return JSONResponse(
-            status_code=status.HTTP_403_FORBIDDEN,
-            content={"detail": "Not enough permissions"}
-        )
+# Получение конкретной задачи по ID
+@router.get("/tasks/{task_id}", response_model=TaskResponse)
+async def read_task(task_id: int, db: AsyncSession = Depends(get_async_session)):
+    # Поиск задачи по ID
+    stmt = select(Task).where(Task.id == task_id)
+    result = await db.execute(stmt)
+    task = result.scalar_one_or_none()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
 
-    return templates.TemplateResponse(
-        "converter_for_admin.html",
-        {
-            "request": request,
-            "user": user
-        }
-    )
+# Обновление задачи
+@router.put("/tasks/{task_id}", response_model=TaskResponse)
+async def update_task(task_id: int, task_update: TaskUpdate, db: AsyncSession = Depends(get_async_session)):
+    # Поиск задачи для обновления
+    stmt = select(Task).where(Task.id == task_id)
+    result = await db.execute(stmt)
+    db_task = result.scalar_one_or_none()
+    if db_task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    # Обновление полей задачи из переданных данных
+    update_data = task_update.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_task, key, value)
+    # Сохранение изменений
+    await db.commit()
+    # Обновление объекта из базы
+    await db.refresh(db_task)
+    # Уведомление клиентов об обновлении
+    for connection in active_connections:
+        await connection.send_text(f"Task {db_task.id} updated")
+    return db_task
 
+# Удаление задачи
+@router.delete("/tasks/{task_id}", response_model=TaskResponse)
+async def delete_task(task_id: int, db: AsyncSession = Depends(get_async_session)):
+    # Поиск задачи для удаления
+    stmt = select(Task).where(Task.id == task_id)
+    result = await db.execute(stmt)
+    task = result.scalar_one_or_none()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    # Удаление задачи из базы данных
+    await db.delete(task)
+    await db.commit()
+    # Уведомление клиентов об удалении
+    for connection in active_connections:
+        await connection.send_text(f"Task {task.id} deleted")
+    return task
 
-@router.post("/convert-for-user", response_class=HTMLResponse)
-async def protected_user_route(request: Request, user: User = Depends(current_user), from_: str = Form(...), to: str = Form(...), amount: str = Form(...)):
-    """
-    :param from_:
-        This option is intended for the currency we are converting.
-
-    :param to:
-        This is the volute we are converting to.
-
-    :param amount:
-        Number of currencies convertible.
-
-    :return:
-        json response
-    """
-    try:
-        url = f"https://api.apilayer.com/currency_data/convert?to={to}&from={from_}&amount={amount}"
-        headers = {"apikey": settings.CURRENCY_API_KEY}
-        response = requests.get(url, headers=headers)
-        result = response.json()
-        return templates.TemplateResponse("converter.html", {"request": request, "user": user, "result": result})
-    except Exception as error:
-        return templates.TemplateResponse("converter.html", {"request": request, "error": str(error)})
-
-
-
-@router.post("/convert-for-admin", response_class=HTMLResponse)
-async def protected_admin_route(request: Request, user: User = Depends(current_user), session: AsyncSession = Depends(get_async_session), from_: str = Form(...), to: str = Form(...), amount: str = Form(...)):
-    """
-    :param from_:
-        This option is intended for the currency we are converting.
-
-    :param to:
-        This is the volute we are converting to.
-
-    :param amount:
-        Number of currencies convertible.
-
-    :return:
-        json response
-    """
-    stmt = select(Role).where(Role.id == user.role_id)
-    result = await session.execute(stmt)
-    role = result.scalar_one()
-
-    if role.name != "admin":
-        return JSONResponse(
-            status_code=status.HTTP_403_FORBIDDEN,
-            content={"detail": "Not enough permissions"}
-        )
-    try:
-        url = f"https://api.apilayer.com/currency_data/convert?to={to}&from={from_}&amount={amount}"
-        headers = {"apikey": settings.CURRENCY_API_KEY}
-        response = requests.get(url, headers=headers)
-        result = response.json()
-        return templates.TemplateResponse("converter_for_admin.html", {"request": request, "user": user, "result": result})
-    except Exception as error:
-        return templates.TemplateResponse("converter_for_admin.html", {"request": request, "error": str(error)})
 
 app.include_router(router)
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000, ws='auto')

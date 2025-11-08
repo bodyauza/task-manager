@@ -20,8 +20,6 @@ password_helper_bc = PasswordHelper(password_hash)
 
 
 class UserManager(IntegerIDMixin, BaseUserManager[User, int]):
-    reset_password_token_secret = settings.reset_password_secret
-    verification_token_secret = settings.email_verification_secret
     password_helper = password_helper_bc
 
     async def on_after_register(self, user: User, request: Optional[Request] = None):

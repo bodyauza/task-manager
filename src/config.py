@@ -11,11 +11,6 @@ class Settings(BaseSettings):
     algorithm: str
     access_exp: int
 
-    reset_password_secret: str
-    email_verification_secret: str
-
-    CURRENCY_API_KEY: str
-
     # db parameters
     DB_HOST: str
     DB_PORT: str
