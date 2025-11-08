@@ -1,14 +1,14 @@
-# Currency Converter
+# Task Manager
 
 ## Screenshots
 
 ### Protected Page
 
-![Admin Page](https://github.com/bodyauza/currency-converter/blob/main/src/screenshots/protected2.png)
+![Task Board](https://github.com/bodyauza/)
 
 ### Swagger UI
 
-![Swagger UI](https://github.com/bodyauza/currency-converter/blob/main/src/screenshots/Swagger1.png)
+![Swagger UI](https://github.com/bodyauza/)
 
 ## Technological Stack
 
@@ -55,20 +55,43 @@
    The client sends a request to the server with an object containing the user's login and password.
 
 2. **Token Generation**  
-   If the entered password is correct, the server generates access and refresh tokens and returns them to the client.
+   If the entered password is correct, the server generates access token and returns it to the client.
 
 3. **Using the Access Token**  
    The client uses the received access token to interact with the API. All subsequent requests to protected routes must
    include this token in the cookie.
 
 4. **Access Token Renewal**  
-   The access token has a validity period, usually 5 minutes. When the validity of this token expires, the client sends
-   the refresh token to the server and receives a new access token. This process is repeated until the refresh token
-   expires.
+   The access token has a validity period, usually 40 minutes.
+   When the token expires, the client sends a request to the server and receives a new access token. 
 
-5. **Extending the Refresh Token**  
-   The refresh token is issued for 30 days. Approximately 1-5 days before the expiration of the refresh token, the
-   client sends a request with valid refresh token to obtain a new pair of tokens.
+## Endpoints
+
+Доступ к интерактивной документации Swagger UI и маршрутам аутентификации
+можно получить по адресу: [http://localhost:8000/docs](http://localhost:8000/docs)
+
+- `POST /auth/login` - JWT аутентификация (получение токена).
+- `POST /auth/logout` - Выход из системы.
+- `POST /auth/register` - Регистрация нового пользователя.
+- `POST /auth/access-token` - Получение нового access токена.
+
+Маршруты задач:
+
+- `GET http://localhost:8000/tasks/`: Получение списка задач (защищённая конечная точка).
+- `POST http://localhost:8000/create-task/`: Создание новой задачи (защищённая конечная точка).
+- `GET http://localhost:8000/tasks/{task_id}`: Получить определённую задачу (защищённая конечная точка).
+- `PUT http://localhost:8000/update-task/{task_id}`: Обновить определённую задачу (защищённая конечная точка).
+- `DELETE http://localhost:8000/delete-task/{task_id}`: Удалить определённую задачу (защищённая конечная точка).
+
+**WebSocket** — протокол связи поверх TCP-соединения (см. Модель OSI), предназначенный для обмена сообщениями между браузером и веб-сервером,
+используя постоянное соединение:
+
+  - Использует собственный протокол `ws://` или `wss://` поверх TCP-соединения.
+  - Соединение остается открытым, позволяя серверу и клиенту обмениваться данными в реальном времени без повторных запросов.
+  - Сервер может самостоятельно инициировать отправку данных клиенту (например, уведомления, чаты, онлайн-игры).
+  - Данные передаются в виде кадров (frames) с минимальными накладными расходами.
+
+Для получения обновлений статуса задачи в режиме реального времени используйте WebSocket-подключения к `"ws://localhost:8000/ws/tasks/{client_id}`
 
 ## Local development
 
@@ -98,48 +121,25 @@ pip install -r requirements.txt
 ```
 
 ### 4. Configuring Environment Variables
-Create or modify the .env file in the project root and specify the following variables:
+Rename the .env.example file to .env in the root of the project and specify the following variables:
 
 ```
 DB_USER=...
 DB_PASS=...
 ```
 
-### 5. Obtain a currency converter API key (for example, from [API Layer](https://apilayer.com/marketplace/currency_data-api))
+### 5. Generate an access token in .env file:
+
 ```
-CURRENCY_API_KEY=...
+ACCESS_SECRET=
 ```
 
-### 6. FastAPI applications run on the Uvicorn server. To start the server open a terminal and run the command:
+### 6. Create a `clients` database in PostgreSQL:
+```sql
+CREATE DATABASE clients;
+```
+
+### 7. FastAPI applications run on the Uvicorn server. To start the server open a terminal and run the command:
 ```
 uvicorn main:app --reload
-```
-
-Access the interactive Swagger UI documentation at: [http://localhost:8000/docs](http://localhost:8000/docs)
-
-### 7. To run all tests of the project, run the command:
-```
-pytest
-```
-#### Additional useful commands:
-
-Run tests from a specific file:
-```
-pytest tests/test_main.py
-```
-Stop on the first failed test:
-```
-pytest -x
-```
-Rerun only failed tests:
-```
-pytest --lf
-```
-Run tests changed since the last commit (if `pytest-xdist` is installed):
-```
-pytest --last-failed
-```
-Run tests with execution time measurements:
-```
-pytest --durations=5
 ```
