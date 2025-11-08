@@ -110,7 +110,7 @@ async def publish_message(client_id, message):
         await connection.send_text(f"Client with {client_id} wrote {message}!")
 
 # Для получения обновлений статуса задачи в режиме реального времени
-# используйте WebSocket-подключения к `"ws://localhost:8000/ws/tasks/{client_id}`.
+# используйте WebSocket-подключения к `ws://localhost:8000/ws/tasks/{client_id}`.
 # Пример клиентской стороны для подписки на обновление статуса задачи:
 # const socket = new WebSocket("ws://localhost:8000/ws/tasks/{client_id}")
 @app.websocket("/ws/tasks/{client_id}")
