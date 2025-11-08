@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Real-Time App</title>
+</head>
+<body>
+    <div id="messages"></div>
+    <input type="text" id="messageInput" placeholder="Введите сообщение">
+    <button onclick="sendMessage()">Отправить</button>
+
+    <script>
+        let socket;
+
+        function connectWebSocket() {
+            socket = new WebSocket("ws://localhost:8000/ws/tasks/1");
+            const messagesDiv = document.getElementById("messages");
+
+            socket.addEventListener("open", (event) => {
+                messagesDiv.innerHTML += `<p>Соединение установлено</p>`;
+            });
+
+            socket.addEventListener("message", (event) => {
+                const message = event.data;
+                messagesDiv.innerHTML += `<p>${message}</p>`;
+            });
+
+            socket.addEventListener("error", (event) => {
+                messagesDiv.innerHTML += `<p>Ошибка соединения</p>`;
+            });
+
+            socket.addEventListener("close", (event) => {
+                messagesDiv.innerHTML += `<p>Соединение закрыто</p>`;
+            });
+        }
+
+        function sendMessage() {
+            const messageInput = document.getElementById("messageInput");
+            const message = messageInput.value;
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(message);
+                messageInput.value = "";
+            } else {
+                alert("WebSocket не подключен");
+            }
+        }
+
+        // Подключаемся при загрузке страницы
+        window.addEventListener('load', connectWebSocket);
+    </script>
+</body>
+</html>
