@@ -70,10 +70,10 @@
 Доступ к интерактивной документации Swagger UI и маршрутам аутентификации
 можно получить по адресу: [http://localhost:8000/docs](http://localhost:8000/docs)
 
-- `POST /auth/login` - JWT аутентификация (получение токена).
-- `POST /auth/logout` - Выход из системы.
-- `POST /auth/register` - Регистрация нового пользователя.
-- `POST /auth/access-token` - Получение нового access токена.
+- `POST http://localhost:8000/auth/login` - JWT аутентификация (получение токена).
+- `POST http://localhost:8000/auth/logout` - Выход из системы.
+- `POST http://localhost:8000/auth/register` - Регистрация нового пользователя.
+- `POST http://localhost:8000/auth/access-token` - Получение нового access токена.
 
 Маршруты задач:
 
