@@ -143,3 +143,25 @@ CREATE DATABASE clients;
 ```
 uvicorn main:app --reload
 ```
+or run the project using Docker:
+
+#### Сборка и запуск 
+```
+docker-compose up --build
+```
+#### Запуск в фоновом режиме 
+```
+docker-compose up -d
+```
+#### Просмотр логов 
+```
+docker-compose logs -f web
+```
+#### Остановка 
+```
+docker-compose down
+```
+#### Остановка с удалением окружения Docker
+```
+docker-compose down -v
+```

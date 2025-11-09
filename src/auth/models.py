@@ -10,8 +10,8 @@ class Role(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
-    # Для PostgreSQL. Пример: {"authorization", "access to the currency conversion page for users"}
-    permissions: Mapped[list[str]] = mapped_column(ARRAY(String(100)))
+    permissions: Mapped[dict] = mapped_column(JSON, nullable=True)
+    # permissions: Mapped[list[str]] = mapped_column(ARRAY(String(100)))
 
 from typing import List  # Добавляем импорт
 
