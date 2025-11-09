@@ -128,7 +128,7 @@ DB_USER=...
 DB_PASS=...
 ```
 
-### 5. Generate an access token in .env file:
+### 5. Generate a secret key for signing JWT access tokens in .env file:
 
 ```
 ACCESS_SECRET=
