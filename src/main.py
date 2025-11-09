@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(
-    title='Currency Conversion',
+    title='Task Manager',
     lifespan=lifespan
 )
 
