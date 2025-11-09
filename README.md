@@ -145,23 +145,23 @@ uvicorn main:app --reload
 ```
 or run the project using Docker:
 
-#### Сборка и запуск 
+#### Build and run
 ```
 docker-compose up --build
 ```
-#### Запуск в фоновом режиме 
+#### Run in background
 ```
 docker-compose up -d
 ```
-#### Просмотр логов 
+#### View logs
 ```
 docker-compose logs -f web
 ```
-#### Остановка 
+#### Stop
 ```
 docker-compose down
 ```
-#### Остановка с удалением окружения Docker
+#### Stop and remove the Docker environment
 ```
 docker-compose down -v
 ```
