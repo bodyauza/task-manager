@@ -4,11 +4,11 @@
 
 ### Protected Page
 
-![Task Board](https://github.com/bodyauza/)
+![Task Board](https://github.com/bodyauza/task-manager/blob/main/src/screenshots/task-board.png)
 
 ### Swagger UI
 
-![Swagger UI](https://github.com/bodyauza/)
+![Swagger UI](https://github.com/bodyauza/task-manager/blob/main/src/screenshots/swagger.png)
 
 ## Technological Stack
 
