@@ -39,7 +39,7 @@
 - **uvicorn**: 0.35.0
 
 ### Database
-- **PostgreSQL**: 17.5
+- **PostgreSQL**: 18.0
 - **SQLAlchemy**: 2.0.41
 
 ### Testing Tools
