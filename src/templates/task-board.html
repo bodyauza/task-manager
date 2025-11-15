@@ -264,7 +264,6 @@
     </style>
 </head>
 <body>
-    <!-- ИЗМЕНЕНИЕ 1: Добавляем скрытый элемент для передачи user.id из шаблона в JavaScript -->
     <input type="hidden" id="userId" value="{{ user }}">
 
     <!-- Основной контейнер с сеткой -->
@@ -334,7 +333,6 @@
     </div>
 
     <script>
-        // ИЗМЕНЕНИЕ 2: Получаем user.id из скрытого поля, переданного из шаблона
         const userId = document.getElementById('userId').value;
 
         // Переменная для хранения WebSocket соединения
@@ -412,7 +410,6 @@
         // Функция подключения к WebSocket серверу
         function connectWebSocket() {
             try {
-                // ИЗМЕНЕНИЕ 3: Используем динамический user.id вместо фиксированного "1"
                 socket = new WebSocket(`ws://localhost:8000/ws/tasks/${userId}`);
 
                 // Обработчик события открытия соединения
