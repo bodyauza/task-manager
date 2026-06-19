@@ -9,3 +9,6 @@ venv
 .idea
 .vscode
 .git
+.env
+.env.*
+!.env.example

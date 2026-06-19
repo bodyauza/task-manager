@@ -1,0 +1,25 @@
+# Secrets — fill in before running locally, never commit
+src/.dev.env
+src/.tests.env
+src/.env
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
