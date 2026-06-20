@@ -1,27 +1,42 @@
-version: '3.8'
-
 services:
   web:
-    build: .
+    build:
+      context: ..
+      dockerfile: src/Dockerfile
     ports:
       - "8000:8000"
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     volumes:
-      - .:/app
+      - ..:/app
     restart: unless-stopped
+    # Загружаем переменные из .dev.env; DB_HOST переопределяется ниже,
+    # потому что внутри Docker сеть контейнеров: хост БД = имя сервиса "db",
+    # а не "localhost" из .dev.env.
+    env_file:
+      - .dev.env
+    environment:
+      DB_HOST: db
 
   db:
     image: postgres:18
-    POSTGRES_USER: ${DB_USER}
-    POSTGRES_PASSWORD: ${DB_PASS}
-    POSTGRES_DB: ${DB_NAME}
+    # Переменные окружения для образа postgres должны быть
+    # под ключом `environment:`.
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASS}
+      POSTGRES_DB: ${DB_NAME}
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
   postgres_data:

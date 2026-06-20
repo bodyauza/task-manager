@@ -1,6 +1,14 @@
-from pydantic_settings import BaseSettings
-from functools import lru_cache
 import os
+from functools import lru_cache
+
+from dotenv import load_dotenv
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BASE_DIR = os.path.dirname(__file__)
+
+load_dotenv(os.path.join(BASE_DIR, ".dev.env"), override=False)
+load_dotenv(os.path.join(BASE_DIR, ".tests.env"), override=False)
+load_dotenv(os.path.join(BASE_DIR, ".env"), override=False)
 
 
 class Settings(BaseSettings):
@@ -11,6 +19,10 @@ class Settings(BaseSettings):
     algorithm: str
     access_exp: int
 
+    # Настройки refresh-токена (используется в /auth/access-token)
+    refresh_secret: str
+    refresh_exp: int
+
     # db parameters
     DB_HOST: str
     DB_PORT: str
@@ -20,7 +32,13 @@ class Settings(BaseSettings):
     DB_DRIVER_SYNC: str
     DB_DRIVER_ASYNC: str
 
-    # DATABASE_URL = "postgresql+asyncpg://root:123@localhost:5432/clients"
+    cors_origins: list[str] = [
+        "http://localhost",
+        "http://localhost:8080",
+        "http://127.0.0.1:8000",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
 
     @property
     def ASYNC_DATABASE_URL(self):
@@ -28,18 +46,15 @@ class Settings(BaseSettings):
 
 
 class ProductionSettings(Settings):
-    class Config:
-        env_file = os.path.join(os.path.dirname(__file__), ".env")
+    model_config = SettingsConfigDict(env_file=os.path.join(BASE_DIR, ".env"))
 
 
 class DevelopmentSettings(Settings):
-    class Config:
-        env_file = os.path.join(os.path.dirname(__file__), ".dev.env")
+    model_config = SettingsConfigDict(env_file=os.path.join(BASE_DIR, ".dev.env"))
 
 
 class TestingSettings(Settings):
-    class Config:
-        env_file = os.path.join(os.path.dirname(__file__), ".tests.env")
+    model_config = SettingsConfigDict(env_file=os.path.join(BASE_DIR, ".tests.env"))
 
 
 @lru_cache

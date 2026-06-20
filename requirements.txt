@@ -5,35 +5,44 @@ argon2-cffi-bindings==21.2.0
 asyncpg==0.30.0
 bcrypt==4.1.2
 certifi==2024.8.30
-cffi==1.17.1
+cffi==2.0.0
 charset-normalizer==3.3.2
 click==8.1.7
-cryptography==44.0.1
+cryptography==46.0.7
 dnspython==2.7.0
 email_validator==2.1.2
 fastapi==0.115.14
-fastapi-users==15.0.1
+fastapi-users==15.0.2
 fastapi-users-db-sqlalchemy==6.0.1
 greenlet==3.1.1
-gunicorn==23.0.0
-h11==0.14.0
+h11==0.16.0
 idna==3.10
 Jinja2==3.1.6
 makefun==1.15.6
 Mako==1.3.5
 MarkupSafe==2.1.5
 packaging==24.1
-passlib==1.7.4
-pwdlib==0.2.1
+pwdlib==0.3.0
 pycparser==2.22
 pydantic==2.9.2
 pydantic_core==2.23.4
+# пакет отсутствовал, из-за этого падает `from pydantic_settings import BaseSettings`
+# в src/config.py с ошибкой ModuleNotFoundError: No module named 'pydantic_settings'
+pydantic-settings==2.6.1
 pyjwt==2.10.1
-python-multipart==0.0.20
-requests==2.32.3
+python-multipart==0.0.21
+requests==2.33.0
 sniffio==1.3.1
 SQLAlchemy==2.0.41
-starlette==0.47.2
+starlette>=0.40.0,<0.47.0
 typing_extensions==4.12.2
-urllib3==2.5.0
-uvicorn==0.31.0
+urllib3==2.7.0
+# Пакет отсутствовал, из-за этого uvicorn не может обрабатывать
+# WebSocket-рукопожатия (GET /ws/tasks/{client_id} возвращал 404 с предупреждением
+# "No supported WebSocket library detected. Please use 'pip install
+# \"uvicorn[standard]\"', or install 'websockets' or 'wsproto' manually.")
+websockets==13.1
+uvicorn==0.35.0
+
+# Alembic migrations
+alembic==1.14.0
