@@ -121,28 +121,6 @@
 Для получения обновлений статуса задачи в режиме реального времени используйте WebSocket-подключение к `ws://<host>/ws/tasks/{user_id}`.
 Подключение требует действующую куку `access_token` (получается через `/auth/login`) — без неё сервер закрывает соединение с кодом `1008`.
 
-Протокол WebSocket определяется автоматически на основе протокола страницы:
-
-| Протокол страницы | WebSocket-протокол |
-|---|---|
-| `http://` | `ws://` |
-| `https://` | `wss://` |
-
-При деплое за reverse proxy (nginx) браузер устанавливает `wss://`-соединение с nginx,
-а nginx проксирует его на uvicorn по `ws://` внутри сети. Для корректной работы необходима
-следующая конфигурация nginx:
-
-```nginx
-location /ws/ {
-    proxy_pass http://localhost:8000;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-}
-```
-
-Без заголовков `Upgrade` и `Connection` nginx разрывает WebSocket-соединение сразу после рукопожатия.
-
 Поведение WebSocket-чата:
 
 - Все события о задачах подписываются email-ом инициатора: `user@mail.com: New task created: Задача №1`.
