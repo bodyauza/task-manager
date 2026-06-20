@@ -497,6 +497,12 @@
                     statusDiv.textContent = "Status: Disconnected";
                     statusDiv.className = "connection-status status-disconnected";
                     addMessage("System: Connection closed");
+                    // 1008 = Policy Violation (auth failure — токен истёк или отсутствует).
+                    // Повторное подключение вызвало бы бесконечный цикл — перенаправляем на логин.
+                    if (event.code === 1008) {
+                        window.location.href = "/";
+                        return;
+                    }
                     setTimeout(connectWebSocket, 3000);
                 };
 

@@ -2,7 +2,7 @@ import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy import select, text
 
-from src.auth.models import Role
+from src.auth.models import Role, User
 from src.database import async_session_maker, engine, Base
 from src.main import app
 
@@ -46,3 +46,12 @@ async def setup_and_reset():
 async def client():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
+
+
+async def promote_to_admin(email: str) -> None:
+    """Upgrade an already-registered user to role_id=2 (admin) directly in the DB."""
+    async with async_session_maker() as session:
+        result = await session.execute(select(User).where(User.email == email))
+        user = result.scalar_one()
+        user.role_id = 2
+        await session.commit()

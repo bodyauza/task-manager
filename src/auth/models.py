@@ -29,7 +29,7 @@ class User(SQLAlchemyBaseUserTable[int], Base):
     __tablename__ = "person"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    email: Mapped[str] = mapped_column(String, nullable=False)
+    email: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     username: Mapped[str] = mapped_column(String, nullable=False)
     registered_at: Mapped[datetime] = mapped_column(TIMESTAMP, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     role_id: Mapped[int] = mapped_column(ForeignKey(Role.id))

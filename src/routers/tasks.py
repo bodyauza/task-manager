@@ -105,7 +105,7 @@ async def websocket_endpoint(
             del active_connections[user.id]
 
 
-@router.post("/create-task/", response_model=TaskResponse)
+@router.post("/create-task/", response_model=TaskResponse, status_code=201)
 async def create_task(
     task: TaskCreate,
     user: User = Depends(current_user),
@@ -149,12 +149,13 @@ async def search_tasks_by_title(
     if not title.strip():
         raise HTTPException(status_code=400, detail="Title query parameter must not be empty")
 
-    pattern = f"%{title.strip()}%"
+    escaped = title.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = f"%{escaped}%"
     tasks = (await db.execute(
-        select(Task).where(Task.title.ilike(pattern)).offset(skip).limit(limit)
+        select(Task).where(Task.title.ilike(pattern, escape="\\")).offset(skip).limit(limit)
     )).scalars().all()
     total = (await db.execute(
-        select(func.count()).select_from(Task).where(Task.title.ilike(pattern))
+        select(func.count()).select_from(Task).where(Task.title.ilike(pattern, escape="\\"))
     )).scalar_one()
     response.headers["X-Total-Count"] = str(total)
     return tasks
@@ -194,7 +195,10 @@ async def delete_task(
     task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
+    # snapshot — это простой Pydantic-объект, не знает о SQLAlchemy.
+    # обращение к snapshot.title — это просто чтение поля Python-класса.
+    snapshot = TaskResponse.model_validate(task)
     await db.delete(task)
     await db.commit()
-    await broadcast_task_event("task_deleted", task.title, exclude_user_id=user.id, sender_email=user.email)
-    return task
+    await broadcast_task_event("task_deleted", snapshot.title, exclude_user_id=user.id, sender_email=user.email)
+    return snapshot

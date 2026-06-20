@@ -1,5 +1,12 @@
+import asyncio
 import os
+import sys
 from dotenv import load_dotenv
+
+# asyncpg on Windows fails with ProactorEventLoop (the default in Python 3.8+).
+# Switch to SelectorEventLoop so asyncpg can establish connections correctly.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Must be set before any src.* import so that lru_cache on get_settings()
 # caches TestingSettings (pointing to clients_test DB) instead of the

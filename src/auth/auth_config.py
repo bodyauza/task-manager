@@ -1,7 +1,11 @@
+from fastapi import Depends, HTTPException, status
 from fastapi_users import FastAPIUsers
 from fastapi_users.authentication import (AuthenticationBackend,
                                           CookieTransport, JWTStrategy)
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from src.config import settings
+from src.database import get_async_session
 
 # secure включается только в production.
 _cookie_secure = settings.api_mode in ("prod", "production")
@@ -11,7 +15,8 @@ cookie_transport = CookieTransport(
     cookie_name="access_token",
     cookie_max_age=settings.access_exp,
     cookie_secure=_cookie_secure,  # Только для HTTPS в production
-    cookie_httponly=True  # Защита от XSS
+    cookie_httponly=True,          # Защита от XSS: JS не может прочитать куку
+    cookie_samesite="lax",         # Защита от CSRF: куки не отправляются в cross-site запросах
 )
 
 # Используется отдельной кукой "refresh_token" с более долгим сроком жизни,
@@ -21,7 +26,8 @@ refresh_cookie_transport = CookieTransport(
     cookie_name="refresh_token",
     cookie_max_age=settings.refresh_exp,
     cookie_secure=_cookie_secure,
-    cookie_httponly=True
+    cookie_httponly=True,
+    cookie_samesite="lax",
 )
 
 
@@ -52,7 +58,7 @@ auth_backend = AuthenticationBackend(
 
 
 from src.auth.manager import get_user_manager
-from src.auth.models import User
+from src.auth.models import Role, User
 
 fastapi_users = FastAPIUsers[User, int](
     get_user_manager,
@@ -65,3 +71,22 @@ fastapi_users = FastAPIUsers[User, int](
 # async def protected_route(user: User = Depends(current_user)):
 
 current_user = fastapi_users.current_user(active=True)
+
+
+def require_permission(permission: str):
+    """
+    Dependency factory that gates a route behind a role permission check.
+    Raises 403 if the current user's role does not include the required permission.
+    """
+    async def _dependency(
+        user: User = Depends(current_user),
+        db: AsyncSession = Depends(get_async_session),
+    ) -> User:
+        role = await db.get(Role, user.role_id)
+        if role is None or permission not in (role.permissions or []):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions",
+            )
+        return user
+    return _dependency

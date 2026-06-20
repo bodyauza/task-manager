@@ -24,7 +24,7 @@ async def _create(client: AsyncClient, title="My Task", description="desc"):
 async def test_create_task_success(client: AsyncClient):
     await _register_login(client)
     r = await _create(client)
-    assert r.status_code == 200
+    assert r.status_code == 201
     data = r.json()
     assert data["title"] == "My Task"
     assert data["completed"] is False

@@ -2,13 +2,23 @@
 
 ## Screenshots
 
-### Protected Page
+### Protected Pages
 
-![Task Board](https://github.com/bodyauza/task-manager/blob/main/src/screenshots/task-board.png)
+![Task Board](src/screenshots/task_board.png)
+
+![Changing tasks](src/screenshots/changing_tasks.png)
 
 ### Swagger UI
 
-![Swagger UI](https://github.com/bodyauza/task-manager/blob/main/src/screenshots/swagger.png)
+![Swagger UI](src/screenshots/swagger.png)
+
+### Login page
+
+![Login page](src/screenshots/auth.png)
+
+### Registration page
+
+![Registration page](src/screenshots/register.png)
 
 ## Technological Stack
 
@@ -60,7 +70,7 @@
 
 2. **Token Generation**
    If the entered password is correct, the server generates an access token and a refresh token and returns them to the client
-   as `access_token` and `refresh_token` cookies.
+   as `access_token` and `refresh_token` cookies. Both cookies are set with `HttpOnly` (защита от XSS) and `SameSite=Lax` (защита от CSRF).
 
 3. **Using the Access Token**
    The client uses the received access token to interact with the API. All subsequent requests to protected routes must
@@ -84,13 +94,21 @@
 
 Маршруты задач (все защищены: требуют действующий `access_token`):
 
-> **Shared board:** приложение реализует модель совместной доски задач — все аутентифицированные пользователи видят один общий список и могут редактировать или удалять любую задачу. Инициатор каждого изменения передаётся остальным участникам через WebSocket (`sender: "user@example.com"`). Такой подход намеренен: приложение предназначено для командной работы, а не для изолированных личных списков.
+> **Shared board:** приложение реализует модель совместной доски задач — все аутентифицированные пользователи видят один общий список и могут редактировать или удалять любую задачу. Инициатор каждого изменения передаётся остальным участникам через WebSocket (`sender: "user@example.com"`). Такой подход выбран намеренно: приложение предназначено для командной работы, а не для изолированных личных списков.
 
 - `GET http://localhost:8000/tasks/` — Получение списка **всех** задач из БД. Параметры: `skip` (≥ 0, по умолчанию 0), `limit` (1–100, по умолчанию 5). Общее количество задач возвращается в заголовке `X-Total-Count`.
 - `GET http://localhost:8000/tasks/search?title=...` — Поиск задач по части названия (регистронезависимый ILIKE). Поддерживает те же параметры пагинации и заголовок `X-Total-Count`.
 - `POST http://localhost:8000/create-task/` — Создание новой задачи. Возвращает `409 Conflict`, если задача с таким названием уже существует.
 - `PUT http://localhost:8000/update-task/{task_id}` — Частичное или полное обновление задачи (любой авторизованный пользователь). Возвращает `409 Conflict` при попытке переименовать в уже существующее название.
 - `DELETE http://localhost:8000/delete-task/{task_id}` — Удаление задачи (любой авторизованный пользователь).
+
+Маршруты управления пользователями (требуют роль `admin`):
+
+> Доступ проверяется через `require_permission("delete")`: пользователь с ролью `user` (permissions: `["read", "write"]`) получает `403 Forbidden`. Только пользователь с ролью `admin` (permissions: `["read", "write", "delete"]`) проходит проверку.
+
+- `GET http://localhost:8000/users/` — Список всех зарегистрированных пользователей.
+- `PATCH http://localhost:8000/users/{user_id}` — Изменение данных пользователя (`username`, `role_id`, `is_active`). Возвращает `404`, если пользователь не найден.
+- `DELETE http://localhost:8000/users/{user_id}` — Удаление учётной записи пользователя. Возвращает `404`, если пользователь не найден.
 
 **WebSocket** — протокол связи поверх TCP-соединения (см. Модель OSI), предназначенный для обмена сообщениями между браузером и веб-сервером,
 используя постоянное соединение:
@@ -191,7 +209,7 @@ alembic upgrade head
 ```
 
 Миграции создают таблицы `role`, `person`, `task` и уникальный индекс на `task.title`.
-При первом запуске приложения lifespan наполняет таблицу `role` базовыми ролями (`user`, `admin`).
+При первом запуске приложения lifespan заполняет таблицу `role` базовыми ролями (`user`, `admin`).
 
 Для генерации новой миграции после изменения моделей:
 
@@ -200,26 +218,12 @@ alembic revision --autogenerate -m "describe change"
 alembic upgrade head
 ```
 
-> **Важно:** `create_tables()` в lifespan использует `Base.metadata.create_all()` и создаёт таблицы
-> в обход Alembic — таблица `alembic_version` при этом остаётся пустой. Если запустить
-> `alembic upgrade head` после `create_all`, Alembic попытается создать таблицы повторно и упадёт
-> с ошибкой `table already exists`.
->
 > **Рекомендуемый подход для продакшна** — запускать миграции явно перед стартом приложения
 > (например, в entrypoint Docker-контейнера):
 >
 > ```
 > alembic upgrade head && uvicorn src.main:app --host 0.0.0.0 --port 8000
 > ```
->
-> Если БД уже была создана через `create_all` и вы переходите на Alembic, выполните один раз:
->
-> ```
-> alembic stamp head
-> ```
->
-> Эта команда выставляет текущую ревизию без применения миграций — Alembic начнёт отслеживать
-> схему с этого момента.
 
 ### 7. Start the server
 
@@ -246,7 +250,7 @@ task-manager/          ← корень проекта (все docker-коман
 
 ### Конфигурация переменных окружения
 
-Перед первым запуском заполни `src/.dev.env`:
+Перед первым запуском заполните `src/.dev.env`:
 
 ```
 DB_USER=your_db_user
@@ -290,7 +294,7 @@ docker-compose -f src/docker-compose.yml down -v
 
 ### Применение миграций
 
-После первого запуска контейнеров выполни миграции Alembic:
+После первого запуска контейнеров выполните миграции Alembic:
 
 ```
 docker-compose -f src/docker-compose.yml exec web alembic upgrade head
@@ -317,7 +321,8 @@ CREATE DATABASE clients_test;
 ```
 
 Запускать миграции (`alembic upgrade head`) вручную не нужно — фикстура `setup_and_reset`
-создаёт таблицы и засевает роли автоматически перед каждым тестом.
+создаёт таблицы и заполняет роли автоматически перед каждым тестом.
+Для тестов, требующих права администратора, используется вспомогательная функция `promote_to_admin(email)`, которая напрямую обновляет `role_id` пользователя в БД.
 
 ### 2. Установите dev-зависимости
 
@@ -339,10 +344,11 @@ pytest tests/ -v
 
 ### Как работают фикстуры
 
-| Фикстура | Scope | Назначение |
+| Фикстура / функция | Scope | Назначение |
 |----------|-------|-----------|
-| `setup_and_reset` | function, autouse | Перед тестом: `create_all` + засев ролей. После теста: `TRUNCATE task, person` |
+| `setup_and_reset` | function, autouse | Перед тестом: `create_all` + заполнение ролей. После теста: `TRUNCATE task, person` |
 | `client` | function | `httpx.AsyncClient` с `ASGITransport` для HTTP-запросов к приложению |
+| `promote_to_admin` | — | Вспомогательная функция: повышает пользователя до `role_id=2` (admin) напрямую в БД |
 
 > **Примечание.** `httpx.ASGITransport` обрабатывает только HTTP-запросы и не запускает
 > ASGI lifespan (`startup` / `shutdown`). Поэтому инициализация таблиц и ролей
@@ -378,3 +384,4 @@ docker exec src-web-1 sh -c "
 |--------|----------|
 | `test_auth.py` | Регистрация (успех / дубль / невалидный email / слабый пароль), логин (успех / неверный пароль / несуществующий пользователь), выход, refresh-токен (успех / без куки) |
 | `test_tasks.py` | Создание (успех / дубль / без авторизации / пустой title), чтение (пустой список / пагинация / вторая страница / невалидные параметры), поиск (найдено / не найдено / без авторизации), обновление (успех / частичное / дубль title / 404 / без авторизации), удаление (успех / 404 / без авторизации), совместный доступ (другой пользователь может редактировать и удалять чужие задачи, видит все задачи) |
+| `test_users.py` | Список пользователей (admin — успех / обычный пользователь — 403 / без авторизации — 401), удаление пользователя (admin — успех / обычный пользователь — 403 / 404), редактирование пользователя (admin — успех / обычный пользователь — 403) |
