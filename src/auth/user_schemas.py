@@ -1,35 +1,25 @@
 import re
 from typing import Optional
 
-from pydantic import ConfigDict, field_validator
+from pydantic import ConfigDict, Field, field_validator
 from fastapi_users import schemas
 
-# Модели Pydantic для автоматической валидации получаемых данных (DTO).
-
-# Добавлена проверка email и password общепринятыми регулярными
-# выражениями (помимо стандартной валидации EmailStr/email-validator у
-# schemas.BaseUserCreate, которая проверяет только формальную структуру адреса,
-# но не сложность пароля - её там вообще нет).
-
-# EMAIL_REGEX - классический паттерн "локальная часть @ домен.зона":
-# буквы/цифры/._+- до "@", затем доменные метки через точку, последняя
-# зона из 2+ букв/цифр.
+# Базовая проверка синтаксиса: допускает user@domain.tld.
+# Полноценная верификация email — только через отправку письма с кодом подтверждения.
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
 
-# PASSWORD_REGEX - минимум 8 символов, как минимум одна строчная буква,
-# одна заглавная буква и одна цифра. Это общепринятый минимальный набор
-# требований к "сложному" паролю (OWASP baseline).
-PASSWORD_REGEX = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$")
+# Lookahead (?=...) проверяет наличие каждого класса символов независимо от позиции,
+# поэтому порядок символов в пароле не важен.
+PASSWORD_REGEX = re.compile(
+    r"^(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()\-_=+\[\]{};:'\",.<>/?]).{5,}$"
+)
+
+PASSWORD_ERROR = (
+    "Пароль должен содержать: цифры, символы верхнего регистра "
+    "и специальные символы. Минимальная длина пароля — 5 символов."
+)
 
 
-# Проверки вынесены в самостоятельные функции (а не оставлены
-# только как pydantic field_validator внутри UserCreate), чтобы их можно было
-# повторно использовать при ЛОГИНЕ (POST /auth/login). Эндпоинт логина
-# принимает OAuth2PasswordRequestForm, а не UserCreate, поэтому
-# field_validator-ы UserCreate там не сработали бы автоматически - раньше
-# валидация формата email/пароля проверялась только при регистрации, и можно
-# было залогиниться (или хотя бы попытаться) с заведомо некорректным по
-# формату email/паролем.
 def is_valid_email_format(email: str) -> bool:
     return bool(EMAIL_REGEX.match(email))
 
@@ -42,20 +32,31 @@ class UserRead(schemas.BaseUser[int]):
     id: int
     email: str
     username: str
+    firstname: str
+    lastname: str
+    # None если пользователь не указал отчество при регистрации или оно не хранится в БД.
+    patronymic: Optional[str] = None
     role_id: int
     is_active: bool = True
-    is_superuser: bool = False
+    # exclude=True: поле скрыто из JSON-ответов API, но сохраняется в БД.
+    # fastapi-users требует is_superuser в модели; права в проекте задаются через role_id.
+    is_superuser: bool = Field(default=False, exclude=True)
     is_verified: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class UserCreate(schemas.BaseUserCreate):
+    # username не передаётся клиентом: вычисляется в UserManager.create()
+    # как email.split("@")[0] и записывается в БД.
     username: str
+    firstname: str
+    lastname: str
+    # None если отчество не передано — Pydantic не подставляет пустую строку.
+    patronymic: Optional[str] = None
     email: str
     password: str
     is_active: Optional[bool] = True
-    is_superuser: Optional[bool] = False
     is_verified: Optional[bool] = False
 
     @field_validator("email")
@@ -69,8 +70,5 @@ class UserCreate(schemas.BaseUserCreate):
     @classmethod
     def validate_password_strength(cls, value: str) -> str:
         if not is_valid_password_format(value):
-            raise ValueError(
-                "Password must be at least 8 characters long and contain "
-                "at least one lowercase letter, one uppercase letter, and one digit"
-            )
+            raise ValueError(PASSWORD_ERROR)
         return value

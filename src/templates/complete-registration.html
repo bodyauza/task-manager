@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Завершение регистрации — Task Manager</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            background-color: #eceff1;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            color: #212529;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 24px 16px;
+        }
+
+        .brand {
+            font-size: 13px;
+            font-weight: 700;
+            color: #003f6b;
+            letter-spacing: 1.2px;
+            text-transform: uppercase;
+            margin-bottom: 18px;
+        }
+
+        .card {
+            background: white;
+            border-top: 4px solid #003f6b;
+            border-radius: 0 0 4px 4px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+            padding: 32px 36px;
+            width: 420px;
+            max-width: 100%;
+        }
+
+        .card-title {
+            color: #003f6b;
+            font-size: 17px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            border-bottom: 2px solid #003f6b;
+            padding-bottom: 10px;
+            margin-bottom: 6px;
+        }
+
+        .step-hint {
+            font-size: 11px;
+            color: #78909c;
+            margin-bottom: 24px;
+            letter-spacing: 0.3px;
+        }
+
+        .name-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+        }
+
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 4px;
+            font-size: 11px;
+            font-weight: 700;
+            color: #6c757d;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+        }
+
+        input[type="text"],
+        input[type="password"] {
+            width: 100%;
+            padding: 9px 12px;
+            border: 1px solid #ced4da;
+            border-radius: 2px;
+            font-size: 14px;
+            font-family: inherit;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+
+        input:focus {
+            outline: none;
+            border-color: #003f6b;
+            box-shadow: 0 0 0 2px rgba(0, 63, 107, 0.12);
+        }
+
+        .password-wrapper {
+            position: relative;
+        }
+
+        .password-wrapper input {
+            padding-right: 42px;
+        }
+
+        .toggle-password {
+            position: absolute;
+            right: 2px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: none;
+            border: none;
+            cursor: pointer;
+            padding: 6px;
+            color: #6c757d;
+            line-height: 0;
+            width: auto;
+            transition: color 0.2s;
+        }
+
+        .toggle-password:hover { color: #003f6b; background: none; }
+
+        .hint {
+            font-size: 11px;
+            color: #78909c;
+            margin-top: 5px;
+            line-height: 1.4;
+        }
+
+        .btn-submit {
+            width: 100%;
+            background-color: #003f6b;
+            color: white;
+            border: none;
+            padding: 12px;
+            border-radius: 2px;
+            cursor: pointer;
+            font-size: 14px;
+            font-family: inherit;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            transition: background-color 0.2s;
+            margin-top: 8px;
+        }
+
+        .btn-submit:hover    { background-color: #002b4e; }
+        .btn-submit:disabled { background-color: #78909c; cursor: default; }
+
+        .error-message {
+            color: #b71c1c;
+            font-size: 13px;
+            margin-top: 12px;
+            text-align: center;
+            min-height: 20px;
+        }
+
+        .link-row {
+            text-align: center;
+            margin-top: 22px;
+            font-size: 13px;
+            color: #6c757d;
+        }
+
+        .link-row a {
+            color: #003f6b;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .link-row a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="brand">Task Manager</div>
+
+    <div class="card">
+        <div class="card-title">Завершение регистрации</div>
+        <div class="step-hint">Шаг 3 из 3 — Введите ваши данные</div>
+
+        <form id="completeForm">
+            <div class="name-row">
+                <div class="form-group">
+                    <label for="firstname">Имя</label>
+                    <input type="text" id="firstname" required
+                           autocomplete="given-name" placeholder="Иван" maxlength="255">
+                </div>
+                <div class="form-group">
+                    <label for="lastname">Фамилия</label>
+                    <input type="text" id="lastname" required
+                           autocomplete="family-name" placeholder="Иванов" maxlength="255">
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="patronymic">Отчество</label>
+                <input type="text" id="patronymic"
+                       autocomplete="additional-name" placeholder="Необязательное поле" maxlength="255">
+            </div>
+            <div class="form-group">
+                <label for="password">Пароль</label>
+                <div class="password-wrapper">
+                    <input type="password" id="password" required
+                           autocomplete="new-password" placeholder="••••••••">
+                    <button type="button" class="toggle-password" id="togglePassword"
+                            aria-label="Показать пароль">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"
+                             viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                            <circle cx="12" cy="12" r="3"/>
+                        </svg>
+                    </button>
+                </div>
+                <p class="hint">Мин. 5 символов, заглавная буква, цифра и специальный символ (!@#$…).</p>
+            </div>
+            <button type="submit" class="btn-submit" id="submitBtn">Зарегистрироваться</button>
+            <div id="errorMessage" class="error-message"></div>
+        </form>
+
+        <div class="link-row">
+            Уже есть аккаунт? <a href="/">Войти</a>
+        </div>
+    </div>
+
+    <script src="/static/js/complete-registration.js" defer></script>
+</body>
+</html>

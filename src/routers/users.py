@@ -12,13 +12,21 @@ from src.database import get_async_session
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
+# require_permission("delete") вычисляется один раз при загрузке модуля.
+# Все маршруты этого роутера требуют разрешения "delete" — оно есть только у роли admin (id=2).
+# Использование одного экземпляра вместо повторного вызова в каждом Depends исключает
+# создание лишних closure-объектов при каждом запросе.
 _admin_only = require_permission("delete")
 
 
 class UserAdminUpdate(BaseModel):
-    username: Optional[str] = None
-    role_id: Optional[int] = None
-    is_active: Optional[bool] = None
+    # Все поля опциональны: PATCH передаёт только изменяемые атрибуты.
+    username:   Optional[str]  = None
+    firstname:  Optional[str]  = None
+    lastname:   Optional[str]  = None
+    patronymic: Optional[str]  = None
+    role_id:    Optional[int]  = None
+    is_active:  Optional[bool] = None
 
 
 @router.get("/", response_model=list[UserRead])
@@ -31,22 +39,52 @@ async def list_users(
 
 
 @router.patch("/{user_id}", response_model=UserRead)
+# PATCH — семантика частичного обновления: клиент передаёт только изменяемые поля,
+# остальные остаются нетронутыми. response_model=UserRead ограничивает ответ:
+# поля, отсутствующие в UserRead (например, hashed_password), в JSON не попадут.
 async def update_user(
     user_id: int,
     payload: UserAdminUpdate,
+    # _admin_only проверяет наличие разрешения "delete" в роли текущего пользователя.
+    # Если пользователь не аутентифицирован или роль не содержит "delete" — 403 Forbidden
+    # до входа в тело функции.
     admin: User = Depends(_admin_only),
+    # get_async_session открывает транзакцию через async with и закрывает её после ответа.
     db: AsyncSession = Depends(get_async_session),
 ):
+    # db.get() — lookup по первичному ключу. SQLAlchemy сначала проверяет identity map
+    # (кеш сессии): если объект с таким id уже загружался в рамках этой транзакции —
+    # возвращает его без SELECT. Иначе выполняет SELECT * FROM person WHERE id = $1.
     user = await db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
+    # exclude_unset=True — Pydantic отслеживает, какие поля были явно переданы в теле
+    # запроса, а какие получили default=None. Если клиент послал {"is_active": false},
+    # update_data = {"is_active": False}; поля username, role_id и прочие в словарь
+    # не попадают. Без exclude_unset=True PATCH перезаписывал бы все поля модели,
+    # включая те, которые клиент не трогал.
     update_data = payload.model_dump(exclude_unset=True)
+
+    # setattr обновляет атрибуты ORM-объекта через InstrumentedAttribute-дескрипторы.
+    # SQLAlchemy перехватывает каждое присваивание и помечает объект как dirty,
+    # добавляя его в unit of work. SELECT на этом этапе не выполняется.
     for field, value in update_data.items():
         setattr(user, field, value)
 
+    # commit() запускает unit of work: SQLAlchemy формирует UPDATE person SET ... WHERE id=$1
+    # только для изменённых столбцов и фиксирует транзакцию. При нарушении ограничений
+    # (например, уникальный username уже занят) — IntegrityError, транзакция откатывается.
     await db.commit()
+
+    # После commit() SQLAlchemy переводит все атрибуты объекта в состояние expired.
+    # В async-контексте обращение к expired-атрибуту вызвало бы MissingGreenlet —
+    # lazy SELECT в async недопустим. refresh() выполняет явный SELECT прямо сейчас,
+    # пока сессия ещё открыта, и заполняет атрибуты актуальными значениями из БД.
     await db.refresh(user)
+
+    # FastAPI вызывает UserRead.model_validate(user) (from_attributes=True) и сериализует
+    # ORM-объект в JSON согласно схеме UserRead.
     return user
 
 
@@ -56,8 +94,13 @@ async def delete_user(
     admin: User = Depends(_admin_only),
     db: AsyncSession = Depends(get_async_session),
 ):
+    # Запрет самоудаления: если единственный admin удалит свою учётную запись,
+    # доступ к управлению пользователями будет утрачен без возможности восстановления через UI.
     if user_id == admin.id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot delete your own account")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete your own account",
+        )
 
     user = await db.get(User, user_id)
     if user is None:

@@ -1,0 +1,15 @@
+<nav class="navbar navbar-dark" style="background-color: #003f6b;">
+    <div class="container-fluid px-4">
+        <span class="navbar-brand fw-bold fs-5 text-white">Task Manager</span>
+        <div class="d-flex gap-3 align-items-center">
+            <a href="/task-board"
+               class="nav-link{% if current_page == 'tasks' %} fw-semibold text-white{% else %} text-white-50{% endif %}">
+                Задачи
+            </a>
+            <a href="/profile"
+               class="nav-link{% if current_page == 'profile' %} fw-semibold text-white{% else %} text-white-50{% endif %}">
+                Личный кабинет
+            </a>
+        </div>
+    </div>
+</nav>

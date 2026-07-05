@@ -7,21 +7,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.config import settings
 from src.database import get_async_session
 
-# secure включается только в production.
+# secure=True только в production: в dev HTTP нет TLS, браузер не отправит Secure-куку.
 _cookie_secure = settings.api_mode in ("prod", "production")
 
-# Транспорт для access токена
+# SameSite=lax: кука отправляется при top-level navigation (переход по ссылке),
+# но блокируется при cross-site subresource-запросах — достаточно для защиты от CSRF
+# без ограничений на OAuth-редиректы.
 cookie_transport = CookieTransport(
     cookie_name="access_token",
     cookie_max_age=settings.access_exp,
-    cookie_secure=_cookie_secure,  # Только для HTTPS в production
-    cookie_httponly=True,          # Защита от XSS: JS не может прочитать куку
-    cookie_samesite="lax",         # Защита от CSRF: куки не отправляются в cross-site запросах
+    cookie_secure=_cookie_secure,
+    cookie_httponly=True,
+    cookie_samesite="lax",
 )
 
-# Используется отдельной кукой "refresh_token" с более долгим сроком жизни,
-# чтобы POST /auth/access-token мог выдать новый access токен даже после
-# истечения старого access токена.
+# Отдельная кука refresh_token с TTL 7 дней позволяет выдать новый access_token
+# без повторного логина. Хранится отдельно от access_token: компрометация одной
+# куки не даёт доступа к другой (разные секреты, разные TTL).
 refresh_cookie_transport = CookieTransport(
     cookie_name="refresh_token",
     cookie_max_age=settings.refresh_exp,
@@ -31,24 +33,25 @@ refresh_cookie_transport = CookieTransport(
 )
 
 
-# Стратегия аутентификации для access токена (короткоживущий)
+# JWTStrategy создаётся через callable, а не как синглтон: fastapi-users вызывает
+# get_strategy() при каждом запросе, что позволяет подменять секреты без перезапуска.
 def get_access_strategy() -> JWTStrategy:
     return JWTStrategy(
         secret=settings.access_secret,
         lifetime_seconds=settings.access_exp,
-        algorithm=settings.algorithm
+        algorithm=settings.algorithm,
     )
 
 
-# Стратегия аутентификации для refresh токена (долгоживущий).
-# Подписывается отдельным секретом (REFRESH_SECRET), чтобы компрометация
-# access-токена не позволяла подделать refresh-токен и наоборот.
 def get_refresh_strategy() -> JWTStrategy:
+    # Отдельный секрет: компрометация access_secret не позволяет подделать
+    # refresh-токен и получить долгосрочный доступ к сессии.
     return JWTStrategy(
         secret=settings.refresh_secret,
         lifetime_seconds=settings.refresh_exp,
-        algorithm=settings.algorithm
+        algorithm=settings.algorithm,
     )
+
 
 auth_backend = AuthenticationBackend(
     name="access_jwt",
@@ -65,19 +68,16 @@ fastapi_users = FastAPIUsers[User, int](
     [auth_backend]
 )
 
-# Создание dependency для получения текущего пользователя
-# Используется как dependency в защищенных маршрутах, например:
-# @router.get("/protected-route")
-# async def protected_route(user: User = Depends(current_user)):
-
+# active=True: неактивные пользователи (is_active=False) получают 401,
+# даже если их токен действителен.
 current_user = fastapi_users.current_user(active=True)
 
 
 def require_permission(permission: str):
-    """
-    Dependency factory that gates a route behind a role permission check.
-    Raises 403 if the current user's role does not include the required permission.
-    """
+    # Фабрика dependency: каждый вызов возвращает новую async-функцию.
+    # Вызывается один раз на уровне модуля: _guard = require_permission("delete"),
+    # затем используется как Depends(_guard) в маршрутах.
+    # Бросает 403 если role.permissions пользователя не содержит запрошенного права.
     async def _dependency(
         user: User = Depends(current_user),
         db: AsyncSession = Depends(get_async_session),
