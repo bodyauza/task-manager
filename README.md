@@ -93,51 +93,46 @@
 Между шагами 2 и 3 сервер выдаёт короткоживущий JWT (`reg_token`) в HttpOnly-куке —
 он служит доказательством того, что email подтверждён, и связывает шаги без серверного состояния.
 
-```
-Клиент                                        Сервер                          CRM
-  │                                              │                              │
-  │── POST /auth/register/request-code ─────────▶│                              │
-  │   { email }                                  │                              │
-  │                                              │ SELECT person WHERE email=?  │
-  │                                              │ SELECT registration_pending  │
-  │                                              │ secrets.randbelow(1_000_000) │
-  │                                              │ bcrypt_hash(code)            │
-  │                                              │ INSERT registration_pending  │
-  │                                              │ SMTP → отправка письма       │
-  │◀── 200 OK { "message": "Code sent" } ────────│                              │
-  │                                              │                              │
-  │   [пользователь вводит 6-значный код]        │                              │
-  │                                              │                              │
-  │── POST /auth/register/verify-code ───────────▶│                              │
-  │   { email, code }                            │                              │
-  │                                              │ SELECT registration_pending  │
-  │                                              │ проверка expires_at          │
-  │                                              │ проверка attempts < 3        │
-  │                                              │ bcrypt verify(code, hash)    │
-  │                                              │ DELETE registration_pending  │
-  │                                              │ jwt.encode(sub=email,        │
-  │                                              │   purpose="registration",    │
-  │                                              │   exp=now+20min)             │
-  │◀── 200 OK  Set-Cookie: reg_token=<JWT> ──────│                              │
-  │            HttpOnly; SameSite=Strict         │                              │
-  │                                              │                              │
-  │── POST /auth/register/complete ──────────────▶│                              │
-  │   Cookie: reg_token=<JWT>                    │                              │
-  │   { firstname, lastname, patronymic?,        │                              │
-  │     password }                               │                              │
-  │                                              │ jwt.decode(reg_token)        │
-  │                                              │ проверка purpose=            │
-  │                                              │   "registration"             │
-  │                                              │ валидация пароля             │
-  │                                              │──── register_user() ────────▶│
-  │                                              │     group_id, firstname,     │
-  │                                              │     lastname, username, email│
-  │                                              │◀─── { status: "success",    │
-  │                                              │       data: { id: N } }      │
-  │                                              │ INSERT person                │
-  │                                              │ DELETE Cookie: reg_token     │
-  │◀── 201 Created { "message":                  │                              │
-  │      "Registration complete" } ──────────────│                              │
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as 🌐 Клиент
+    participant S as ⚙️ Сервер
+    participant D as 🗄️ PostgreSQL
+    participant M as 📧 SMTP
+    participant R as 🏢 CRM
+
+    rect rgb(219, 234, 254)
+        Note over C,R: Шаг 1 — Запрос кода подтверждения
+        C->>S: POST /auth/register/request-code — body: email
+        S->>D: SELECT person WHERE email=? (дубль → 409)
+        S->>D: SELECT registration_pending (rate-limit → 429)
+        Note right of S: secrets.randbelow(1_000_000) → 6-значный код<br/>bcrypt.hash(code) → code_hash
+        S->>D: INSERT registration_pending (code_hash, expires_at=now+15мин, attempts=0)
+        S->>M: send_confirmation_code(email, code)
+        M-->>C: Письмо с кодом подтверждения
+        S-->>C: 200 OK — message: Code sent
+    end
+
+    rect rgb(254, 243, 199)
+        Note over C,R: Шаг 2 — Верификация кода
+        C->>S: POST /auth/register/verify-code — body: email, code
+        S->>D: SELECT registration_pending WHERE email=?
+        Note right of S: expires_at прошёл? → 400 CODE_EXPIRED<br/>attempts ≥ 3? → 400 TOO_MANY_ATTEMPTS<br/>bcrypt.verify(code, hash) неверно? → 400 INVALID_CODE
+        S->>D: DELETE registration_pending
+        Note right of S: jwt.encode(sub=email, purpose=registration,<br/>exp=now+15мин, secret=REG_TOKEN_SECRET)
+        S-->>C: 200 OK — Set-Cookie: reg_token=eyJ...<br/>HttpOnly, SameSite=Strict, Max-Age=900
+    end
+
+    rect rgb(209, 250, 229)
+        Note over C,R: Шаг 3 — Создание пользователя
+        C->>S: POST /auth/register/complete<br/>Cookie: reg_token=eyJ...<br/>body: firstname, lastname, patronymic?, password
+        Note right of S: jwt.decode(reg_token) → email<br/>purpose == registration? иначе → 401<br/>password regex fail? → 400
+        S->>R: action=insert, entity_id=1<br/>items: group_id, firstname, lastname, username, email
+        R-->>S: status=success, data.id=42
+        S->>D: INSERT INTO person
+        S-->>C: 201 Created — message: Registration complete<br/>Set-Cookie: reg_token=; Max-Age=0
+    end
 ```
 
 ### Коды ошибок регистрации
@@ -164,40 +159,34 @@
 Аутентификация построена на двух JWT-токенах с раздельными секретами и TTL.
 `access_token` используется при каждом запросе, `refresh_token` — только для его обновления.
 
-```
-Клиент                                        Сервер                          CRM
-  │                                              │                              │
-  │── POST /auth/login ──────────────────────────▶│                              │
-  │   Content-Type: application/x-www-form-      │                              │
-  │   urlencoded                                 │                              │
-  │   username=<email>&password=<pwd>            │                              │
-  │                                              │ валидация формата email/pwd  │
-  │                                              │ SELECT person WHERE email=?  │
-  │                                              │ bcrypt verify(pwd, hash)     │
-  │                                              │──── find_user_by_email() ───▶│
-  │                                              │◀─── { id: N } ───────────────│
-  │                                              │ jwt.encode(access_token,     │
-  │                                              │   exp=30min, secret=ACCESS)  │
-  │                                              │ jwt.encode(refresh_token,    │
-  │                                              │   exp=7d, secret=REFRESH)    │
-  │◀── 200 OK                                    │                              │
-  │    Set-Cookie: access_token=<JWT>            │                              │
-  │      HttpOnly; SameSite=Lax; Max-Age=1800    │                              │
-  │    Set-Cookie: refresh_token=<JWT>           │                              │
-  │      HttpOnly; SameSite=Lax; Max-Age=604800  │                              │
-  │                                              │                              │
-  │  [access_token истёк через 30 мин]           │                              │
-  │                                              │                              │
-  │── POST /auth/access-token ───────────────────▶│                              │
-  │   Cookie: refresh_token=<JWT>                │                              │
-  │                                              │ jwt.decode(refresh_token,    │
-  │                                              │   secret=REFRESH)            │
-  │                                              │ SELECT person WHERE id=sub   │
-  │                                              │ проверка is_active           │
-  │                                              │ jwt.encode(новый             │
-  │                                              │   access_token, exp=30min)   │
-  │◀── 200 OK                                    │                              │
-  │    Set-Cookie: access_token=<JWT>            │                              │
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as 🌐 Клиент
+    participant S as ⚙️ Сервер
+    participant D as 🗄️ PostgreSQL
+    participant R as 🏢 CRM
+
+    rect rgb(219, 234, 254)
+        Note over C,R: Вход в систему — POST /auth/login
+        C->>S: POST /auth/login<br/>Content-Type: application/x-www-form-urlencoded<br/>username=email, password=pwd
+        S->>D: SELECT person WHERE email=?
+        Note right of S: bcrypt.verify(pwd, hashed_password)<br/>ошибка → 400 LOGIN_BAD_CREDENTIALS
+        S->>R: action=select, entity_id=1<br/>filters: field_9 == email
+        R-->>S: data: [id, email, ...]
+        Note right of S: jwt.encode(access_token, exp=30мин, secret=ACCESS_SECRET)<br/>jwt.encode(refresh_token, exp=7д, secret=REFRESH_SECRET)
+        S-->>C: 200 OK<br/>Set-Cookie: access_token=eyJ... (HttpOnly, SameSite=Lax, Max-Age=1800)<br/>Set-Cookie: refresh_token=eyJ... (HttpOnly, SameSite=Lax, Max-Age=604800)
+    end
+
+    Note over C,R: ⏱ 30 минут — access_token истёк, fetchWithAuth() инициирует обновление
+
+    rect rgb(254, 243, 199)
+        Note over C,S: Обновление токена — POST /auth/access-token
+        C->>S: POST /auth/access-token<br/>Cookie: refresh_token=eyJ...
+        S->>D: SELECT person WHERE id=sub AND is_active=true
+        Note right of S: jwt.decode(refresh_token, secret=REFRESH_SECRET)<br/>проверка is_active<br/>jwt.encode(access_token, exp=30мин)
+        S-->>C: 200 OK<br/>Set-Cookie: access_token=eyJ... (HttpOnly, SameSite=Lax, Max-Age=1800)
+    end
 ```
 
 ### Токены
