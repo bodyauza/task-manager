@@ -1,16 +1,21 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
 from src.auth.auth_config import fastapi_users
 from src.auth.endpoints import auth_router
 from src.auth.models import Role
+from src.auth.registration_endpoints import registration_router
 from src.auth.user_schemas import UserCreate, UserRead
 from src.config import settings
 from src.database import async_session_maker
@@ -38,6 +43,9 @@ from src.routers.users import router as users_router
 
 
 async def create_initial_roles():
+    # Alembic управляет схемой, не данными — начальные роли не закладываются в миграции.
+    # Идемпотентность: INSERT выполняется только для отсутствующих id;
+    # повторный запуск приложения не дублирует записи.
     try:
         async with async_session_maker() as session:
             result = await session.execute(select(Role).where(Role.id.in_([1, 2])))
@@ -61,12 +69,30 @@ async def create_initial_roles():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # lifespan заменяет устаревший on_event("startup"/"shutdown") начиная с FastAPI 0.93.
+    # Код до yield — инициализация при старте; после yield — завершение при остановке.
     await create_initial_roles()
     yield
 
 
 app = FastAPI(title="Task Manager", lifespan=lifespan)
 
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    # Браузерная навигация посылает Accept: text/html — отвечаем редиректом на логин.
+    # JS fetch посылает Accept: */* — получает JSON 401 и сам запускает цикл обновления токена.
+    # Без этого разделения браузер показывал бы сырой JSON {"detail":"Unauthorized"}
+    # при переходе на защищённый URL без авторизации.
+    if exc.status_code == 401 and "text/html" in request.headers.get("accept", ""):
+        return RedirectResponse(url="/", status_code=302)
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+_static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+
+# cors_origins задан для dev-окружения. В production список нужно сузить
+# до реального домена приложения и убрать все localhost-адреса.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -81,15 +107,39 @@ app.add_middleware(
     ],
 )
 
-app.include_router(
-    fastapi_users.get_register_router(UserRead, UserCreate),
-    prefix="/auth",
-    tags=["Authentication"],
-)
-app.include_router(auth_router)
+@app.middleware("http")
+async def add_csp_header(request: Request, call_next):
+    response = await call_next(request)
+
+    # Swagger UI (FastAPI 0.115+) генерирует HTML с инлайн-<script> для инициализации
+    # SwaggerUIBundle и загружает JS/CSS/favicon с внешних доменов (cdn.jsdelivr.net,
+    # fastapi.tiangolo.com). Добавить 'unsafe-inline' только для /docs — нельзя: CSP
+    # применяется ко всей странице. Исключаем маршруты документации из CSP полностью:
+    # в production Swagger обычно отключается через app = FastAPI(docs_url=None).
+    if request.url.path in ("/docs", "/redoc", "/openapi.json"):
+        return response
+
+    response.headers["Content-Security-Policy"] = (
+        # Запрещает загрузку любых ресурсов со сторонних доменов по умолчанию
+        "default-src 'self'; "
+        # JS вынесен в /static/js/*.js; inline onclick-обработчики заменены на
+        # addEventListener — 'unsafe-inline' больше не требуется.
+        "script-src 'self'; "
+        # Inline <style>-блоки и Bootstrap CSS с jsdelivr CDN
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        # Разрешает fetch-запросы и WebSocket только к своему серверу
+        "connect-src 'self' ws: wss:; "
+        # data: — для возможных data-URI (иконки, аватары)
+        "img-src 'self' data:"
+    )
+    return response
+
+
+app.include_router(registration_router)  # /auth/register/request-code, verify-code, complete
+app.include_router(auth_router)          # /auth/login, /auth/logout, /auth/access-token
 app.include_router(tasks_router)
 app.include_router(users_router)
-app.include_router(pages_router)
+app.include_router(pages_router)   # HTML-страницы монтируются последними
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import func, select
@@ -17,9 +17,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Working with tasks"])
 
-# Ключ — user.id из проверенного JWT-токена, не client_id из URL.
-# Это исключает подмену слота: злоумышленник не может занять соединение
-# другого пользователя, подставив чужой ID в URL.
+# Словарь активных WS-соединений: user_id → (websocket, email).
+# Ключ — user_id: один пользователь может иметь только одно активное соединение.
+# Новое соединение вытесняет предыдущее (закрывает его кодом 1000).
+# При разрыве соединения запись удаляется в блоке except WebSocketDisconnect.
 active_connections: dict[int, tuple[WebSocket, str]] = {}
 
 
@@ -70,11 +71,8 @@ async def websocket_endpoint(
     websocket: WebSocket,
     user_manager: UserManager = Depends(get_user_manager),
 ):
-    """
-    WebSocket с JWT-аутентификацией до accept().
-    client_id в URL не используется для идентификации — слот регистрируется
-    по user.id из токена, что исключает захват чужого соединения.
-    """
+    # Браузеры не поддерживают заголовок Authorization при WS-хэндшейке.
+    # Аутентификация выполняется через куку access_token, установленную при логине.
     token = websocket.cookies.get("access_token")
     if token is None:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
@@ -111,7 +109,24 @@ async def create_task(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    db_task = Task(**task.model_dump(), owner_id=user.id)
+    # Пробуем создать задачу в CRM до INSERT в БД (best-effort).
+    # crm_task_id=None означает, что синхронизация не выполнена.
+    from src.crm.task_service import TaskManager as CRMTaskManager
+
+    crm_task_id: Optional[int] = None
+    try:
+        tm = CRMTaskManager()
+        crm_result = await tm.create_task(
+            title=task.title,
+            description=task.description,
+            completed=False,
+        )
+        crm_task_id = crm_result.get("id")
+        logger.info("CRM: task '%s' created, crm_id=%s", task.title, crm_task_id)
+    except Exception as exc:
+        logger.error("CRM create_task failed for '%s': %s", task.title, exc)
+
+    db_task = Task(**task.model_dump(), owner_id=user.id, crm_task_id=crm_task_id)
     db.add(db_task)
     try:
         await db.commit()
@@ -120,7 +135,9 @@ async def create_task(
         raise HTTPException(status_code=409, detail=f"Task with title '{task.title}' already exists")
     await db.refresh(db_task)
     await broadcast_task_event("task_created", db_task.title, exclude_user_id=user.id, sender_email=user.email)
-    return db_task
+    result = TaskResponse.model_validate(db_task)
+    result.crm_synced = crm_task_id is not None
+    return result
 
 
 @router.get("/tasks/", response_model=List[TaskResponse])
@@ -149,6 +166,8 @@ async def search_tasks_by_title(
     if not title.strip():
         raise HTTPException(status_code=400, detail="Title query parameter must not be empty")
 
+    # Экранируем спецсимволы SQL LIKE (\, %, _) перед подстановкой в паттерн.
+    # Без экранирования поиск по строке «100%» найдёт все записи, а не только содержащие «100%».
     escaped = title.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     pattern = f"%{escaped}%"
     tasks = (await db.execute(
@@ -171,9 +190,12 @@ async def update_task(
     db_task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
     if db_task is None:
         raise HTTPException(status_code=404, detail="Task not found")
+
     update_data = task_update.model_dump(exclude_unset=True)
-    # Вычисляем до commit, пока db_task не expire после возможного rollback
     title_to_report = update_data.get("title") or db_task.title
+    # crm_task_id читается до commit — после expire объект недоступен
+    crm_task_id = db_task.crm_task_id
+
     for key, value in update_data.items():
         setattr(db_task, key, value)
     try:
@@ -182,8 +204,33 @@ async def update_task(
         await db.rollback()
         raise HTTPException(status_code=409, detail=f"Task with title '{title_to_report}' already exists")
     await db.refresh(db_task)
+
+    crm_synced: Optional[bool] = None
+    if crm_task_id is not None:
+        from src.crm.task_service import TaskManager as CRMTaskManager
+        try:
+            tm = CRMTaskManager()
+            await tm.update_task(
+                task_id=crm_task_id,
+                title=update_data.get("title"),
+                description=update_data.get("description"),
+                completed=update_data.get("completed"),
+            )
+            crm_synced = True
+            logger.info("CRM: task id=%s updated (crm_id=%s)", task_id, crm_task_id)
+        except Exception as exc:
+            crm_synced = False
+            logger.error("CRM update_task failed for task id=%s: %s", task_id, exc)
+    else:
+        # Задача не числится в CRM — синхронизация невозможна.
+        # False (не None): фронтенд показывает уведомление при crm_synced === false.
+        crm_synced = False
+        logger.warning("Task id=%s has no crm_task_id — CRM update skipped", task_id)
+
     await broadcast_task_event("task_updated", db_task.title, exclude_user_id=user.id, sender_email=user.email)
-    return db_task
+    result = TaskResponse.model_validate(db_task)
+    result.crm_synced = crm_synced
+    return result
 
 
 @router.delete("/delete-task/{task_id}", response_model=TaskResponse)
@@ -195,10 +242,32 @@ async def delete_task(
     task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    # snapshot — это простой Pydantic-объект, не знает о SQLAlchemy.
-    # обращение к snapshot.title — это просто чтение поля Python-класса.
+
     snapshot = TaskResponse.model_validate(task)
+    # crm_task_id читается до delete/commit — после expire объект недоступен
+    crm_task_id = task.crm_task_id
+
     await db.delete(task)
     await db.commit()
+
+    if crm_task_id is not None:
+        from src.crm.task_service import TaskManager as CRMTaskManager
+        try:
+            tm = CRMTaskManager()
+            await tm.delete_task(crm_task_id)
+            snapshot.crm_synced = True
+            logger.info("CRM: task id=%s deleted (crm_id=%s)", task_id, crm_task_id)
+        except Exception as exc:
+            snapshot.crm_synced = False
+            logger.error(
+                "CRM delete_task failed for task id=%s (crm_id=%s): %s",
+                task_id, crm_task_id, exc,
+            )
+    else:
+        # Задача не числится в CRM — синхронизация невозможна.
+        # False (не None): фронтенд показывает уведомление при crm_synced === false.
+        snapshot.crm_synced = False
+        logger.warning("Task id=%s has no crm_task_id — CRM delete skipped", task_id)
+
     await broadcast_task_event("task_deleted", snapshot.title, exclude_user_id=user.id, sender_email=user.email)
     return snapshot

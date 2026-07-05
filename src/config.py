@@ -6,9 +6,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = os.path.dirname(__file__)
 
-load_dotenv(os.path.join(BASE_DIR, ".dev.env"), override=False)
+# override=False: переменные, уже установленные в os.environ (например, через shell),
+# имеют приоритет над значениями из файлов .env.
+# Порядок важен: .dev.env загружается первым и «захватывает» переменные, не заданные
+# в os.environ. Это нужно для crm/config.py, который читает CRM_* через os.getenv()
+# напрямую, минуя pydantic-settings.
+load_dotenv(os.path.join(BASE_DIR, ".dev.env"),   override=False)
 load_dotenv(os.path.join(BASE_DIR, ".tests.env"), override=False)
-load_dotenv(os.path.join(BASE_DIR, ".env"), override=False)
+load_dotenv(os.path.join(BASE_DIR, ".env"),        override=False)
 
 
 class Settings(BaseSettings):
@@ -19,11 +24,11 @@ class Settings(BaseSettings):
     algorithm: str
     access_exp: int
 
-    # Настройки refresh-токена (используется в /auth/access-token)
+    # Refresh-токен подписывается отдельным секретом.
+    # Компрометация access_secret не позволяет подделать refresh-токен.
     refresh_secret: str
     refresh_exp: int
 
-    # db parameters
     DB_HOST: str
     DB_PORT: str
     DB_USER: str
@@ -31,6 +36,16 @@ class Settings(BaseSettings):
     DB_NAME: str
     DB_DRIVER_SYNC: str
     DB_DRIVER_ASYNC: str
+
+    SMTP_HOST: str = "smtp.yandex.ru"
+    SMTP_PORT: int = 465
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+
+    # Отдельный секрет для reg_token — компрометация access_secret не позволяет
+    # подделать токен незавершённой регистрации.
+    REG_TOKEN_SECRET: str = "change-me-in-production"
+    REG_TOKEN_EXP: int = 1200  # 20 минут
 
     cors_origins: list[str] = [
         "http://localhost",
@@ -46,19 +61,21 @@ class Settings(BaseSettings):
 
 
 class ProductionSettings(Settings):
-    model_config = SettingsConfigDict(env_file=os.path.join(BASE_DIR, ".env"))
+    model_config = SettingsConfigDict(env_file=os.path.join(BASE_DIR, ".env"), extra="ignore")
 
 
 class DevelopmentSettings(Settings):
-    model_config = SettingsConfigDict(env_file=os.path.join(BASE_DIR, ".dev.env"))
+    model_config = SettingsConfigDict(env_file=os.path.join(BASE_DIR, ".dev.env"), extra="ignore")
 
 
 class TestingSettings(Settings):
-    model_config = SettingsConfigDict(env_file=os.path.join(BASE_DIR, ".tests.env"))
+    model_config = SettingsConfigDict(env_file=os.path.join(BASE_DIR, ".tests.env"), extra="ignore")
 
 
 @lru_cache
 def get_settings():
+    # lru_cache: pydantic-settings читает и парсит .env-файл при каждом вызове Settings().
+    # Кэш сводит это к одному разбору на жизненный цикл процесса.
     mode = os.getenv("API_MODE")
     if mode in ("test", "testing"):
         return TestingSettings()

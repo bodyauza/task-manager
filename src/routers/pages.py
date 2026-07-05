@@ -1,11 +1,14 @@
 import os
+from typing import Optional
 
-from fastapi import APIRouter, Depends, Request
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Cookie, Depends, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.auth_config import current_user
-from src.auth.models import User
+from src.auth.models import Role, User
+from src.database import get_async_session
 
 router = APIRouter(tags=["Pages"])
 
@@ -23,6 +26,60 @@ async def register_page(request: Request):
     return templates.TemplateResponse(request, "register.html")
 
 
+@router.get("/confirm-email", response_class=HTMLResponse)
+async def confirm_email_page(request: Request):
+    return templates.TemplateResponse(request, "confirm-email.html")
+
+
+@router.get("/complete-registration", response_class=HTMLResponse)
+async def complete_registration_page(
+    request: Request,
+    reg_token: Optional[str] = Cookie(default=None),
+):
+    # Server-side guard: без reg_token пользователь не должен попасть на эту страницу.
+    # Полная валидация (подпись + срок) происходит при POST /auth/register/complete.
+    if reg_token is None:
+        return RedirectResponse(url="/register", status_code=302)
+    return templates.TemplateResponse(request, "complete-registration.html")
+
+
 @router.get("/task-board", response_class=HTMLResponse)
 async def task_board(request: Request, user: User = Depends(current_user)):
-    return templates.TemplateResponse(request, "task-board.html", {"user": user.id})
+    # current_page передаётся в _navbar.html для выделения активной ссылки меню.
+    return templates.TemplateResponse(
+        request, "task-board.html", {"user": user.id, "current_page": "tasks"}
+    )
+
+
+@router.get("/profile", response_class=HTMLResponse)
+async def profile_page(
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    role = await db.get(Role, user.role_id)
+
+    # Jinja2 рендерит шаблон синхронно. Если передать ORM-объект напрямую,
+    # обращение к «ленивым» атрибутам (например, user.role.name) внутри шаблона
+    # вызовет MissingGreenlet: SQLAlchemy не может выполнить SELECT вне async-контекста.
+    # Все нужные значения извлекаются здесь, пока сессия открыта, и передаются
+    # в шаблон как обычные Python-значения.
+    response = templates.TemplateResponse(
+        request,
+        "profile.html",
+        {
+            "current_page":  "profile",
+            "firstname":     user.firstname,
+            "lastname":      user.lastname,
+            "patronymic":    user.patronymic or "",
+            "email":         user.email,
+            "username":      user.username,
+            "role_name":     role.name if role else "—",
+            "registered_at": (
+                user.registered_at.strftime("%d.%m.%Y") if user.registered_at else "—"
+            ),
+            "is_active": user.is_active,
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
