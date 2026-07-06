@@ -94,6 +94,7 @@
 он служит доказательством того, что email подтверждён, и связывает шаги без серверного состояния.
 
 ```mermaid
+%%{init: {'theme': 'default', 'themeVariables': {'noteTextColor': '#0f172a', 'noteBkgColor': '#fffbeb', 'noteBorderColor': '#b45309', 'signalTextColor': '#0f172a', 'actorTextColor': '#0f172a', 'actorBkg': '#f0f9ff', 'actorBorderColor': '#0284c7', 'labelTextColor': '#0f172a', 'sequenceNumberColor': '#0f172a'}}}%%
 sequenceDiagram
     autonumber
     participant C as 🌐 Клиент
@@ -168,6 +169,7 @@ sequenceDiagram
 `access_token` используется при каждом запросе, `refresh_token` — только для его обновления.
 
 ```mermaid
+%%{init: {'theme': 'default', 'themeVariables': {'noteTextColor': '#0f172a', 'noteBkgColor': '#fffbeb', 'noteBorderColor': '#b45309', 'signalTextColor': '#0f172a', 'actorTextColor': '#0f172a', 'actorBkg': '#f0f9ff', 'actorBorderColor': '#0284c7', 'labelTextColor': '#0f172a', 'sequenceNumberColor': '#0f172a'}}}%%
 sequenceDiagram
     autonumber
     participant C as 🌐 Клиент
