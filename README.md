@@ -140,7 +140,7 @@ sequenceDiagram
         R-->>S: status=success, data.id=42
         S->>D: INSERT INTO person
         S-->>C: 201 Created
-        Note left of C: message: Registration complete<br/>Set-Cookie: reg_token=; Max-Age=0
+        Note left of C: message: Registration complete<br/>reg_token cookie удалена (Max-Age=0)
     end
 ```
 
