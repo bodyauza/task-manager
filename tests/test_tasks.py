@@ -119,7 +119,7 @@ async def test_search_tasks_unauthenticated(client: AsyncClient):
 async def test_update_task_success(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp)
     created = (await _create(client, title="Old Title")).json()
-    r = await client.put(f"/update-task/{created['id']}", json={"title": "New Title", "completed": True})
+    r = await client.patch(f"/tasks/{created['id']}", json={"title": "New Title", "completed": True})
     assert r.status_code == 200
     assert r.json()["title"] == "New Title"
     assert r.json()["completed"] is True
@@ -128,7 +128,7 @@ async def test_update_task_success(client: AsyncClient, mock_smtp: dict):
 async def test_update_task_partial(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp)
     created = (await _create(client, title="Keep Title")).json()
-    r = await client.put(f"/update-task/{created['id']}", json={"completed": True})
+    r = await client.patch(f"/tasks/{created['id']}", json={"completed": True})
     assert r.status_code == 200
     assert r.json()["title"] == "Keep Title"
     assert r.json()["completed"] is True
@@ -138,18 +138,18 @@ async def test_update_task_duplicate_title(client: AsyncClient, mock_smtp: dict)
     await _register_login(client, mock_smtp)
     await _create(client, title="Task A")
     t2 = (await _create(client, title="Task B")).json()
-    r = await client.put(f"/update-task/{t2['id']}", json={"title": "Task A"})
+    r = await client.patch(f"/tasks/{t2['id']}", json={"title": "Task A"})
     assert r.status_code == 409
 
 
 async def test_update_task_not_found(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp)
-    r = await client.put("/update-task/99999", json={"title": "X"})
+    r = await client.patch("/tasks/99999", json={"title": "X"})
     assert r.status_code == 404
 
 
 async def test_update_task_unauthenticated(client: AsyncClient):
-    r = await client.put("/update-task/1", json={"title": "X"})
+    r = await client.patch("/tasks/1", json={"title": "X"})
     assert r.status_code == 401
 
 
@@ -181,7 +181,7 @@ async def test_other_user_can_update_task(client: AsyncClient, mock_smtp: dict):
     created = (await _create(client, title="Shared Task")).json()
     await client.post("/auth/logout")
     await _register_login(client, mock_smtp, EMAIL2)
-    r = await client.put(f"/update-task/{created['id']}", json={"completed": True})
+    r = await client.patch(f"/tasks/{created['id']}", json={"completed": True})
     assert r.status_code == 200
 
 

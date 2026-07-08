@@ -44,7 +44,9 @@ class Settings(BaseSettings):
 
     # Отдельный секрет для reg_token — компрометация access_secret не позволяет
     # подделать токен незавершённой регистрации.
-    REG_TOKEN_SECRET: str = "change-me-in-production"
+    # Нет значения по умолчанию: приложение не запустится без явно заданной переменной
+    # окружения REG_TOKEN_SECRET — случайный дефолт типа "change-me" был бы тихой уязвимостью.
+    REG_TOKEN_SECRET: str
     REG_TOKEN_EXP: int = 1200  # 20 минут
 
     cors_origins: list[str] = [
@@ -58,6 +60,10 @@ class Settings(BaseSettings):
     @property
     def ASYNC_DATABASE_URL(self):
         return f"postgresql+{self.DB_DRIVER_ASYNC}://{self.DB_USER}:{self.DB_PASS}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+
+    @property
+    def is_production(self) -> bool:
+        return self.api_mode in ("prod", "production")
 
 
 class ProductionSettings(Settings):
@@ -87,3 +93,28 @@ def get_settings():
 
 
 settings = get_settings()
+
+"""
+Процесс запускается (API_MODE=dev в shell)
+        ↓
+import src.config
+        ↓
+load_dotenv(".dev.env", override=False)   → os.environ["CRM_API_URL"] = "..."
+load_dotenv(".tests.env", override=False) → CRM_API_URL уже есть, пропускаем
+load_dotenv(".env", override=False)       → пропускаем
+        ↓
+get_settings()
+        ↓
+os.getenv("API_MODE") → "dev"
+        ↓
+DevelopmentSettings()
+  pydantic читает os.environ + ".dev.env"
+  валидирует типы (str "465" → int 465)
+  ValidationError если REG_TOKEN_SECRET отсутствует
+        ↓
+settings = <DevelopmentSettings object>
+        ↓
+@lru_cache сохраняет объект
+        ↓
+все модули импортируют тот же settings
+"""

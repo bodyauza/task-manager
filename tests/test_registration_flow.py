@@ -57,9 +57,9 @@ async def test_request_code_invalid_email(client: AsyncClient):
     assert r.json()["detail"] == "INVALID_EMAIL"
 
 
-async def test_request_code_duplicate_email(client: AsyncClient, register_and_login: dict):
-    # register_and_login регистрирует user@example.com
-    r = await _request_code(client, email=register_and_login["email"])
+async def test_request_code_duplicate_email(client: AsyncClient, registered_user: dict):
+    # registered_user регистрирует user@example.com
+    r = await _request_code(client, email=registered_user["email"])
     assert r.status_code == 409
     assert r.json()["detail"] == "EMAIL_ALREADY_REGISTERED"
 

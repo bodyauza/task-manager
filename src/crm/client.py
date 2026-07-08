@@ -172,6 +172,17 @@ class CRMClient:
     если ни один признак успеха не найден.
     """
 
+    # Разделяемый клиент на уровне класса: новый TCP-пул и TLS-хендшейк при каждом
+    # запросе (как в async with AsyncClient()) обходятся в ~10–20 мс накладных расходов.
+    # Один AsyncClient переиспользует HTTP/1.1 keep-alive соединения между вызовами.
+    _http: httpx.AsyncClient | None = None
+
+    @classmethod
+    def _get_client(cls) -> httpx.AsyncClient:
+        if cls._http is None:
+            cls._http = httpx.AsyncClient(timeout=30.0)
+        return cls._http
+
     def __init__(self):
         self.base_url: str = crm_settings.API_URL
         self.api_key: str = crm_settings.API_KEY
@@ -240,24 +251,22 @@ class CRMClient:
         safe_payload = {k: v for k, v in payload.items() if k not in ("key", "password")}
         logger.info("CRM → %s | %s", full_url, safe_payload)
 
-        # timeout=30.0: CRM demo-инстанс иногда отвечает с задержкой до 20+ с.
-        # Без явного таймаута зависший запрос заблокирует worker до закрытия соединения.
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            try:
-                response = await client.post(full_url, json=payload)
-                response.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                raise Exception(f"HTTP {e.response.status_code}: {e.response.text}")
-            except httpx.ConnectError:
-                raise Exception(f"Connection error: cannot reach {full_url}")
-            except httpx.TimeoutException:
-                raise Exception("CRM request timed out")
+        client = self._get_client()
+        try:
+            response = await client.post(full_url, json=payload)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise Exception(f"HTTP {e.response.status_code}: {e.response.text}")
+        except httpx.ConnectError:
+            raise Exception(f"Connection error: cannot reach {full_url}")
+        except httpx.TimeoutException:
+            raise Exception("CRM request timed out")
 
-            logger.info("CRM ← %s", response.text)
-            try:
-                result = response.json()
-            except Exception:
-                raise Exception(f"CRM returned invalid JSON: {response.text[:200]}")
+        logger.info("CRM ← %s", response.text)
+        try:
+            result = response.json()
+        except Exception:
+            raise Exception(f"CRM returned invalid JSON: {response.text[:200]}")
 
         # Формат признака успеха не стандартизирован между версиями CRM и типами операций.
         # Проверяем все известные варианты — подробнее в docstring класса CRMClient.

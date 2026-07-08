@@ -15,16 +15,18 @@ class Base(DeclarativeBase):
     metadata = metadata
 
 
-_is_prod = settings.api_mode in ("prod", "production")
+_is_prod = settings.is_production
+# NullPool нужен только в тестах: pytest-asyncio создаёт новый event loop на каждый
+# тест, а QueuePool держит соединения привязанными к старому loop — при переходе
+# соединение оказывается «чужим» и asyncpg бросает RuntimeError.
+# В dev-режиме QueuePool оставляем: одиночный event loop uvicorn'а живёт весь запуск,
+# и переиспользование соединений даёт ощутимый прирост скорости при разработке.
+_is_test = settings.api_mode in ("test", "testing")
 
 # echo=True в dev/test режимах: SQLAlchemy логирует все SQL-запросы.
 # В production отключается — в продакшне объём логов SQL нерентабелен.
 engine_kwargs = {"echo": not _is_prod}
-if not _is_prod:
-    # NullPool отключает пул соединений: каждый запрос открывает и закрывает
-    # соединение явно. Нужно для тестов — pytest-asyncio открывает несколько
-    # event loop подряд, а пул держит соединения открытыми между ними,
-    # что приводит к ошибкам «connection already closed».
+if _is_test:
     engine_kwargs["poolclass"] = NullPool
 
 engine = create_async_engine(settings.ASYNC_DATABASE_URL, **engine_kwargs)

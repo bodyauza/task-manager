@@ -128,7 +128,7 @@ async def register_user(
 
 
 @pytest_asyncio.fixture
-async def register_and_login(client: AsyncClient, mock_smtp: dict) -> dict:
+async def registered_user(client: AsyncClient, mock_smtp: dict) -> dict:
     """Регистрирует тестового пользователя через трёхшаговый flow."""
     await client.post(
         "/auth/register/request-code", json={"email": _REG_EMAIL}

@@ -10,14 +10,14 @@ async def _login(client: AsyncClient, email: str, password: str = VALID_PASSWORD
 
 # ── Login ────────────────────────────────────────────────────────────────────
 
-async def test_login_success(client: AsyncClient, register_and_login: dict):
-    r = await _login(client, **register_and_login)
+async def test_login_success(client: AsyncClient, registered_user: dict):
+    r = await _login(client, **registered_user)
     assert r.status_code == 200
     assert "access_token" in r.cookies
 
 
-async def test_login_wrong_password(client: AsyncClient, register_and_login: dict):
-    r = await _login(client, email=register_and_login["email"], password="WrongPass1!")
+async def test_login_wrong_password(client: AsyncClient, registered_user: dict):
+    r = await _login(client, email=registered_user["email"], password="WrongPass1!")
     assert r.status_code == 400
 
 
@@ -28,8 +28,8 @@ async def test_login_nonexistent_user(client: AsyncClient):
 
 # ── Logout ───────────────────────────────────────────────────────────────────
 
-async def test_logout(client: AsyncClient, register_and_login: dict):
-    await _login(client, **register_and_login)
+async def test_logout(client: AsyncClient, registered_user: dict):
+    await _login(client, **registered_user)
     r = await client.post("/auth/logout")
     assert r.status_code == 200
 
@@ -41,8 +41,8 @@ async def test_logout_unauthenticated(client: AsyncClient):
 
 # ── Refresh token ────────────────────────────────────────────────────────────
 
-async def test_refresh_token_success(client: AsyncClient, register_and_login: dict):
-    await _login(client, **register_and_login)
+async def test_refresh_token_success(client: AsyncClient, registered_user: dict):
+    await _login(client, **registered_user)
     r = await client.post("/auth/access-token")
     assert r.status_code == 200
     assert "access_token" in r.cookies

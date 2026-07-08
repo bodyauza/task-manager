@@ -180,7 +180,7 @@ async def search_tasks_by_title(
     return tasks
 
 
-@router.put("/update-task/{task_id}", response_model=TaskResponse)
+@router.patch("/tasks/{task_id}", response_model=TaskResponse)
 async def update_task(
     task_id: int,
     task_update: TaskUpdate,
@@ -191,6 +191,11 @@ async def update_task(
     if db_task is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
+    # model_dump(exclude_unset=True): Pydantic хранит множество __fields_set__ —
+    # имена полей, явно переданных клиентом в теле запроса (не полученных из default).
+    # Тело {"completed": true} даёт update_data = {"completed": True} без "title".
+    # Без exclude_unset PATCH вёл бы себя как PUT: все поля попали бы в словарь
+    # (title=None), и setattr перезаписал бы title задачи в NULL.
     update_data = task_update.model_dump(exclude_unset=True)
     title_to_report = update_data.get("title") or db_task.title
     # crm_task_id читается до commit — после expire объект недоступен

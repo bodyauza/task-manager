@@ -425,8 +425,8 @@ function updatePagination() {
 
 async function updateTask(id, title, description, completed) {
     try {
-        const response = await fetchWithAuth(`/update-task/${id}`, {
-            method: 'PUT',
+        const response = await fetchWithAuth(`/tasks/${id}`, {
+            method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ title, description, completed }),
         });

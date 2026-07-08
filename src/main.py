@@ -2,9 +2,6 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 from fastapi import FastAPI, Request
 from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +19,9 @@ from src.database import async_session_maker
 from src.routers.pages import router as pages_router
 from src.routers.tasks import router as tasks_router
 from src.routers.users import router as users_router
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 # async def create_tables():
