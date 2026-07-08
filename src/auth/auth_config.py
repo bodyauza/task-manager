@@ -8,7 +8,7 @@ from src.config import settings
 from src.database import get_async_session
 
 # secure=True только в production: в dev HTTP нет TLS, браузер не отправит Secure-куку.
-_cookie_secure = settings.api_mode in ("prod", "production")
+_cookie_secure = settings.is_production
 
 # SameSite=lax: кука отправляется при top-level navigation (переход по ссылке),
 # но блокируется при cross-site subresource-запросах — достаточно для защиты от CSRF

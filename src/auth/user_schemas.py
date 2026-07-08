@@ -49,7 +49,7 @@ class UserRead(schemas.BaseUser[int]):
 class UserCreate(schemas.BaseUserCreate):
     # username не передаётся клиентом: вычисляется в UserManager.create()
     # как email.split("@")[0] и записывается в БД.
-    username: str
+    username: Optional[str] = None
     firstname: str
     lastname: str
     # None если отчество не передано — Pydantic не подставляет пустую строку.

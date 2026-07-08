@@ -109,10 +109,11 @@ def _decode_reg_token(token: str) -> str:
         )
 
 
-def _now_naive() -> datetime:
-    # Все TIMESTAMP-поля в БД хранятся без timezone (naive).
-    # datetime.utcnow() deprecated в Python 3.12; используем aware + replace(tzinfo=None).
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+def _now_utc() -> datetime:
+    # TIMESTAMP(timezone=True) в БД хранит aware-datetime в UTC.
+    # Возвращаем aware datetime, чтобы сравнения (now > pending.expires_at)
+    # не бросали TypeError при вычитании naive и aware объектов.
+    return datetime.now(timezone.utc)
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -142,7 +143,7 @@ async def request_registration_code(
     if existing is not None:
         raise HTTPException(status_code=409, detail="EMAIL_ALREADY_REGISTERED")
 
-    now = _now_naive()
+    now = _now_utc()
     pending = (
         await db.execute(
             select(RegistrationPending).where(RegistrationPending.email == email)
@@ -212,7 +213,7 @@ async def verify_registration_code(
     if pending is None:
         raise HTTPException(status_code=400, detail="NO_PENDING_REGISTRATION")
 
-    now = _now_naive()
+    now = _now_utc()
 
     # Проверка срока — до проверки числа попыток: просроченный код не считается попыткой.
     if now > pending.expires_at:
@@ -244,7 +245,7 @@ async def verify_registration_code(
     await db.commit()
 
     token = _issue_reg_token(email)
-    _secure = settings.api_mode in ("prod", "production")
+    _secure = settings.is_production
     # samesite="strict": кука не отправляется при межсайтовых запросах —
     # злоумышленник не может выманить браузер завершить чужую регистрацию.
     # httponly=True: JS не может прочитать токен через document.cookie.
@@ -314,7 +315,7 @@ async def complete_registration(
             raise HTTPException(status_code=409, detail="EMAIL_ALREADY_REGISTERED")
         raise
 
-    _secure = settings.api_mode in ("prod", "production")
+    _secure = settings.is_production
     # Удаление куки: браузер получает Set-Cookie с max_age=0 и немедленно её удаляет.
     # Параметры (secure, httponly, samesite) должны совпадать с теми, что были при выдаче —
     # без них некоторые браузеры игнорируют директиву удаления.

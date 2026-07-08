@@ -254,7 +254,7 @@ sequenceDiagram
 - `GET /tasks/` — список всех задач. Параметры: `skip` (≥ 0, по умолчанию 0), `limit` (1–100, по умолчанию 5). Общее число задач — в заголовке `X-Total-Count`.
 - `GET /tasks/search?title=...` — поиск по части названия (регистронезависимый ILIKE с экранированием спецсимволов). Поддерживает те же параметры пагинации.
 - `POST /create-task/` — создать задачу. `409 Conflict` при дублировании названия.
-- `PUT /update-task/{task_id}` — полное или частичное обновление задачи. `409 Conflict` при переименовании в существующее название.
+- `PATCH /tasks/{task_id}` — частичное обновление задачи (только переданные поля). `409 Conflict` при переименовании в существующее название.
 - `DELETE /delete-task/{task_id}` — удалить задачу.
 
 ### Управление пользователями (требуют роль `admin`)
@@ -390,6 +390,12 @@ src/crm/
 ├── user_service.py  # поиск пользователя по email (используется при логине)
 └── task_service.py  # CRUD-операции с задачами (entity_id=29)
 ```
+
+### HTTP-клиент
+
+`CRMClient` держит один `httpx.AsyncClient` на весь срок жизни процесса (`_http` — класс-переменная, lazy-инициализация при первом запросе). TCP-соединение к CRM переиспользуется между вызовами через HTTP/1.1 keep-alive.
+
+`aclose()` не вызывается явно: при завершении процесса OS закрывает сокеты. Для production с k8s/systemd потребуется инициализация в `lifespan` с явным `await CRMClient._http.aclose()` — это обеспечит drain in-flight запросов до `SIGKILL`.
 
 ### Формат запросов к API
 
@@ -767,7 +773,7 @@ docker exec src-web-1 python -m pytest tests/ -v
 | `client` | function | `httpx.AsyncClient` с `ASGITransport` — HTTP-запросы к приложению без TCP |
 | `mock_crm` | function, autouse | Патч `CRMClient`, `CRMUserSelector`, `TaskManager` через `unittest.mock.patch` |
 | `mock_smtp` | function, autouse | Перехват `send_confirmation_code`; код сохраняется в `dict[email, code]` |
-| `register_and_login` | function | Полный трёхшаговый flow регистрации через HTTP |
+| `registered_user` | function | Полный трёхшаговый flow регистрации через HTTP |
 | `promote_to_admin` | — | Повышает пользователя до `role_id=2` напрямую в БД |
 
 > `httpx.ASGITransport` не запускает ASGI lifespan (`startup`/`shutdown`).

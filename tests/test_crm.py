@@ -39,17 +39,19 @@ def _err_resp(msg: str) -> MagicMock:
 
 
 def _patch_httpx(return_value=None, side_effect=None):
-    """Патчит httpx.AsyncClient как контекстный менеджер."""
+    """Патчит CRMClient._http напрямую — _get_client() возвращает его без вызова конструктора.
+
+    CRMClient кеширует AsyncClient в _http (класс-переменная). patch.object заменяет
+    значение на mock и восстанавливает None после patcher.stop().
+    """
     mock_http = AsyncMock()
     if side_effect:
         mock_http.post = AsyncMock(side_effect=side_effect)
     else:
         mock_http.post = AsyncMock(return_value=return_value)
 
-    patcher = patch("src.crm.client.httpx.AsyncClient")
-    mock_cls = patcher.start()
-    mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_http)
-    mock_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+    patcher = patch.object(CRMClient, "_http", new=mock_http)
+    patcher.start()
     return patcher, mock_http
 
 

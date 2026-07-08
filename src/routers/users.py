@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.auth_config import require_permission
-from src.auth.models import User
+from src.auth.models import Role, User
 from src.auth.user_schemas import UserRead
 from src.database import get_async_session
 
@@ -65,6 +65,13 @@ async def update_user(
     # не попадают. Без exclude_unset=True PATCH перезаписывал бы все поля модели,
     # включая те, которые клиент не трогал.
     update_data = payload.model_dump(exclude_unset=True)
+
+    # Валидация role_id до setattr: db.get возвращает None для несуществующего id,
+    # FK-нарушение на уровне БД дало бы IntegrityError с менее понятным сообщением.
+    if "role_id" in update_data:
+        role = await db.get(Role, update_data["role_id"])
+        if role is None:
+            raise HTTPException(status_code=400, detail="Invalid role_id")
 
     # setattr обновляет атрибуты ORM-объекта через InstrumentedAttribute-дескрипторы.
     # SQLAlchemy перехватывает каждое присваивание и помечает объект как dirty,

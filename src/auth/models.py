@@ -15,10 +15,10 @@ class RegistrationPending(Base):
     code_hash: Mapped[str] = mapped_column(String(1024), nullable=False)
     # attempts: количество неверных попыток. При достижении лимита запись удаляется.
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    expires_at: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP,
-        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
+        TIMESTAMP(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
         nullable=False,
     )
 
@@ -57,18 +57,18 @@ class User(SQLAlchemyBaseUserTable[int], Base):
     __tablename__ = "person"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    email: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     # username = email.split("@")[0], вычисляется в UserManager.create().
     # Хранится в БД отдельно: CRM требует явное поле логина при регистрации.
-    username: Mapped[str] = mapped_column(String, nullable=False)
+    username: Mapped[str] = mapped_column(String(255), nullable=False)
     firstname: Mapped[str] = mapped_column(String(255), nullable=False)
     lastname: Mapped[str] = mapped_column(String(255), nullable=False)
     # nullable=True: отчество необязательно — не все пользователи его имеют.
     # Хранится как NULL, а не как пустая строка, чтобы отличать «не указано» от «пусто».
     patronymic: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     registered_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP,
-        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
+        TIMESTAMP(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
     )
     role_id: Mapped[int] = mapped_column(ForeignKey(Role.id))
     role: Mapped[Role] = relationship("Role")
