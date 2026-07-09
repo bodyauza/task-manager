@@ -1,3 +1,44 @@
+"""
+Поток инициализации тестового окружения (корневой conftest.py)
+──────────────────────────────────────────────────────────────
+pytest выполняет conftest.py ДО импорта любого тестового модуля.
+tests/conftest.py импортирует src.main → src.config → get_settings() кэшируется.
+Весь код ниже должен отработать раньше этой цепочки.
+
+[1] asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())
+    asyncpg несовместим с ProactorEventLoop (умолчание Windows 3.8+).
+    Заменяем на SelectorEventLoop до создания любого event loop.
+
+[2] os.environ["API_MODE"] = "test"
+    Устанавливается до первого src-импорта.
+    get_settings() в src/config.py кэшируется при первом вызове через @lru_cache.
+    Если API_MODE не выставлен здесь → get_settings() вернёт ProductionSettings
+    и все тесты будут работать с продакшн-БД.
+
+[3] load_dotenv(".tests.env", override=True)
+    Проблема: src/config.py при импорте вызывает load_dotenv(".dev.env", override=False).
+    .dev.env записывает DB_NAME=clients в os.environ первым.
+    pydantic-settings читает os.environ с приоритетом над env_file →
+    TestingSettings взяла бы DB_NAME=clients (dev-БД) вместо clients_test.
+    Решение: загрузить .tests.env с override=True до любого src-импорта,
+    чтобы перезаписать dev-значения тестовыми.
+
+[4] Сохранение и восстановление DB_HOST
+    override=True затирает ВСЕ переменные, включая DB_HOST.
+    В Docker docker-compose задаёт DB_HOST=db (имя сервиса контейнера БД).
+    .tests.env содержит DB_HOST=localhost — неверный адрес внутри Docker.
+    Решение: сохранить DB_HOST → load_dotenv(override=True) → восстановить.
+
+[5] Состояние os.environ после выполнения conftest.py
+    os.environ["API_MODE"] = "test"
+    os.environ["DB_NAME"]  = "clients_test"     (из .tests.env)
+    os.environ["DB_HOST"]  = исходное значение  (shell/docker сохранено на шаге [4])
+
+[6] Первый импорт src.config (через tests/conftest.py → src.main)
+    get_settings() → "test" → TestingSettings() → подключение к clients_test
+    @lru_cache фиксирует объект навсегда на время сессии pytest.
+"""
+
 import asyncio
 import os
 import sys

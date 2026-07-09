@@ -9,7 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.auth_config import current_user, get_access_strategy
 from src.auth.manager import UserManager, get_user_manager
-from src.auth.models import Task, User
+from src.auth.models import User
+from src.task_logic.models import Task
 from src.database import get_async_session
 from src.task_logic.task_schemas import TaskCreate, TaskResponse, TaskUpdate
 
@@ -157,9 +158,9 @@ async def read_tasks(
 @router.get("/tasks/search", response_model=List[TaskResponse])
 async def search_tasks_by_title(
     response: Response,
-    title: str,
-    skip: int = Query(0, ge=0),
-    limit: int = Query(5, ge=1, le=100),
+    title: str, # ← Query, обязательный: нет default → FastAPI требует его в URL
+    skip: int = Query(0, ge=0), # ← Query, опциональный: default=0, валидация ≥ 0
+    limit: int = Query(5, ge=1, le=100), # ← Query, опциональный: default=5, валидация 1–100
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):

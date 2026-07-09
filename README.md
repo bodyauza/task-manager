@@ -298,7 +298,7 @@ person
 ├── lastname        VARCHAR(255)
 ├── patronymic      VARCHAR(255) NULL
 ├── hashed_password VARCHAR(1024)       (bcrypt, rounds=14)
-├── registered_at   TIMESTAMP
+├── registered_at   TIMESTAMP WITH TIME ZONE
 ├── role_id         INTEGER FK → role.id
 ├── is_active       BOOLEAN
 ├── is_superuser    BOOLEAN
@@ -317,8 +317,8 @@ registration_pending
 ├── email       VARCHAR(255) UNIQUE
 ├── code_hash   VARCHAR(1024)           (bcrypt-хеш 6-значного кода)
 ├── attempts    INTEGER                 (счётчик неверных попыток, лимит = 3)
-├── expires_at  TIMESTAMP               (now + 15 мин)
-└── created_at  TIMESTAMP               (используется для rate-limit: 60 с)
+├── expires_at  TIMESTAMP WITH TIME ZONE (now + 15 мин)
+└── created_at  TIMESTAMP WITH TIME ZONE (используется для rate-limit: 60 с)
 ```
 
 ### Миграции Alembic
@@ -326,11 +326,12 @@ registration_pending
 | Ревизия | Изменение |
 |---|---|
 | `0001` | Создание таблиц `role`, `person`, `task` |
-| `0002` | Добавление `registration_pending` |
-| `0003` | Добавление `firstname`, `lastname`, `crm_task_id` |
-| `0004` | Уникальный индекс на `task.title` |
-| `0005` | Обновление структуры `person` |
+| `0002` | UNIQUE на `person.email`; удаление индекса `ix_task_description` |
+| `0003` | Добавление `firstname`, `lastname` в `person`; `crm_task_id` в `task` |
+| `0004` | Сужение `task.title` до `VARCHAR(100)` |
+| `0005` | Создание таблицы `registration_pending` |
 | `0006` | Добавление `patronymic` (nullable) в `person` |
+| `0007` | `TIMESTAMP WITH TIME ZONE` для `registered_at`, `expires_at`, `created_at`; `person.username` → `VARCHAR(255)` |
 
 ---
 
@@ -638,6 +639,8 @@ alembic revision --autogenerate -m "describe change"
 alembic upgrade head
 ```
 
+`alembic/env.py` загружает все ORM-модели через `import src.models`. `src/models/__init__.py` — единый реестр: импортирует `src.auth.models` (`User`, `Role`, `RegistrationPending`) и `src.task_logic.models` (`Task`). При добавлении новой модели достаточно добавить импорт в `src/models/__init__.py` — `alembic/env.py` менять не нужно.
+
 ### 7. Запустить сервер
 
 ```
@@ -769,12 +772,13 @@ docker exec src-web-1 python -m pytest tests/ -v
 
 | Фикстура / функция | Scope | Назначение |
 |---|---|---|
-| `setup_and_reset` | function, autouse | Перед тестом: `drop_all + create_all` + заполнение ролей. После: нет (схема пересоздаётся следующим тестом) |
+| `setup_and_reset` | function, autouse | `drop_all + create_all` + безусловная вставка ролей. Teardown отсутствует — следующий тест начнёт с drop_all |
 | `client` | function | `httpx.AsyncClient` с `ASGITransport` — HTTP-запросы к приложению без TCP |
 | `mock_crm` | function, autouse | Патч `CRMClient`, `CRMUserSelector`, `TaskManager` через `unittest.mock.patch` |
 | `mock_smtp` | function, autouse | Перехват `send_confirmation_code`; код сохраняется в `dict[email, code]` |
-| `registered_user` | function | Полный трёхшаговый flow регистрации через HTTP |
-| `promote_to_admin` | — | Повышает пользователя до `role_id=2` напрямую в БД |
+| `registered_user` | function | Полный трёхшаговый flow регистрации через HTTP; возвращает `{"email": ..., "password": ...}` |
+| `register_user` | — (async helper) | Вспомогательная функция: прогоняет три шага регистрации; используется в тестах напрямую |
+| `promote_to_admin` | — (async helper) | Повышает пользователя до `role_id=2` в БД. Требует повторного логина для обновления JWT |
 
 > `httpx.ASGITransport` не запускает ASGI lifespan (`startup`/`shutdown`).
 > Инициализация схемы и ролей выполняется напрямую в `setup_and_reset`, а не через lifespan.
@@ -783,9 +787,9 @@ docker exec src-web-1 python -m pytest tests/ -v
 
 | Модуль | Сценарии |
 |---|---|
-| `test_auth.py` | Логин (успех / неверный пароль / несуществующий пользователь), выход (JS-вариант), refresh-токен (успех / без куки) |
-| `test_registration_flow.py` | request-code (успех / нормализация email / невалидный email / дубль / rate-limit), verify-code (успех / нет pending / неверный код / счётчик попыток / лимит исчерпан / невалидный формат), complete (успех / без токена / слабый пароль / пустой firstname), полный flow + логин, patronymic (с отчеством / без / хранение NULL / возврат значения) |
-| `test_tasks.py` | Создание (успех / дубль / без авторизации), чтение (пагинация / вторая страница), поиск, обновление (успех / частичное / дубль title / 404), удаление, совместный доступ |
-| `test_users.py` | Список (admin / обычный пользователь 403 / без авторизации 401), удаление (успех / 403 / 404), редактирование (успех / 403) |
-| `test_crm.py` | CRM-клиент: создание / обновление / удаление задачи, поиск пользователя |
-| `test_pages.py` | HTML-маршруты: login / register / task-board / profile / complete-registration (без reg_token → редирект) |
+| `test_auth.py` | Логин (успех / неверный пароль / несуществующий пользователь), logout (JS-вариант / без авторизации), refresh-токен (успех / без куки) |
+| `test_registration_flow.py` | request-code (успех / нормализация email / невалидный email / дубль / rate-limit), verify-code (успех / нет pending / неверный код / счётчик попыток / лимит исчерпан / невалидный формат), complete (успех / без токена / слабый пароль / пустой firstname), полный flow + немедленный логин, patronymic (с отчеством / без / хранение NULL) |
+| `test_tasks.py` | Создание (успех / дубль title / без авторизации / пустой title), чтение (пустой список / пагинация / вторая страница / невалидный limit / невалидный skip), поиск (найдено / не найдено / без авторизации), обновление (успех / частичное / дубль title / 404 / без авторизации), удаление (успех / 404 / без авторизации), совместный доступ |
+| `test_users.py` | Список (admin — успех / user — 403 / без авторизации — 401), удаление (успех / 403 / 404), редактирование (успех / 403) |
+| `test_crm.py` | CRMClient: register_user (успех / ConnectError / таймаут / CRM API error / невалидный JSON); find_user_by_email (найден / не найден / ConnectError); TaskManager: create_task / update_task / delete_task (успех и ошибки); _bool_to_crm |
+| `test_pages.py` | HTML-маршруты: login / register / task-board (аутентифицированный и нет) |

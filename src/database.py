@@ -31,6 +31,11 @@ if _is_test:
 
 engine = create_async_engine(settings.ASYNC_DATABASE_URL, **engine_kwargs)
 
+"""
+**engine_kwargs при вызове функции распаковывает словарь в именованные аргументы. Интерпретатор превращает это в:
+create_async_engine(settings.ASYNC_DATABASE_URL, echo=True, poolclass=NullPool)
+"""
+
 # expire_on_commit=False: после commit() атрибуты ORM-объектов не инвалидируются.
 # Без этого флага обращение к полю объекта после commit вызовет lazy SELECT —
 # в async-контексте это приводит к MissingGreenlet, т.к. нет активной сессии.

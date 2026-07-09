@@ -11,6 +11,18 @@ logger = logging.getLogger(__name__)
 class CRMClient:
     """Асинхронный HTTP-клиент для REST API CRM «Руководитель».
 
+    Браузер ──── HTTP запрос ────► FastAPI (сервер)
+                                     │
+                           нужно вызвать CRM API
+                                     │
+                                     ▼
+                               httpx (клиент) ──── HTTP запрос ────► CRM
+                               httpx (клиент) ◄─── HTTP ответ  ────  CRM
+                                     │
+                           вернуть результат
+                                     │
+    FastAPI ──── HTTP ответ ────► Браузер
+
     Формат запросов к API
     ---------------------
     Все запросы — HTTP POST на endpoint /api/rest.php.
@@ -216,7 +228,6 @@ class CRMClient:
         :raises Exception: При HTTP-ошибке, таймауте, невалидном JSON или ответе CRM с ошибкой
         """
         # demo_id — GET-параметр, идентифицирующий конкретный demo-инстанс CRM.
-        # Production-инстансы его не требуют; в .dev.env CRM_DEMO_ID оставляется пустым.
         full_url = self.base_url
         if self.demo_id:
             sep = "&" if "?" in full_url else "?"

@@ -74,6 +74,20 @@ async def lifespan(app: FastAPI):
     await create_initial_roles()
     yield
 
+"""
+uvicorn запускает приложение
+        │
+        ▼
+[1] create_initial_roles()   ← INSERT roles если не существуют
+        │
+        ▼
+[2] yield ─────────────────── приложение работает, принимает HTTP-запросы
+        │
+        │   (Ctrl+C / SIGTERM)
+        ▼
+[3] сюда можно добавить cleanup: закрыть пул, flush логов
+"""
+
 
 app = FastAPI(title="Task Manager", lifespan=lifespan)
 
@@ -88,7 +102,17 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         return RedirectResponse(url="/", status_code=302)
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
+# __file__ — абсолютный путь к main.py в файловой системе.
+# os.path.abspath(__file__) защищает от случаев, когда __file__ содержит
+# относительный путь (зависит от способа запуска: uvicorn, pytest, IDE).
+# os.path.dirname(...) обрезает имя файла, оставляя директорию src/.
+# os.path.join(..., "static") добавляет подпапку → абсолютный путь к src/static/.
 _static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+# app.mount регистрирует отдельное ASGI-приложение (StaticFiles) на префиксе /static.
+# Все запросы вида GET /static/js/task-board.js перехватываются StaticFiles
+# и не доходят до обычных FastAPI-роутеров.
+# name="static" — псевдоним для url_path_for("static", path="...") в шаблонах Jinja2.
 app.mount("/static", StaticFiles(directory=_static_dir), name="static")
 
 # cors_origins задан для dev-окружения. В production список нужно сузить
