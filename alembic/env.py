@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import settings
 from src.database import Base
-import src.auth.models  # noqa: F401 — registers ORM models onto Base.metadata
+import src.models  # noqa: F401 — registers all ORM models onto Base.metadata
 
 config = context.config
 
