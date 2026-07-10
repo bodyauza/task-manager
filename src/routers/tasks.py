@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.auth.auth_config import current_user, get_access_strategy
 from src.auth.manager import UserManager, get_user_manager
 from src.auth.models import User
-from src.task_logic.models import Task
+from src.task_logic.models import Subtask, Task
 from src.database import get_async_session
 from src.task_logic.task_schemas import TaskCreate, TaskResponse, TaskUpdate
 
@@ -48,22 +48,41 @@ async def publish_message(sender_user_id: int, message: str, sender: WebSocket):
         active_connections.pop(uid, None)
 
 
-async def broadcast_task_event(
-    event_type: str,
-    title: str,
-    exclude_user_id: int | None = None,
-    sender_email: str = "",
-):
-    """Рассылает событие задачи всем клиентам, кроме инициатора изменения."""
-    payload = json.dumps({"type": event_type, "title": title, "sender": sender_email})
+async def broadcast_event(payload: dict, exclude_user_id: int | None = None) -> None:
+    """Рассылает произвольное событие всем клиентам, кроме инициатора."""
+    data = json.dumps(payload)
     dead: list[int] = []
     for uid, (connection, _) in list(active_connections.items()):
         if uid == exclude_user_id:
             continue
-        if not await _send_safe(uid, connection, payload):
+        if not await _send_safe(uid, connection, data):
             dead.append(uid)
     for uid in dead:
         active_connections.pop(uid, None)
+
+
+async def broadcast_task_event(
+    event_type: str,                    # тип события: "task_created", "subtask_updated" и т.д.
+    title: str,                         # основное поле payload: title задачи или подзадачи
+    exclude_user_id: int | None = None, # серверный фильтр: broadcast_event пропустит этот uid
+    sender_email: str = "",             # email инициатора → data.sender в payload клиента
+    **extra,                            # дополнительные поля payload: task_title, actor_id и др.
+) -> None:
+    # broadcast_event получает два аргумента:
+    #   1. dict  — JSON-payload: сериализуется и отправляется каждому клиенту по WS.
+    #   2. exclude_user_id — серверный фильтр доставки: broadcast_event пропускает этот uid
+    #      при итерации по active_connections. В payload НЕ входит, клиенту не виден.
+    #
+    # Разделение намеренное: dict — «что отправить»; exclude_user_id — «кому не отправлять».
+    # Если бы exclude_user_id лежал внутри dict — он попал бы в JSON-ответ клиента,
+    # но никого бы не исключил из рассылки: broadcast_event читает его как отдельный аргумент.
+    #
+    # actor_id, напротив, передаётся через **extra и попадает в dict — потому что должен
+    # дойти до фронтенда для ветвления String(data.actor_id) === userId.
+    await broadcast_event(
+        {"type": event_type, "title": title, "sender": sender_email, **extra},
+        exclude_user_id,
+    )
 
 
 @router.websocket("/ws/tasks/{client_id}")
@@ -110,6 +129,19 @@ async def create_task(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
+    # Проверяем уникальность title+owner ДО вызова CRM, чтобы не создавать
+    # дубликаты в CRM при повторном запросе с тем же названием.
+    existing = (
+        await db.execute(
+            select(Task).where(Task.title == task.title, Task.owner_id == user.id)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Задача с названием '{task.title}' уже существует",
+        )
+
     # Пробуем создать задачу в CRM до INSERT в БД (best-effort).
     # crm_task_id=None означает, что синхронизация не выполнена.
     from src.crm.task_service import TaskManager as CRMTaskManager
@@ -149,10 +181,29 @@ async def read_tasks(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    tasks = (await db.execute(select(Task).offset(skip).limit(limit))).scalars().all()
+    # Подзапрос: COUNT(*) подзадач, сгруппированных по task_id.
+    # OUTER JOIN гарантирует, что задачи без подзадач получат count=0.
+    count_sq = (
+        select(Subtask.task_id, func.count(Subtask.id).label("cnt"))
+        .group_by(Subtask.task_id)
+        .subquery("sub_counts")
+    )
+    rows = (
+        await db.execute(
+            select(Task, func.coalesce(count_sq.c.cnt, 0))
+            .outerjoin(count_sq, Task.id == count_sq.c.task_id)
+            .offset(skip)
+            .limit(limit)
+        )
+    ).all()
     total = (await db.execute(select(func.count()).select_from(Task))).scalar_one()
     response.headers["X-Total-Count"] = str(total)
-    return tasks
+    results = []
+    for task, cnt in rows:
+        r = TaskResponse.model_validate(task)
+        r.subtask_count = cnt
+        results.append(r)
+    return results
 
 
 @router.get("/tasks/search", response_model=List[TaskResponse])
@@ -179,6 +230,32 @@ async def search_tasks_by_title(
     )).scalar_one()
     response.headers["X-Total-Count"] = str(total)
     return tasks
+
+
+@router.get("/tasks/{task_id}", response_model=TaskResponse)
+async def get_task(
+    task_id: int,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    count_sq = (
+        select(Subtask.task_id, func.count(Subtask.id).label("cnt"))
+        .group_by(Subtask.task_id)
+        .subquery("sub_counts")
+    )
+    row = (
+        await db.execute(
+            select(Task, func.coalesce(count_sq.c.cnt, 0))
+            .outerjoin(count_sq, Task.id == count_sq.c.task_id)
+            .where(Task.id == task_id)
+        )
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task, cnt = row
+    result = TaskResponse.model_validate(task)
+    result.subtask_count = cnt
+    return result
 
 
 @router.patch("/tasks/{task_id}", response_model=TaskResponse)

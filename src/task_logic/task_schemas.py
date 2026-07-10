@@ -56,3 +56,5 @@ class TaskResponse(BaseModel):
     # True  = последняя синхронизация прошла успешно.
     # False = последняя синхронизация завершилась ошибкой.
     crm_synced: Optional[bool] = None
+    # subtask_count вычисляется через подзапрос в read_tasks; None в остальных эндпоинтах.
+    subtask_count: Optional[int] = None

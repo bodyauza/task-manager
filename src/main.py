@@ -17,6 +17,7 @@ from src.auth.user_schemas import UserCreate, UserRead
 from src.config import settings
 from src.database import async_session_maker
 from src.routers.pages import router as pages_router
+from src.routers.subtasks import router as subtasks_router
 from src.routers.tasks import router as tasks_router
 from src.routers.users import router as users_router
 
@@ -151,8 +152,8 @@ async def add_csp_header(request: Request, call_next):
         "script-src 'self'; "
         # Inline <style>-блоки и Bootstrap CSS с jsdelivr CDN
         "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-        # Разрешает fetch-запросы и WebSocket только к своему серверу
-        "connect-src 'self' ws: wss:; "
+        # Разрешает fetch-запросы и WebSocket к своему серверу; cdn.jsdelivr.net нужен для source map Bootstrap
+        "connect-src 'self' ws: wss: https://cdn.jsdelivr.net; "
         # data: — для возможных data-URI (иконки, аватары)
         "img-src 'self' data:"
     )
@@ -162,6 +163,7 @@ async def add_csp_header(request: Request, call_next):
 app.include_router(registration_router)  # /auth/register/request-code, verify-code, complete
 app.include_router(auth_router)          # /auth/login, /auth/logout, /auth/access-token
 app.include_router(tasks_router)
+app.include_router(subtasks_router)
 app.include_router(users_router)
 app.include_router(pages_router)   # HTML-страницы монтируются последними
 

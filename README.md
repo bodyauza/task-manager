@@ -249,13 +249,24 @@ sequenceDiagram
 
 ### Задачи (требуют действующий `access_token`)
 
-> **Shared board:** все аутентифицированные пользователи видят один общий список и могут редактировать или удалять любую задачу. Инициатор каждого изменения передаётся остальным через WebSocket (`sender: "user@example.com"`).
+> **Shared board:** все аутентифицированные пользователи видят один общий список и могут создавать, редактировать и удалять любую задачу. Инициатор каждого изменения передаётся остальным через WebSocket (`sender: "user@example.com"`).
 
 - `GET /tasks/` — список всех задач. Параметры: `skip` (≥ 0, по умолчанию 0), `limit` (1–100, по умолчанию 5). Общее число задач — в заголовке `X-Total-Count`.
 - `GET /tasks/search?title=...` — поиск по части названия (регистронезависимый ILIKE с экранированием спецсимволов). Поддерживает те же параметры пагинации.
-- `POST /create-task/` — создать задачу. `409 Conflict` при дублировании названия.
+- `GET /tasks/{task_id}` — получить задачу по ID; включает поле `subtask_count`. `404` если задача не найдена.
+- `POST /create-task/` — создать задачу. `409 Conflict` при дублировании названия у того же владельца.
 - `PATCH /tasks/{task_id}` — частичное обновление задачи (только переданные поля). `409 Conflict` при переименовании в существующее название.
-- `DELETE /delete-task/{task_id}` — удалить задачу.
+- `DELETE /delete-task/{task_id}` — удалить задачу; каскадно удаляет все её подзадачи.
+
+### Подзадачи (требуют действующий `access_token`)
+
+> Все аутентифицированные пользователи могут создавать, редактировать и удалять подзадачи любой задачи.
+
+- `POST /create-subtask/` — создать подзадачу. Тело: `{ task_id, title, description }`. `404` если родительская задача не найдена. `409 Conflict` при дублировании названия в рамках той же задачи.
+- `GET /subtasks/` — список подзадач задачи. Параметры: `task_id` (обязательный), `skip` (≥ 0), `limit` (1–100, по умолчанию 5). Общее число — в заголовке `X-Total-Count`.
+- `GET /subtasks/{subtask_id}` — получить подзадачу по ID. `404` если не найдена.
+- `PATCH /subtasks/{subtask_id}` — частичное обновление подзадачи. `409 Conflict` при дублировании названия.
+- `DELETE /delete-subtask/{subtask_id}` — удалить подзадачу.
 
 ### Управление пользователями (требуют роль `admin`)
 
@@ -271,14 +282,19 @@ sequenceDiagram
 
 Типы событий:
 
-| `type` | Когда отправляется |
-|---|---|
-| `chat` | Текстовое сообщение от пользователя |
-| `task_created` | Другой пользователь создал задачу |
-| `task_updated` | Другой пользователь обновил задачу |
-| `task_deleted` | Другой пользователь удалил задачу |
+| `type` | Получатели | Формат сообщения в чате |
+|---|---|---|
+| `chat` | Все кроме отправителя | `sender: text` |
+| `task_created` | Все кроме инициатора | `email: Создана задача: title` |
+| `task_updated` | Все кроме инициатора | `email: Обновлена задача: title` |
+| `task_deleted` | Все кроме инициатора | `email: Удалена задача: title` |
+| `subtask_created` | Все, включая инициатора | инициатор: `Subtask for task 'X' created: 'Y'`; остальные: `email: Создана подзадача «Y» [X]` |
+| `subtask_updated` | Все, включая инициатора | инициатор: `Subtask for task 'X' updated: 'Y'`; остальные: `email: Обновлена подзадача «Y» [X]` |
+| `subtask_deleted` | Все, включая инициатора | инициатор: `Subtask for task 'X' deleted: 'Y'`; остальные: `email: Удалена подзадача «Y» [X]` |
 
-Инициатор действия не получает серверное эхо. При разрыве соединения клиент переподключается через 3 секунды. История чата сохраняется в `localStorage`.
+Для событий задач инициатор исключён из рассылки — он получает подтверждение через HTTP-ответ (`addMessage` в обработчике `resp.ok`). Для событий подзадач broadcast идёт всем; клиент разделяет форматы по полю `actor_id` из payload (`String(data.actor_id) === userId`).
+
+При разрыве соединения клиент переподключается через 3 секунды. История чата сохраняется в `localStorage`.
 
 ---
 
@@ -306,11 +322,21 @@ person
 
 task
 ├── id          INTEGER PK
-├── title       VARCHAR(100) UNIQUE
+├── title       VARCHAR(100)
 ├── description VARCHAR(2000)
 ├── completed   BOOLEAN
 ├── owner_id    INTEGER FK → person.id
-└── crm_task_id INTEGER NULL            (NULL = не синхронизировано с CRM)
+├── crm_task_id INTEGER NULL            (NULL = не синхронизировано с CRM)
+└── UNIQUE(title, owner_id)             (название уникально в рамках владельца)
+
+subtask
+├── id             INTEGER PK
+├── title          VARCHAR(100)
+├── description    VARCHAR(2000)
+├── completed      BOOLEAN
+├── task_id        INTEGER FK → task.id (ondelete CASCADE)
+├── crm_subtask_id INTEGER NULL         (NULL = не синхронизировано с CRM)
+└── UNIQUE(title, task_id)              (название уникально в рамках задачи)
 
 registration_pending
 ├── id          INTEGER PK
@@ -332,6 +358,8 @@ registration_pending
 | `0005` | Создание таблицы `registration_pending` |
 | `0006` | Добавление `patronymic` (nullable) в `person` |
 | `0007` | `TIMESTAMP WITH TIME ZONE` для `registered_at`, `expires_at`, `created_at`; `person.username` → `VARCHAR(255)` |
+| `0008` | Создание таблицы `subtask`; FK → `task.id` с `ondelete CASCADE`; `UNIQUE(title, task_id)` |
+| `0009` | Замена глобального `UNIQUE(task.title)` на `UNIQUE(task.title, task.owner_id)` |
 
 ---
 
@@ -360,6 +388,9 @@ Task Manager интегрирован с CRM-системой [«Руковод�
 | Создание задачи | `action=insert`, entity_id=29 | Задача сохраняется в БД, `crm_task_id=NULL`, предупреждение в UI |
 | Обновление задачи | `action=update`, `update_by_field={id: crm_task_id}` | Задача обновляется в БД, `crm_synced=false` в ответе |
 | Удаление задачи | `action=delete`, `delete_by_field={id: crm_task_id}` | Задача удаляется из БД, `crm_synced=false` в ответе |
+| Создание подзадачи | `action=insert`, entity_id=32 (только если `task.crm_task_id` не NULL) | Подзадача сохраняется в БД, `crm_subtask_id=NULL`, `crm_synced=false` |
+| Обновление подзадачи | `action=update`, `update_by_field={id: crm_subtask_id}` (только если `crm_subtask_id` не NULL) | Подзадача обновляется в БД, `crm_synced=false` в ответе |
+| Удаление подзадачи | `action=delete`, `delete_by_field={id: crm_subtask_id}` (только если `crm_subtask_id` не NULL) | Подзадача удаляется из БД, `crm_synced=false` в ответе |
 
 ### Сущности CRM
 
@@ -386,10 +417,11 @@ CRM_USER_GROUP_ID=6   # ID группы «Сотрудник» в CRM
 
 ```
 src/crm/
-├── config.py        # чтение CRM_* переменных окружения через os.getenv()
-├── client.py        # базовый HTTP-клиент (httpx async), метод _call()
-├── user_service.py  # поиск пользователя по email (используется при логине)
-└── task_service.py  # CRUD-операции с задачами (entity_id=29)
+├── config.py           # чтение CRM_* переменных окружения через os.getenv()
+├── client.py           # базовый HTTP-клиент (httpx async), метод _call()
+├── user_service.py     # поиск пользователя по email (используется при логине)
+├── task_service.py     # CRUD-операции с задачами (entity_id=29)
+└── subtask_service.py  # CRUD-операции с подзадачами (entity_id=32)
 ```
 
 ### HTTP-клиент
@@ -629,7 +661,7 @@ CREATE DATABASE clients;
 alembic upgrade head
 ```
 
-Миграции создают таблицы `role`, `person`, `task`, `registration_pending`.
+Миграции создают таблицы `role`, `person`, `task`, `subtask`, `registration_pending`.
 При первом запуске приложения lifespan заполняет `role` базовыми ролями (`user`, `admin`).
 
 Добавить новую миграцию после изменения моделей:
@@ -793,3 +825,5 @@ docker exec src-web-1 python -m pytest tests/ -v
 | `test_users.py` | Список (admin — успех / user — 403 / без авторизации — 401), удаление (успех / 403 / 404), редактирование (успех / 403) |
 | `test_crm.py` | CRMClient: register_user (успех / ConnectError / таймаут / CRM API error / невалидный JSON); find_user_by_email (найден / не найден / ConnectError); TaskManager: create_task / update_task / delete_task (успех и ошибки); _bool_to_crm |
 | `test_pages.py` | HTML-маршруты: login / register / task-board (аутентифицированный и нет) |
+| `test_subtasks.py` | Создание (успех / 401 / 404 / пустой title / whitespace нормализация / дубль в задаче / одинаковый title в разных задачах / без описания / ошибка CRM / задача без crm_task_id), чтение списка (пустой / 401 / пагинация / вторая страница / невалидный limit/skip / несуществующий task_id), чтение по ID (успех / 404 / 401), обновление (успех / частичное / 404 / 401 / дубль title / ошибка CRM / нет crm_subtask_id), удаление (успех / 404 / 401 / физическое удаление / ошибка CRM / cascade при удалении задачи) |
+| `test_crm_subtask.py` | SubtaskManager: create_subtask (dict-ответ / list-ответ / completed=True / ConnectError / таймаут / CRM API error / невалидный JSON), update_subtask (успех / нет полей / ConnectError / CRM API error), delete_subtask (успех / ConnectError / CRM API error), _bool_to_crm |

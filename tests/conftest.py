@@ -65,7 +65,8 @@ def mock_crm():
     # поэтому там используются реальные экземпляры с httpx-мок.
     with patch("src.crm.client.CRMClient") as mock_crm_cls, \
          patch("src.crm.user_service.CRMUserSelector") as mock_selector_cls, \
-         patch("src.crm.task_service.TaskManager") as mock_task_mgr_cls:
+         patch("src.crm.task_service.TaskManager") as mock_task_mgr_cls, \
+         patch("src.crm.subtask_service.SubtaskManager") as mock_subtask_mgr_cls:
 
         mock_crm_instance = AsyncMock()
         mock_crm_instance.register_user.return_value = {"status": "success", "data": {"id": "99"}}
@@ -83,10 +84,18 @@ def mock_crm():
         mock_task_mgr.delete_task.return_value = {}
         mock_task_mgr_cls.return_value = mock_task_mgr
 
+        mock_subtask_mgr = AsyncMock()
+        # id=55: роутер делает crm_subtask_id=55 → crm_synced=True в ответе по умолчанию
+        mock_subtask_mgr.create_subtask.return_value = {"id": 55, "response": {"status": "success"}}
+        mock_subtask_mgr.update_subtask.return_value = {"status": "success"}
+        mock_subtask_mgr.delete_subtask.return_value = {"status": "success"}
+        mock_subtask_mgr_cls.return_value = mock_subtask_mgr
+
         yield {
             "crm": mock_crm_instance,
             "selector": mock_selector,
             "task_mgr": mock_task_mgr,
+            "subtask_mgr": mock_subtask_mgr,
         }
 
 
