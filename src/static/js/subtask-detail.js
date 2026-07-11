@@ -49,10 +49,133 @@ async function fetchWithAuth(url, options = {}) {
     return resp;
 }
 
+// ── Файлы: рендер и загрузка ─────────────────────────────────────────────────
+
+function renderSpecification(relPath) {
+    // relPath: "subtasks/7/specification/a1b2_tz.pdf" или null.
+    // URL: /uploads/{relPath} — StaticFiles mount отдаёт файл из src/static/uploads/.
+    const block = document.getElementById('specCurrent');
+    if (relPath) {
+        const link = document.getElementById('specLink');
+        link.href        = `/uploads/${relPath}`;        // путь для скачивания/открытия
+        link.textContent = relPath.split('/').pop();     // только имя файла для отображения
+        block.style.display = 'flex';                    // показываем блок с файлом
+    } else {
+        block.style.display = 'none';                    // скрываем если файла нет
+    }
+}
+
+function renderOtherFiles(paths) {
+    // paths: массив rel-путей ["subtasks/7/other/c3d4_doc.pdf", ...].
+    const ul    = document.getElementById('otherFilesList');
+    const count = document.getElementById('otherCount');
+    ul.innerHTML = '';                                   // очищаем список перед перерисовкой
+    count.textContent = `(${paths.length} / 10)`;       // счётчик (текущее / лимит)
+    for (const relPath of paths) {
+        const name = relPath.split('/').pop();           // имя файла с UUID-префиксом
+        const li   = document.createElement('li');
+        const a    = document.createElement('a');
+        a.className   = 'file-link';
+        a.href        = `/uploads/${relPath}`;
+        a.target      = '_blank';
+        a.textContent = name;
+        const btn = document.createElement('button');
+        btn.className        = 'btn-delete-file';
+        btn.dataset.filename = name;
+        btn.textContent      = '✕';
+        li.appendChild(a);
+        li.appendChild(btn);
+        ul.appendChild(li);
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    // Загрузка файла ТЗ: POST /subtasks/{id}/specification с multipart/form-data
+    document.getElementById('specUploadBtn').addEventListener('click', async () => {
+        const input = document.getElementById('specInput');
+        if (!input.files.length) { showToast('Выберите файл', 'warning'); return; }
+        const fd = new FormData();
+        fd.append('file', input.files[0]);    // поле "file" — FastAPI File(...)
+        const resp = await fetchWithAuth(`/subtasks/${subtaskId}/specification`, { method: 'POST', body: fd });
+        if (!resp) return;
+        if (resp.ok) {
+            const data = await resp.json();
+            renderSpecification(data.specification_path);
+            input.value = '';                 // сбрасываем выбор файла в input
+            showToast('Файл ТЗ загружен', 'info');
+        } else {
+            const err = await resp.json();
+            showToast(err.detail || 'Ошибка загрузки', 'warning');
+        }
+    });
+
+    // Удаление файла ТЗ: DELETE /subtasks/{id}/specification
+    document.getElementById('specDeleteBtn').addEventListener('click', async () => {
+        if (!confirm('Удалить файл ТЗ?')) return;
+        const resp = await fetchWithAuth(`/subtasks/${subtaskId}/specification`, { method: 'DELETE' });
+        if (!resp) return;
+        if (resp.ok) {
+            renderSpecification(null);
+            showToast('Файл ТЗ удалён', 'info');
+        } else {
+            const err = await resp.json();
+            showToast(err.detail || 'Ошибка удаления', 'warning');
+        }
+    });
+
+    document.getElementById('otherFilesList').addEventListener('click', (e) => {
+        const btn = e.target.closest('.btn-delete-file');
+        if (btn) deleteOtherFile(btn.dataset.filename);
+    });
+
+    // Загрузка иных документов: POST /subtasks/{id}/files
+    document.getElementById('otherUploadBtn').addEventListener('click', async () => {
+        const input = document.getElementById('otherInput');
+        if (!input.files.length) { showToast('Выберите файлы', 'warning'); return; }
+        const fd = new FormData();
+        for (const f of input.files) fd.append('files', f);
+        const resp = await fetchWithAuth(`/subtasks/${subtaskId}/files`, { method: 'POST', body: fd });
+        if (!resp) return;
+        if (resp.ok) {
+            const data = await resp.json();
+            renderOtherFiles(data.other_file_paths);
+            const count = input.files.length;
+            input.value = '';
+            showToast(`Загружено файлов: ${count}`, 'info');
+        } else {
+            const err = await resp.json();
+            showToast(err.detail || 'Ошибка загрузки файлов', 'warning');
+        }
+    });
+});
+
+async function deleteOtherFile(filename) {
+    // DELETE /subtasks/{id}/files/{filename} — роутер ищет путь по имени в JSON-списке.
+    if (!confirm(`Удалить файл «${filename}»?`)) return;
+    const resp = await fetchWithAuth(
+        `/subtasks/${subtaskId}/files/${encodeURIComponent(filename)}`, { method: 'DELETE' }
+    );
+    if (!resp) return;
+    if (resp.ok) {
+        const data = await resp.json();
+        renderOtherFiles(data.other_file_paths);
+        showToast('Файл удалён', 'info');
+    } else {
+        const err = await resp.json();
+        showToast(err.detail || 'Ошибка удаления файла', 'warning');
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 function renderSubtask(s) {
     currentSubtask = s;
     document.getElementById('viewTitle').textContent = s.title;
     document.getElementById('viewDescription').textContent = s.description || '—';
+
+    // Отрисовываем файлы при каждом вызове renderSubtask (через loadSubtask).
+    renderSpecification(s.specification_path || null);
+    renderOtherFiles(s.other_file_paths || []);
 
     const statusEl = document.getElementById('viewStatus');
     statusEl.innerHTML = `<span class="status-badge ${s.completed ? 'status-completed' : 'status-pending'}">${s.completed ? 'Выполнена' : 'В работе'}</span>`;

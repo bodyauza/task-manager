@@ -115,6 +115,47 @@ def mock_smtp():
         yield captured
 
 
+@pytest.fixture
+def mock_magic():
+    """Патчит magic.from_buffer для имитации MIME-детектирования по magic bytes.
+
+    Логика определения типа по первым байтам (без зависимости от libmagic):
+      b'%PDF...'  → "application/pdf"
+      b'\\x89PNG'  → "image/png"
+      b'PK...'    → docx/xlsx (ZIP-based OpenXML)
+      иначе       → "application/octet-stream"  (неизвестный формат)
+
+    Это позволяет тестам проверять MIME-валидацию без установки libmagic в CI.
+    """
+    def _detect(content, mime=True):
+        if content[:4] == b'%PDF':
+            return "application/pdf"
+        if content[:4] == b'\x89PNG':
+            return "image/png"
+        if content[:2] == b'PK':
+            # docx и xlsx — ZIP-архивы; magic возвращает MIME openxmlformats
+            return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        return "application/octet-stream"  # неизвестная сигнатура
+
+    with patch("src.utils.file_utils.magic.from_buffer", side_effect=_detect):
+        yield
+
+
+@pytest.fixture
+def upload_root(tmp_path):
+    """Временная директория uploads/ для изоляции файловых тестов от диска.
+
+    Патчит UPLOAD_ROOT в обоих файловых роутерах (task_files, subtask_files).
+    Путь содержит 'uploads' в Path.parts — это обязательно для save_file(),
+    которая вычисляет rel-путь через поиск 'uploads' в дереве директорий.
+    """
+    root = tmp_path / "uploads"
+    root.mkdir()
+    with patch("src.routers.task_files.UPLOAD_ROOT", root), \
+         patch("src.routers.subtask_files.UPLOAD_ROOT", root):
+        yield root
+
+
 async def register_user(
     client: AsyncClient,
     mock_smtp: dict,

@@ -219,6 +219,11 @@ async def delete_subtask(
 
     await db.delete(subtask)                        # DELETE FROM subtask WHERE id=?
     await db.commit()                               # фиксируем; после этого запись в БД не существует
+
+    # Удаляем файлы подзадачи с диска после commit.
+    # Отложенный импорт: избегает циклических зависимостей при инициализации модулей.
+    from src.routers.subtask_files import cleanup_subtask_files
+    cleanup_subtask_files(subtask_id)
     await broadcast_task_event(
         "subtask_deleted", snapshot.title,
         sender_email=user.email,  # email актора → data.sender для других пользователей

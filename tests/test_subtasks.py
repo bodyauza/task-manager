@@ -377,7 +377,7 @@ async def test_delete_subtask_crm_failure(client: AsyncClient, mock_smtp: dict, 
     assert check.status_code == 404        # в локальной БД удалено несмотря на ошибку CRM
 
 
-async def test_delete_task_cascades_subtasks(client: AsyncClient, mock_smtp: dict):
+async def test_delete_task_cascades_subtasks(client: AsyncClient, mock_smtp: dict, mock_crm: dict):
     # ForeignKey(ondelete="CASCADE"): при удалении task PostgreSQL удалит все subtask автоматически
     await _register_login(client, mock_smtp)
     task = await _create_task(client)
@@ -385,3 +385,4 @@ async def test_delete_task_cascades_subtasks(client: AsyncClient, mock_smtp: dic
     await client.delete(f"/delete-task/{task['id']}")
     r = await client.get(f"/subtasks/{subtask['id']}")
     assert r.status_code == 404
+    mock_crm["subtask_mgr"].delete_subtask.assert_called_once_with(55)

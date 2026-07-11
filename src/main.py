@@ -18,7 +18,9 @@ from src.config import settings
 from src.database import async_session_maker
 from src.routers.pages import router as pages_router
 from src.routers.subtasks import router as subtasks_router
+from src.routers.subtask_files import router as subtask_files_router   # файлы подзадач
 from src.routers.tasks import router as tasks_router
+from src.routers.task_files import router as task_files_router         # файлы задач
 from src.routers.users import router as users_router
 
 logging.basicConfig(level=logging.INFO)
@@ -73,6 +75,15 @@ async def lifespan(app: FastAPI):
     # lifespan заменяет устаревший on_event("startup"/"shutdown") начиная с FastAPI 0.93.
     # Код до yield — инициализация при старте; после yield — завершение при остановке.
     await create_initial_roles()
+
+    # Гарантируем существование директории uploads/ при старте приложения.
+    # mkdir(parents=True, exist_ok=True): создаёт всю цепочку вложенных папок;
+    # не падает если директория уже существует.
+    # StaticFiles mount на /uploads требует, чтобы директория существовала
+    # ещё до первого запроса — иначе Starlette бросает RuntimeError при инициализации.
+    from pathlib import Path
+    Path("src/static/uploads").mkdir(parents=True, exist_ok=True)
+
     yield
 
 """
@@ -115,6 +126,19 @@ _static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 # и не доходят до обычных FastAPI-роутеров.
 # name="static" — псевдоним для url_path_for("static", path="...") в шаблонах Jinja2.
 app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+
+# Отдельный mount для загруженных пользователями файлов.
+# /static/uploads — физическое расположение; /uploads — URL-префикс для клиентов.
+# Разнесены намеренно: /static обычно кэшируется агрессивно (иммутабельные ресурсы),
+# а /uploads — пользовательские файлы, которые могут меняться.
+# StaticFiles требует, что директория существовала до вызова mount;
+# создание гарантировано в lifespan выше.
+_uploads_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "uploads")
+# StaticFiles требует существования директории на момент вызова app.mount() —
+# это происходит при импорте модуля (до запуска lifespan).
+# makedirs(exist_ok=True) идемпотентен: не падает если директория уже создана.
+os.makedirs(_uploads_dir, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=_uploads_dir), name="uploads")
 
 # cors_origins задан для dev-окружения. В production список нужно сузить
 # до реального домена приложения и убрать все localhost-адреса.
@@ -160,12 +184,14 @@ async def add_csp_header(request: Request, call_next):
     return response
 
 
-app.include_router(registration_router)  # /auth/register/request-code, verify-code, complete
-app.include_router(auth_router)          # /auth/login, /auth/logout, /auth/access-token
+app.include_router(registration_router)   # /auth/register/request-code, verify-code, complete
+app.include_router(auth_router)           # /auth/login, /auth/logout, /auth/access-token
 app.include_router(tasks_router)
+app.include_router(task_files_router)     # /tasks/{id}/specification, /tasks/{id}/files
 app.include_router(subtasks_router)
+app.include_router(subtask_files_router)  # /subtasks/{id}/specification, /subtasks/{id}/files
 app.include_router(users_router)
-app.include_router(pages_router)   # HTML-страницы монтируются последними
+app.include_router(pages_router)          # HTML-страницы монтируются последними
 
 
 if __name__ == "__main__":

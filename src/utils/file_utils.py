@@ -1,0 +1,133 @@
+"""Утилиты для валидации, именования и сохранения загружаемых файлов.
+
+Используется роутерами task_files.py и subtask_files.py.
+Логика валидации вынесена сюда, а не в роутеры, чтобы не дублировать код.
+"""
+
+import magic                        # python-magic-bin: MIME-детектор по сигнатуре байтов
+from pathlib import Path
+from uuid import uuid4
+
+from fastapi import HTTPException, UploadFile
+
+# ── Константы ────────────────────────────────────────────────────────────────
+
+# Максимальный размер одного загружаемого файла: 100 МБ.
+# read_and_validate() читает файл целиком в память → превышение даёт 413.
+MAX_FILE_SIZE = 100 * 1024 * 1024   # 100 МБ в байтах
+
+# Максимальное количество файлов в поле «Иные документы» на одну запись.
+# Проверяется в роутере: len(existing) + len(new_files) > MAX_OTHER_FILES → 422.
+MAX_OTHER_FILES = 10
+
+# Белый список допустимых расширений и соответствующих им MIME-типов.
+# Ключ — расширение в нижнем регистре (с точкой).
+# Значение — множество допустимых MIME-типов для этого расширения.
+# Двойная проверка (расширение + MIME) защищает от переименованных файлов:
+# файл virus.exe, переименованный в virus.pdf, будет отклонён по MIME.
+ALLOWED: dict[str, set[str]] = {
+    ".pdf":  {"application/pdf"},
+    ".doc":  {"application/msword"},
+    ".docx": {"application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+    ".xls":  {"application/vnd.ms-excel"},
+    ".xlsx": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+    ".jpg":  {"image/jpeg"},
+    ".jpeg": {"image/jpeg"},
+    ".png":  {"image/png"},
+    ".txt":  {"text/plain"},
+}
+
+
+# ── Валидация ────────────────────────────────────────────────────────────────
+
+async def read_and_validate(file: UploadFile) -> bytes:
+    """Читает файл из запроса и проверяет размер, расширение и MIME-тип.
+
+    Последовательность проверок:
+    1. Размер: file.read() читает всё в память; если > MAX_FILE_SIZE → 413.
+    2. Расширение: суффикс имени файла должен быть в ALLOWED → иначе 422.
+    3. MIME-тип: magic.from_buffer анализирует первые байты файла по сигнатуре
+       (magic bytes) — не зависит от расширения. Должен совпадать с допустимым
+       множеством для данного расширения → иначе 422.
+
+    Возвращает байты файла для последующей записи на диск.
+    """
+    content: bytes = await file.read()  # читаем файл целиком в память для проверки размера
+
+    if len(content) > MAX_FILE_SIZE:
+        # 413 Request Entity Too Large: файл превышает лимит.
+        raise HTTPException(
+            status_code=413,
+            detail=f"Размер файла превышает лимит {MAX_FILE_SIZE // (1024 * 1024)} МБ",
+        )
+
+    suffix = Path(file.filename).suffix.lower()  # ".PDF" → ".pdf"; суффикс с точкой
+    if suffix not in ALLOWED:
+        # 422 Unprocessable Entity: расширение не в белом списке.
+        allowed_exts = ", ".join(sorted(ALLOWED))
+        raise HTTPException(
+            status_code=422,
+            detail=f"Расширение '{suffix}' не разрешено. Допустимые: {allowed_exts}",
+        )
+
+    # magic.from_buffer определяет MIME по сигнатуре байтов файла (не по расширению).
+    # Например, PDF начинается с %PDF-1.x; PNG — с \x89PNG\r\n\x1a\n.
+    # mime=True: возвращает строку MIME-типа, а не текстовое описание.
+    detected_mime: str = magic.from_buffer(content, mime=True)
+
+    if detected_mime not in ALLOWED[suffix]:
+        # 422: MIME не совпадает с ожидаемым для этого расширения.
+        # Типичная причина: файл переименован (logo.png → logo.pdf).
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"MIME-тип файла '{detected_mime}' не соответствует расширению '{suffix}'. "
+                f"Ожидается: {', '.join(ALLOWED[suffix])}"
+            ),
+        )
+
+    return content  # валидация пройдена; возвращаем байты для сохранения
+
+
+# ── Именование ───────────────────────────────────────────────────────────────
+
+def safe_filename(original: str) -> str:
+    """Добавляет UUID-префикс к имени файла для предотвращения коллизий.
+
+    Пример: "report.pdf" → "a1b2c3d4_report.pdf"
+    uuid4().hex[:8]: 8 шестнадцатеричных символов = 32^8 = ~4 млрд вариантов;
+    достаточно для предотвращения коллизий даже при параллельных загрузках.
+    Исходное имя сохраняется читаемым для пользователя.
+    """
+    return f"{uuid4().hex[:8]}_{Path(original).name}"
+
+
+# ── Запись на диск ───────────────────────────────────────────────────────────
+
+def save_file(dest_dir: Path, filename: str, content: bytes) -> str:
+    """Создаёт директорию (если нужно), записывает файл и возвращает относительный путь.
+
+    Возвращаемый путь — относительно src/static/uploads/, например:
+    "tasks/3/specification/a1b2c3d4_tz.pdf"
+    Используется для хранения в БД и формирования URL: /uploads/<rel_path>.
+
+    dest_dir должен быть абсолютным путём внутри UPLOAD_ROOT.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)  # создать директорию рекурсивно, если нет
+    (dest_dir / filename).write_bytes(content)   # записать байты в файл
+
+    # Строим относительный путь: всё, что идёт после директории "uploads/" в abs-пути.
+    # Пример: .../src/static/uploads/tasks/3/specification → "tasks/3/specification/file.pdf"
+    parts = dest_dir.parts
+    uploads_idx = next(i for i, p in enumerate(parts) if p == "uploads")  # индекс папки uploads
+    rel = "/".join(parts[uploads_idx + 1:]) + f"/{filename}"  # "tasks/3/specification/file.pdf"
+    return rel
+
+
+# ── Десериализация ───────────────────────────────────────────────────────────
+
+def parse_other_paths(raw: list[str] | None) -> list[str]:
+    """JSONB-колонка PostgreSQL → list[str]. asyncpg десериализует JSONB в list автоматически.
+    Возвращает [] при NULL (нет файлов).
+    """
+    return raw if raw is not None else []

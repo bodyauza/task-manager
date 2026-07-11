@@ -56,10 +56,138 @@ function subtaskLabel(n) {
     return `${n} подзадач`;
 }
 
+// ── Файлы: рендер и загрузка ─────────────────────────────────────────────────
+
+function renderSpecification(relPath) {
+    // relPath: "tasks/3/specification/a1b2_tz.pdf" или null.
+    // URL: /uploads/{relPath} — отдаётся StaticFiles mount на /uploads.
+    const block = document.getElementById('specCurrent');
+    if (relPath) {
+        const link = document.getElementById('specLink');
+        link.href        = `/uploads/${relPath}`;           // StaticFiles mount /uploads
+        link.textContent = relPath.split('/').pop();        // только имя файла для отображения
+        block.style.display = 'flex';                       // показываем блок с файлом
+    } else {
+        block.style.display = 'none';                       // скрываем если файла нет
+    }
+}
+
+function renderOtherFiles(paths) {
+    // paths: массив rel-путей, например ["tasks/3/other/c3d4_doc.pdf"].
+    const ul    = document.getElementById('otherFilesList');
+    const count = document.getElementById('otherCount');
+    ul.innerHTML = '';                                      // очищаем список перед перерисовкой
+    count.textContent = `(${paths.length} / 10)`;          // счётчик (текущее / лимит)
+    for (const relPath of paths) {
+        const name = relPath.split('/').pop();              // "a1b2_doc.pdf" из пути
+        const li   = document.createElement('li');
+        const a    = document.createElement('a');
+        a.className   = 'file-link';
+        a.href        = `/uploads/${relPath}`;
+        a.target      = '_blank';
+        a.textContent = name;
+        const btn = document.createElement('button');
+        btn.className        = 'btn-delete-file';
+        btn.dataset.filename = name;  // data-filename вместо onclick: inline handlers блокирует CSP
+        btn.textContent      = '✕';
+        li.appendChild(a);
+        li.appendChild(btn);
+        ul.appendChild(li);
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    // Загрузка файла ТЗ: POST /tasks/{id}/specification с multipart/form-data
+    document.getElementById('specUploadBtn').addEventListener('click', async () => {
+        const input = document.getElementById('specInput');
+        if (!input.files.length) { showToast('Выберите файл', 'warning'); return; }
+        const fd = new FormData();
+        fd.append('file', input.files[0]);    // поле "file" — FastAPI File(...)
+        const resp = await fetchWithAuth(`/tasks/${taskId}/specification`, { method: 'POST', body: fd });
+        if (!resp) return;
+        if (resp.ok) {
+            const data = await resp.json();
+            renderSpecification(data.specification_path);
+            input.value = '';                 // сбрасываем выбор файла в input
+            showToast('Файл ТЗ загружен', 'info');
+        } else {
+            const err = await resp.json();
+            showToast(err.detail || 'Ошибка загрузки', 'warning');
+        }
+    });
+
+    // Удаление файла ТЗ: DELETE /tasks/{id}/specification
+    document.getElementById('specDeleteBtn').addEventListener('click', async () => {
+        if (!confirm('Удалить файл ТЗ?')) return;
+        const resp = await fetchWithAuth(`/tasks/${taskId}/specification`, { method: 'DELETE' });
+        if (!resp) return;
+        if (resp.ok) {
+            renderSpecification(null);
+            showToast('Файл ТЗ удалён', 'info');
+        } else {
+            const err = await resp.json();
+            showToast(err.detail || 'Ошибка удаления', 'warning');
+        }
+    });
+
+    // Делегирование клика на кнопки удаления файлов — CSP запрещает inline onclick.
+    // Слушатель на <ul> перехватывает клики от всех дочерних .btn-delete-file.
+    document.getElementById('otherFilesList').addEventListener('click', (e) => {
+        const btn = e.target.closest('.btn-delete-file');
+        if (btn) deleteOtherFile(btn.dataset.filename);
+    });
+
+    // Загрузка иных документов: POST /tasks/{id}/files с несколькими файлами
+    document.getElementById('otherUploadBtn').addEventListener('click', async () => {
+        const input = document.getElementById('otherInput');
+        if (!input.files.length) { showToast('Выберите файлы', 'warning'); return; }
+        const fd = new FormData();
+        // поле "files" — FastAPI принимает list[UploadFile] = File(...)
+        for (const f of input.files) fd.append('files', f);
+        const resp = await fetchWithAuth(`/tasks/${taskId}/files`, { method: 'POST', body: fd });
+        if (!resp) return;
+        if (resp.ok) {
+            const data = await resp.json();
+            renderOtherFiles(data.other_file_paths);
+            const count = input.files.length; // сохранить до сброса: input.value='' обнуляет FileList
+            input.value = '';
+            showToast(`Загружено файлов: ${count}`, 'info');
+        } else {
+            const err = await resp.json();
+            showToast(err.detail || 'Ошибка загрузки файлов', 'warning');
+        }
+    });
+});
+
+async function deleteOtherFile(filename) {
+    // filename: имя файла с UUID-префиксом, например "a1b2c3d4_doc.pdf".
+    // DELETE /tasks/{id}/files/{filename} — роутер ищет путь по имени в списке.
+    if (!confirm(`Удалить файл «${filename}»?`)) return;
+    const resp = await fetchWithAuth(
+        `/tasks/${taskId}/files/${encodeURIComponent(filename)}`, { method: 'DELETE' }
+    );
+    if (!resp) return;
+    if (resp.ok) {
+        const data = await resp.json();
+        renderOtherFiles(data.other_file_paths);
+        showToast('Файл удалён', 'info');
+    } else {
+        const err = await resp.json();
+        showToast(err.detail || 'Ошибка удаления файла', 'warning');
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 function renderTask(t) {
     currentTask = t;
     document.getElementById('viewTitle').textContent = t.title;
     document.getElementById('viewDescription').textContent = t.description || '—';
+
+    // Отрисовываем файлы: renderSpecification и renderOtherFiles вызываются каждый раз
+    // при loadTask() — это гарантирует актуальность состояния после перезагрузки страницы.
+    renderSpecification(t.specification_path || null);
+    renderOtherFiles(t.other_file_paths || []);
 
     const statusEl = document.getElementById('viewStatus');
     statusEl.innerHTML = `<span class="status-badge ${t.completed ? 'status-completed' : 'status-pending'}">${t.completed ? 'Выполнена' : 'В работе'}</span>`;

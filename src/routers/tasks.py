@@ -327,11 +327,42 @@ async def delete_task(
         raise HTTPException(status_code=404, detail="Task not found")
 
     snapshot = TaskResponse.model_validate(task)
-    # crm_task_id читается до delete/commit — после expire объект недоступен
     crm_task_id = task.crm_task_id
+
+    # Один запрос до CASCADE-удаления: id нужен для очистки файлов на диске,
+    # crm_subtask_id — для удаления подзадач в CRM. После commit оба недоступны.
+    subtask_rows = (
+        await db.execute(
+            select(Subtask.id, Subtask.crm_subtask_id).where(Subtask.task_id == task_id)
+        )
+    ).all()
+    subtask_ids: list[int] = [row[0] for row in subtask_rows]
+    crm_subtask_ids: list[int] = [row[1] for row in subtask_rows if row[1] is not None]
 
     await db.delete(task)
     await db.commit()
+
+    from src.routers.task_files import cleanup_task_files
+    cleanup_task_files(task_id)
+
+    # Файлы подзадач хранятся отдельно (uploads/subtasks/{id}/),
+    # cleanup_task_files не затрагивает их — удаляем явно.
+    if subtask_ids:
+        from src.routers.subtask_files import cleanup_subtask_files
+        for sub_id in subtask_ids:
+            cleanup_subtask_files(sub_id)
+
+    # Удаляем подзадачи из CRM: CASCADE удалил их в локальной БД,
+    # но CRM не знает об этом — подзадачи (entity_id=32) остались бы orphan-записями.
+    if crm_subtask_ids:
+        from src.crm.subtask_service import SubtaskManager
+        sm = SubtaskManager()
+        for crm_sub_id in crm_subtask_ids:
+            try:
+                await sm.delete_subtask(crm_sub_id)
+                logger.info("CRM: subtask crm_id=%s deleted (cascade from task %s)", crm_sub_id, task_id)
+            except Exception as exc:
+                logger.error("CRM: cascade delete subtask crm_id=%s failed: %s", crm_sub_id, exc)
 
     if crm_task_id is not None:
         from src.crm.task_service import TaskManager as CRMTaskManager

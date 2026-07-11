@@ -44,6 +44,19 @@
         .notif.notif-show { opacity: 1; transform: translateX(0); }
         .notif.notif-warning { background: #e65100; }
         .notif.notif-info { background: #003f6b; }
+        /* ── Секция файлов ────────────────────────────────── */
+        .file-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid #dee2e6; }
+        .file-upload-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+        .file-upload-row input[type="file"] { flex: 1; min-width: 0; font-size: 13px; }
+        .btn-upload { background-color: #546e7a; }
+        .btn-upload:hover { background-color: #37474f; }
+        .file-current { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+        .file-link { font-size: 13px; color: #003f6b; word-break: break-all; }
+        .btn-delete-file { background-color: #b71c1c; padding: 4px 10px; font-size: 12px; }
+        .btn-delete-file:hover { background-color: #961515; }
+        .file-list { list-style: none; padding: 0; margin: 6px 0 0; }
+        .file-list li { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+        .files-counter { font-size: 11px; color: #6c757d; margin-left: 4px; }
     </style>
 </head>
 <body>
@@ -74,6 +87,39 @@
                     <span class="field-label">Синхронизация CRM</span>
                     <span id="viewCrm"></span>
                 </div>
+
+                <!-- ── Техническое задание ─────────────────────────────────────── -->
+                <div class="file-section">
+                    <span class="field-label">Техническое задание</span>
+                    <!-- spec-current скрыт если файл не загружен; JS управляет видимостью -->
+                    <div class="file-current" id="specCurrent" style="display:none;">
+                        <a class="file-link" id="specLink" href="#" target="_blank"></a>
+                        <button class="btn-delete-file" id="specDeleteBtn">✕ Удалить</button>
+                    </div>
+                    <div class="file-upload-row">
+                        <!-- accept: браузерный фильтр диалога выбора файла (не замена серверной валидации) -->
+                        <input type="file" id="specInput"
+                               accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png,.txt">
+                        <button class="btn-upload" id="specUploadBtn">Загрузить</button>
+                    </div>
+                </div>
+
+                <!-- ── Иные документы ──────────────────────────────────────────── -->
+                <div class="file-section">
+                    <span class="field-label">
+                        Иные документы
+                        <span class="files-counter" id="otherCount">(0 / 10)</span>
+                    </span>
+                    <!-- other-files-list заполняется JS при loadSubtask() -->
+                    <ul class="file-list" id="otherFilesList"></ul>
+                    <div class="file-upload-row">
+                        <!-- multiple: позволяет выбрать несколько файлов за раз -->
+                        <input type="file" id="otherInput" multiple
+                               accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png,.txt">
+                        <button class="btn-upload" id="otherUploadBtn">Добавить файлы</button>
+                    </div>
+                </div>
+
                 <div class="actions-row">
                     <button id="editToggleBtn">Редактировать</button>
                     <button class="delete" id="deleteBtn">Удалить</button>
