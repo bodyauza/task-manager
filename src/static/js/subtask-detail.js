@@ -1,6 +1,8 @@
 const subtaskId = parseInt(document.getElementById('subtaskId').value, 10);
 const taskId    = parseInt(document.getElementById('taskId').value, 10);
+const userId    = document.getElementById('userId').value;
 let currentSubtask = null;
+let socket;
 
 function escapeHtml(v) {
     const d = document.createElement('div');
@@ -272,8 +274,36 @@ async function deleteSubtask() {
     }
 }
 
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+// Симметрично task-detail.js: реагирует на файловые события этой подзадачи.
+
+function connectWebSocket() {
+    try {
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws/tasks/${userId}`);
+
+        socket.onmessage = function(event) {
+            try {
+                const data = JSON.parse(event.data);
+                if (data.type === 'subtask_files_updated' && data.subtask_id === subtaskId) {
+                    loadSubtask();  // перечитываем актуальное состояние с сервера
+                    showToast(`${data.sender}: файлы подзадачи обновлены`, 'info');
+                }
+            } catch (e) { /* нераспознанное сообщение — игнорируем */ }
+        };
+
+        socket.onclose = function(event) {
+            if (event.code === 1008) { window.location.href = '/'; return; }
+            setTimeout(connectWebSocket, 3000);   // переподключение при разрыве
+        };
+    } catch (error) {
+        setTimeout(connectWebSocket, 3000);
+    }
+}
+
 window.addEventListener('load', function() {
     loadSubtask();
+    connectWebSocket();
 
     document.getElementById('editToggleBtn').addEventListener('click', openEditForm);
     document.getElementById('cancelBtn').addEventListener('click', closeEditForm);

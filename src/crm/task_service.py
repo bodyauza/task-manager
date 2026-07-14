@@ -1,4 +1,3 @@
-import base64
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -12,35 +11,17 @@ class TaskManager(CRMClient):
     """CRUD-операции с сущностью «Задачи» (entity_id=29).
 
     Поля:
-        field_311 — Название    (строка, уникальное)
-        field_312 — Описание    (текст)
-        field_313 — Статус      (чекбокс: "true" / "false")
+        field_317 — Название    (строка, уникальное)
+        field_318 — Описание    (текст)
+        field_319 — Статус      (чекбокс: "true" / "false")
     """
 
     ENTITY_ID   = 29    # числовой ID сущности «Задачи» в CRM Руководитель
-    FIELD_TITLE = 311   # ID поля «Название»
-    FIELD_DESCR = 312   # ID поля «Описание»
-    FIELD_DONE  = 313   # ID поля «Статус» (чекбокс: "true" / "false")
-    FIELD_SPEC  = 395   # ID поля «Техническое задание» (file upload, одиночный файл)
-    FIELD_OTHER = 396   # ID поля «Иные документы» (вложения, множественные файлы)
-
-    @staticmethod
-    def _bool_to_crm(value: bool) -> str:
-        """Преобразует bool в строковый формат поля-чекбокса CRM."""
-        return "true" if value else "false"
-
-    @staticmethod
-    def _file_to_crm(abs_path: Path) -> dict:
-        """Читает файл с диска и возвращает CRM-совместимый словарь.
-
-        CRM ожидает файлы в виде {'name': 'filename.pdf', 'content': '<base64>'}.
-        Метод вызывается только если abs_path существует — роутер создаёт файл
-        до вызова update_task, поэтому read_bytes() не должен упасть.
-        """
-        return {
-            "name":    abs_path.name,                                    # оригинальное имя (с UUID-префиксом)
-            "content": base64.b64encode(abs_path.read_bytes()).decode(), # base64 без переносов строк
-        }
+    FIELD_TITLE = 317   # ID поля «Название»
+    FIELD_DESCR = 318   # ID поля «Описание»
+    FIELD_DONE  = 319   # ID поля «Статус» (чекбокс: "true" / "false")
+    FIELD_SPEC  = 320   # ID поля «Техническое задание» (file upload, одиночный файл)
+    FIELD_OTHER = 321   # ID поля «Иные документы» (вложения, множественные файлы)
 
     async def create_task(
         self,
@@ -85,9 +66,9 @@ class TaskManager(CRMClient):
     ) -> Dict[str, Any]:
         """Обновляет задачу по CRM-ID; передаёт только заполненные поля.
 
-        clear_specification=True: field_395 = [] (CRM удаляет вложение ТЗ).
-        other_file_abs_paths=[]: field_396 = [] (CRM очищает поле иных документов).
-        other_file_abs_paths=[p1,p2]: field_396 = [file1, file2] (полная замена содержимого поля).
+        clear_specification=True: field_320 = [] (CRM удаляет вложение ТЗ).
+        other_file_abs_paths=[]: field_321 = [] (CRM очищает поле иных документов).
+        other_file_abs_paths=[p1,p2]: field_321 = [file1, file2] (полная замена содержимого поля).
         """
         data: Dict[str, Any] = {}
         if title is not None:

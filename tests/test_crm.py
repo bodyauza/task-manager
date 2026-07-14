@@ -15,6 +15,13 @@ from src.crm.client import CRMClient
 from src.crm.task_service import TaskManager
 from src.crm.user_service import CRMUserSelector
 
+# Ключи полей CRM выводятся из констант TaskManager, а не хардкодятся строками:
+# сторонние разработчики меняют FIELD_TITLE/FIELD_DESCR/FIELD_DONE в task_service.py
+# под свой demo-инстанс CRM, и эти тесты продолжают проходить без правок.
+_FIELD_TITLE = f"field_{TaskManager.FIELD_TITLE}"
+_FIELD_DESCR = f"field_{TaskManager.FIELD_DESCR}"
+_FIELD_DONE  = f"field_{TaskManager.FIELD_DONE}"
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -186,9 +193,9 @@ async def test_create_task_success_dict_data():
         assert result["id"] == 17
         payload = mock_http.post.call_args.kwargs["json"]
         assert payload["action"] == "insert"
-        assert payload["entity_id"] == 29
-        assert payload["items"][0]["field_311"] == "Task A"
-        assert payload["items"][0]["field_313"] == "false"
+        assert payload["entity_id"] == TaskManager.ENTITY_ID
+        assert payload["items"][0][_FIELD_TITLE] == "Task A"
+        assert payload["items"][0][_FIELD_DONE] == "false"
     finally:
         patcher.stop()
 
@@ -235,9 +242,9 @@ async def test_update_task_success():
         assert result["status"] == "success"
         payload = mock_http.post.call_args.kwargs["json"]
         assert payload["action"] == "update"
-        assert payload["data"]["field_311"] == "New Title"
-        assert payload["data"]["field_313"] == "true"
-        assert "field_312" not in payload["data"]
+        assert payload["data"][_FIELD_TITLE] == "New Title"
+        assert payload["data"][_FIELD_DONE] == "true"
+        assert _FIELD_DESCR not in payload["data"]
         assert payload["update_by_field"] == {"id": 17}
     finally:
         patcher.stop()
@@ -276,7 +283,7 @@ async def test_delete_task_success():
         assert result["status"] == "success"
         payload = mock_http.post.call_args.kwargs["json"]
         assert payload["action"] == "delete"
-        assert payload["entity_id"] == 29
+        assert payload["entity_id"] == TaskManager.ENTITY_ID
         assert payload["delete_by_field"] == {"id": 17}
     finally:
         patcher.stop()

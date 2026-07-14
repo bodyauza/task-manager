@@ -11,7 +11,7 @@ from src.auth.models import User
 from src.task_logic.models import Subtask, Task
 from src.database import get_async_session          # DI: выдаёт AsyncSession из пула
 from src.task_logic.subtask_schemas import SubtaskCreate, SubtaskResponse, SubtaskUpdate
-from src.routers.tasks import broadcast_task_event  # разделяемая рассылка WS-событий
+from src.realtime import broadcast_task_event  # разделяемая рассылка WS-событий
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +35,10 @@ async def create_subtask(
     # отложенный импорт: избегает циклических зависимостей при старте приложения
 
     crm_subtask_id: Optional[int] = None
+    sm = CRMSubtaskManager()
     # CRM-синхронизация возможна только если родительская задача зарегистрирована в CRM
     if task.crm_task_id is not None:
         try:
-            sm = CRMSubtaskManager()
             crm_result = await sm.create_subtask(
                 parent_item_id=task.crm_task_id,    # CRM-ID задачи-родителя
                 title=subtask.title,
@@ -63,7 +63,29 @@ async def create_subtask(
     try:
         await db.commit()                           # INSERT INTO subtask ...; фиксирует транзакцию
     except IntegrityError:
-        await db.rollback()                         # откатить транзакцию при нарушении UniqueConstraint
+        await db.rollback()                         # откатить транзакцию при нарушении ограничения БД
+        # Компенсирующая транзакция: CRM-запись создана, но commit упал →
+        # удаляем запись из CRM, чтобы не оставить сироту.
+        if crm_subtask_id is not None:
+            try:
+                await sm.delete_subtask(crm_subtask_id)
+            except Exception as crm_exc:
+                logger.error("CRM compensating delete failed for crm_id=%s: %s", crm_subtask_id, crm_exc)
+        # IntegrityError здесь может означать две разные вещи, и клиенту нужно ответить по-разному:
+        #   1. UNIQUE(title, task_id) — подзадача с таким названием уже есть в этой задаче (обычный случай).
+        #   2. ForeignKeyViolation — родительская задача удалена конкурентным delete_task ровно между
+        #      нашим SELECT task (строка выше) и этим commit. delete_task берёт FOR UPDATE на task
+        #      (см. tasks.py::delete_task), поэтому наш INSERT либо целиком проходит до удаления
+        #      задачи, либо блокируется и после её удаления падает именно так — а не создаёт
+        #      "подзадачу-сироту", которую потом пришлось бы искать руками.
+        # Различаем причины перезапросом задачи. subtask.task_id — поле входного Pydantic-объекта
+        # (SubtaskCreate), а не атрибут expired ORM-объекта task — читать его после rollback безопасно,
+        # в отличие от task.id, которое после rollback вызвало бы MissingGreenlet (lazy-load в async).
+        task_exists = (
+            await db.execute(select(Task.id).where(Task.id == subtask.task_id))
+        ).scalar_one_or_none() is not None
+        if not task_exists:
+            raise HTTPException(status_code=404, detail="Task not found")
         raise HTTPException(
             status_code=409,
             detail=f"Subtask with title '{subtask.title}' already exists in this task",

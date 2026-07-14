@@ -1,126 +1,35 @@
-import json
+import asyncio
 import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.auth.auth_config import current_user, get_access_strategy
-from src.auth.manager import UserManager, get_user_manager
+from src.auth.auth_config import current_user
 from src.auth.models import User
 from src.task_logic.models import Subtask, Task
 from src.database import get_async_session
 from src.task_logic.task_schemas import TaskCreate, TaskResponse, TaskUpdate
+from src.realtime import broadcast_task_event
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Working with tasks"])
 
-# Словарь активных WS-соединений: user_id → (websocket, email).
-# Ключ — user_id: один пользователь может иметь только одно активное соединение.
-# Новое соединение вытесняет предыдущее (закрывает его кодом 1000).
-# При разрыве соединения запись удаляется в блоке except WebSocketDisconnect.
-active_connections: dict[int, tuple[WebSocket, str]] = {}
 
+def _subtask_count_subquery():
+    """Подзапрос COUNT(*) подзадач, сгруппированных по task_id.
 
-async def _send_safe(uid: int, connection: WebSocket, payload: str) -> bool:
-    """Отправляет сообщение и возвращает False, если соединение мертво."""
-    try:
-        await connection.send_text(payload)
-        return True
-    except Exception:
-        return False
-
-
-async def publish_message(sender_user_id: int, message: str, sender: WebSocket):
-    """Рассылает чат-сообщение всем клиентам, кроме отправителя."""
-    sender_email = active_connections[sender_user_id][1]
-    payload = json.dumps({"type": "chat", "sender": sender_email, "text": message})
-    dead: list[int] = []
-    for uid, (connection, _) in list(active_connections.items()):
-        if connection is sender:
-            continue
-        if not await _send_safe(uid, connection, payload):
-            dead.append(uid)
-    for uid in dead:
-        active_connections.pop(uid, None)
-
-
-async def broadcast_event(payload: dict, exclude_user_id: int | None = None) -> None:
-    """Рассылает произвольное событие всем клиентам, кроме инициатора."""
-    data = json.dumps(payload)
-    dead: list[int] = []
-    for uid, (connection, _) in list(active_connections.items()):
-        if uid == exclude_user_id:
-            continue
-        if not await _send_safe(uid, connection, data):
-            dead.append(uid)
-    for uid in dead:
-        active_connections.pop(uid, None)
-
-
-async def broadcast_task_event(
-    event_type: str,                    # тип события: "task_created", "subtask_updated" и т.д.
-    title: str,                         # основное поле payload: title задачи или подзадачи
-    exclude_user_id: int | None = None, # серверный фильтр: broadcast_event пропустит этот uid
-    sender_email: str = "",             # email инициатора → data.sender в payload клиента
-    **extra,                            # дополнительные поля payload: task_title, actor_id и др.
-) -> None:
-    # broadcast_event получает два аргумента:
-    #   1. dict  — JSON-payload: сериализуется и отправляется каждому клиенту по WS.
-    #   2. exclude_user_id — серверный фильтр доставки: broadcast_event пропускает этот uid
-    #      при итерации по active_connections. В payload НЕ входит, клиенту не виден.
-    #
-    # Разделение намеренное: dict — «что отправить»; exclude_user_id — «кому не отправлять».
-    # Если бы exclude_user_id лежал внутри dict — он попал бы в JSON-ответ клиента,
-    # но никого бы не исключил из рассылки: broadcast_event читает его как отдельный аргумент.
-    #
-    # actor_id, напротив, передаётся через **extra и попадает в dict — потому что должен
-    # дойти до фронтенда для ветвления String(data.actor_id) === userId.
-    await broadcast_event(
-        {"type": event_type, "title": title, "sender": sender_email, **extra},
-        exclude_user_id,
+    OUTER JOIN с этим подзапросом даёт subtask_count=0 для задач без подзадач.
+    Вынесен в хелпер, чтобы не дублировать в read_tasks и get_task.
+    """
+    return (
+        select(Subtask.task_id, func.count(Subtask.id).label("cnt"))
+        .group_by(Subtask.task_id)
+        .subquery("sub_counts")
     )
-
-
-@router.websocket("/ws/tasks/{client_id}")
-async def websocket_endpoint(
-    client_id: int,
-    websocket: WebSocket,
-    user_manager: UserManager = Depends(get_user_manager),
-):
-    # Браузеры не поддерживают заголовок Authorization при WS-хэндшейке.
-    # Аутентификация выполняется через куку access_token, установленную при логине.
-    token = websocket.cookies.get("access_token")
-    if token is None:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-
-    user = await get_access_strategy().read_token(token, user_manager)
-    if user is None or not user.is_active:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-
-    await websocket.accept()
-
-    old_entry = active_connections.get(user.id)
-    if old_entry is not None and old_entry[0] is not websocket:
-        try:
-            await old_entry[0].close(code=status.WS_1000_NORMAL_CLOSURE)
-        except RuntimeError:
-            pass
-
-    active_connections[user.id] = (websocket, user.email)
-    try:
-        while True:
-            message = await websocket.receive_text()
-            await publish_message(user.id, message, websocket)
-    except WebSocketDisconnect:
-        entry = active_connections.get(user.id)
-        if entry is not None and entry[0] is websocket:
-            del active_connections[user.id]
 
 
 @router.post("/create-task/", response_model=TaskResponse, status_code=201)
@@ -136,6 +45,12 @@ async def create_task(
             select(Task).where(Task.title == task.title, Task.owner_id == user.id)
         )
     ).scalar_one_or_none()
+    # scalar_one_or_none(): берёт первую (и единственную) колонку каждой строки результата
+    # (здесь — объект Task целиком, т.к. select(Task) возвращает ORM-сущность одной колонкой)
+    # и возвращает её. Если строк 0 — вернёт None вместо исключения (в отличие от scalar_one(),
+    # которому 0 строк — уже ошибка). Если строк больше одной — поднимет MultipleResultsFound;
+    # здесь это невозможно даже под гонкой, т.к. UNIQUE(title, owner_id) не даст двум строкам
+    # с одинаковой парой существовать одновременно.
     if existing is not None:
         raise HTTPException(
             status_code=409,
@@ -147,8 +62,8 @@ async def create_task(
     from src.crm.task_service import TaskManager as CRMTaskManager
 
     crm_task_id: Optional[int] = None
+    tm = CRMTaskManager()
     try:
-        tm = CRMTaskManager()
         crm_result = await tm.create_task(
             title=task.title,
             description=task.description,
@@ -165,6 +80,13 @@ async def create_task(
         await db.commit()
     except IntegrityError:
         await db.rollback()
+        # Компенсирующая транзакция: CRM-запись создана, но commit упал →
+        # удаляем запись из CRM, чтобы не оставить сироту.
+        if crm_task_id is not None:
+            try:
+                await tm.delete_task(crm_task_id)
+            except Exception as crm_exc:
+                logger.error("CRM compensating delete failed for crm_id=%s: %s", crm_task_id, crm_exc)
         raise HTTPException(status_code=409, detail=f"Task with title '{task.title}' already exists")
     await db.refresh(db_task)
     await broadcast_task_event("task_created", db_task.title, exclude_user_id=user.id, sender_email=user.email)
@@ -181,13 +103,7 @@ async def read_tasks(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    # Подзапрос: COUNT(*) подзадач, сгруппированных по task_id.
-    # OUTER JOIN гарантирует, что задачи без подзадач получат count=0.
-    count_sq = (
-        select(Subtask.task_id, func.count(Subtask.id).label("cnt"))
-        .group_by(Subtask.task_id)
-        .subquery("sub_counts")
-    )
+    count_sq = _subtask_count_subquery()
     rows = (
         await db.execute(
             select(Task, func.coalesce(count_sq.c.cnt, 0))
@@ -238,11 +154,7 @@ async def get_task(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    count_sq = (
-        select(Subtask.task_id, func.count(Subtask.id).label("cnt"))
-        .group_by(Subtask.task_id)
-        .subquery("sub_counts")
-    )
+    count_sq = _subtask_count_subquery()
     row = (
         await db.execute(
             select(Task, func.coalesce(count_sq.c.cnt, 0))
@@ -322,7 +234,21 @@ async def delete_task(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
+    # FOR UPDATE (не FOR NO KEY UPDATE — эта строка будет удалена, а не просто изменена)
+    # берётся до чтения subtask_rows: между этим SELECT и db.delete(task)+commit ниже
+    # PostgreSQL требует FOR KEY SHARE на эту же строку для любого INSERT в subtask с FK
+    # на неё (create_subtask в subtasks.py) — FOR UPDATE конфликтует с FOR KEY SHARE, поэтому
+    # конкурентная попытка создать подзадачу для удаляемой задачи блокируется до commit/rollback
+    # этой транзакции, а не проходит "в узкое окно" между SELECT subtask_rows и самим удалением.
+    # Без этой блокировки такая подзадача успешно вставилась бы, затем была бы каскадно удалена
+    # ON DELETE CASCADE вместе со строкой task — но её файлы на диске и запись в CRM (если она
+    # успела туда синхронизироваться) остались бы сиротами, так как не попали бы в snapshot
+    # subtask_ids/crm_subtask_ids ниже (он читается ДО того, как гонка успела бы что-то вставить).
+    # Конкурентный create_subtask после разблокировки получит IntegrityError (FK violation) —
+    # обработка этого случая (отличие от дубликата title) добавлена в subtasks.py::create_subtask.
+    task = (
+        await db.execute(select(Task).where(Task.id == task_id).with_for_update())
+    ).scalar_one_or_none()
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
@@ -353,16 +279,20 @@ async def delete_task(
             cleanup_subtask_files(sub_id)
 
     # Удаляем подзадачи из CRM: CASCADE удалил их в локальной БД,
-    # но CRM не знает об этом — подзадачи (entity_id=32) остались бы orphan-записями.
+    # но CRM не знает об этом — подзадачи (entity_id=30) остались бы orphan-записями.
+    # asyncio.gather: параллельные запросы к CRM вместо последовательных (N×RTT → 1×RTT).
     if crm_subtask_ids:
         from src.crm.subtask_service import SubtaskManager
         sm = SubtaskManager()
-        for crm_sub_id in crm_subtask_ids:
-            try:
-                await sm.delete_subtask(crm_sub_id)
-                logger.info("CRM: subtask crm_id=%s deleted (cascade from task %s)", crm_sub_id, task_id)
-            except Exception as exc:
-                logger.error("CRM: cascade delete subtask crm_id=%s failed: %s", crm_sub_id, exc)
+        results = await asyncio.gather(
+            *[sm.delete_subtask(cid) for cid in crm_subtask_ids],
+            return_exceptions=True,
+        )
+        for cid, result in zip(crm_subtask_ids, results):
+            if isinstance(result, Exception):
+                logger.error("CRM: cascade delete subtask crm_id=%s failed: %s", cid, result)
+            else:
+                logger.info("CRM: subtask crm_id=%s deleted (cascade from task %s)", cid, task_id)
 
     if crm_task_id is not None:
         from src.crm.task_service import TaskManager as CRMTaskManager

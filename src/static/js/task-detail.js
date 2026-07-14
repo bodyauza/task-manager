@@ -1,5 +1,7 @@
 const taskId = parseInt(document.getElementById('taskId').value, 10);
+const userId = document.getElementById('userId').value;
 let currentTask = null;
+let socket;
 
 function escapeHtml(v) {
     const d = document.createElement('div');
@@ -286,8 +288,37 @@ async function deleteTask() {
     }
 }
 
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+// Упрощённая версия connectWebSocket из task-board.js — без чата, только
+// реакция на файловые события для задачи, открытой на этой странице.
+
+function connectWebSocket() {
+    try {
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws/tasks/${userId}`);
+
+        socket.onmessage = function(event) {
+            try {
+                const data = JSON.parse(event.data);
+                if (data.type === 'task_files_updated' && data.task_id === taskId) {
+                    loadTask();  // перечитываем актуальное состояние с сервера
+                    showToast(`${data.sender}: файлы задачи обновлены`, 'info');
+                }
+            } catch (e) { /* нераспознанное сообщение — игнорируем */ }
+        };
+
+        socket.onclose = function(event) {
+            if (event.code === 1008) { window.location.href = '/'; return; }
+            setTimeout(connectWebSocket, 3000);   // переподключение при разрыве
+        };
+    } catch (error) {
+        setTimeout(connectWebSocket, 3000);
+    }
+}
+
 window.addEventListener('load', function() {
     loadTask();
+    connectWebSocket();
 
     document.getElementById('editToggleBtn').addEventListener('click', openEditForm);
     document.getElementById('cancelBtn').addEventListener('click', closeEditForm);

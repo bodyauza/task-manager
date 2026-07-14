@@ -9,7 +9,7 @@
 Структура идентична task_files.py, отличия:
   - модель Subtask вместо Task
   - пути: subtasks/{subtask_id}/...
-  - CRM-поля: field_400 (ТЗ) и field_401 (иные документы)
+  - CRM-поля: field_325 (ТЗ) и field_326 (иные документы)
 """
 
 import logging
@@ -23,9 +23,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.auth.auth_config import current_user
 from src.auth.models import User
 from src.database import get_async_session
+from src.realtime import broadcast_task_event
 from src.task_logic.models import Subtask
 from src.utils.file_utils import (
     MAX_OTHER_FILES,
+    UPLOAD_ROOT,         # абсолютный путь к src/static/uploads/ (единая точка определения)
     parse_other_paths,
     read_and_validate,
     safe_filename,
@@ -36,13 +38,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Subtask files"])
 
-# Аналогично task_files.py: абсолютный путь к uploads/ вычисляется от __file__.
-# src/routers/subtask_files.py → parent → src/routers/ → parent → src/ → /static/uploads
-UPLOAD_ROOT = Path(__file__).resolve().parent.parent / "static" / "uploads"
-
 
 # ════════════════════════════════════════════════════════════
-# Техническое задание (одиночный файл, field_400 в CRM)
+# Техническое задание (одиночный файл, field_325 в CRM)
 # ════════════════════════════════════════════════════════════
 
 @router.post("/subtasks/{subtask_id}/specification", status_code=200)
@@ -67,9 +65,8 @@ async def upload_subtask_specification(
     filename = safe_filename(file.filename)            # "spec.pdf" → "a1b2c3d4_spec.pdf"
     dest_dir = UPLOAD_ROOT / "subtasks" / str(subtask_id) / "specification"
 
-    # Удалить старый файл ТЗ если был (замена)
-    if subtask.specification_path:
-        (UPLOAD_ROOT / subtask.specification_path).unlink(missing_ok=True)
+    # Старый путь захватываем до commit; удалим файл только после успешного commit.
+    old_path = UPLOAD_ROOT / subtask.specification_path if subtask.specification_path else None
 
     rel_path = save_file(dest_dir, filename, content)  # записать на диск → rel-путь
 
@@ -85,8 +82,18 @@ async def upload_subtask_specification(
         except Exception as exc:
             logger.error("CRM: subtask %s specification sync failed: %s", subtask_id, exc)
 
+    subtask_title = subtask.title            # захватить до commit — иначе MissingGreenlet после expire
     subtask.specification_path = rel_path   # "subtasks/7/specification/a1b2_spec.pdf"
     await db.commit()
+
+    # Удаляем старый файл только после успешного commit.
+    if old_path:
+        old_path.unlink(missing_ok=True)
+
+    await broadcast_task_event(
+        "subtask_files_updated", subtask_title,
+        exclude_user_id=user.id, sender_email=user.email, subtask_id=subtask_id,
+    )
 
     return {"specification_path": rel_path}
 
@@ -110,6 +117,7 @@ async def delete_subtask_specification(
     (UPLOAD_ROOT / subtask.specification_path).unlink(missing_ok=True)
 
     crm_subtask_id = subtask.crm_subtask_id
+    subtask_title = subtask.title   # захватить до commit — иначе MissingGreenlet после expire
     subtask.specification_path = None
     await db.commit()
 
@@ -121,11 +129,16 @@ async def delete_subtask_specification(
         except Exception as exc:
             logger.error("CRM: subtask %s specification clear failed: %s", subtask_id, exc)
 
+    await broadcast_task_event(
+        "subtask_files_updated", subtask_title,
+        exclude_user_id=user.id, sender_email=user.email, subtask_id=subtask_id,
+    )
+
     return {"specification_path": None}
 
 
 # ════════════════════════════════════════════════════════════
-# Иные документы (множественные файлы, field_401 в CRM)
+# Иные документы (множественные файлы, field_326 в CRM)
 # ════════════════════════════════════════════════════════════
 
 @router.post("/subtasks/{subtask_id}/files", status_code=200)
@@ -136,8 +149,26 @@ async def upload_subtask_files(
     db: AsyncSession = Depends(get_async_session),
 ):
     """Добавляет файлы в «Иные документы» подзадачи (максимум 10 суммарно)."""
+    # Race condition (lost update) на JSONB-колонке other_file_paths: без блокировки строки
+    # между SELECT и последующим UPDATE (subtask.other_file_paths = updated ниже) два параллельных
+    # запроса к одной и той же подзадаче читают один и тот же "existing" ещё до commit друг друга —
+    # итоговый UPDATE второго запроса молча затирает результат первого:
+    #
+    #   Запрос A: existing=[], сохраняет a1b2c3d4_doc.pdf → updated=["a1b2c3d4_doc.pdf"] → commit
+    #   Запрос B: читал existing=[] ещё до commit A → сохраняет e5f6a801_doc.pdf → updated=["e5f6a801_doc.pdf"] → commit
+    #
+    # После обоих commit в БД остаётся только ["e5f6a801_doc.pdf"] — путь a1b2c3d4_doc.pdf
+    # потерян из JSONB, хотя сам файл остался лежать на диске (не отдаётся, не удаляется при чистке).
+    #
+    # Устраняется пессимистичной блокировкой строки перед чтением: with_for_update(key_share=True)
+    # рендерит FOR NO KEY UPDATE (не FOR UPDATE) — этого достаточно, чтобы сериализовать запись
+    # other_file_paths, но НЕ конфликтует с FOR KEY SHARE, которую подзадачи сами не порождают
+    # (у Subtask нет дочерних FK-таблиц) — колонка other_file_paths не входит ни в PK, ни в
+    # UNIQUE-ограничение, поэтому "ключевая" блокировка не нужна в любом случае.
     subtask = (
-        await db.execute(select(Subtask).where(Subtask.id == subtask_id))
+        await db.execute(
+            select(Subtask).where(Subtask.id == subtask_id).with_for_update(key_share=True)
+        )
     ).scalar_one_or_none()
     if subtask is None:
         raise HTTPException(status_code=404, detail="Subtask not found")
@@ -155,16 +186,23 @@ async def upload_subtask_files(
         )
 
     dest_dir  = UPLOAD_ROOT / "subtasks" / str(subtask_id) / "other"
-    new_paths: list[str] = []
 
+    # Проход 1: валидируем все файлы до записи на диск.
+    validated: list[tuple[bytes, str]] = []
     for upload in files:
         content  = await read_and_validate(upload)
         filename = safe_filename(upload.filename)
+        validated.append((content, filename))
+
+    # Проход 2: все файлы валидны — сохраняем на диск.
+    new_paths: list[str] = []
+    for content, filename in validated:
         rel_path = save_file(dest_dir, filename, content)
         new_paths.append(rel_path)
 
     updated = existing + new_paths
     crm_subtask_id = subtask.crm_subtask_id
+    subtask_title = subtask.title   # захватить до commit — иначе MissingGreenlet после expire
     subtask.other_file_paths = updated
     await db.commit()
 
@@ -177,6 +215,11 @@ async def upload_subtask_files(
         except Exception as exc:
             logger.error("CRM: subtask %s other files sync failed: %s", subtask_id, exc)
 
+    await broadcast_task_event(
+        "subtask_files_updated", subtask_title,
+        exclude_user_id=user.id, sender_email=user.email, subtask_id=subtask_id,
+    )
+
     return {"other_file_paths": updated}
 
 
@@ -188,8 +231,15 @@ async def delete_subtask_file(
     db: AsyncSession = Depends(get_async_session),
 ):
     """Удаляет один файл из «Иных документов» подзадачи по имени."""
+    # ⚠ Тот же lost-update race на other_file_paths, что и в upload_subtask_files выше — только
+    # в обратную сторону: если это удаление racing-ит с параллельной загрузкой нового файла,
+    # финальный UPDATE может отменить чужое добавление или воскресить путь, который параллельно
+    # удалили. Устраняется той же блокировкой FOR NO KEY UPDATE — разбор выбора между FOR UPDATE
+    # и FOR NO KEY UPDATE см. в upload_subtask_files.
     subtask = (
-        await db.execute(select(Subtask).where(Subtask.id == subtask_id))
+        await db.execute(
+            select(Subtask).where(Subtask.id == subtask_id).with_for_update(key_share=True)
+        )
     ).scalar_one_or_none()
     if subtask is None:
         raise HTTPException(status_code=404, detail="Subtask not found")
@@ -205,6 +255,7 @@ async def delete_subtask_file(
 
     updated = [p for p in existing if p != target]
     crm_subtask_id = subtask.crm_subtask_id
+    subtask_title = subtask.title   # захватить до commit — иначе MissingGreenlet после expire
     subtask.other_file_paths = updated if updated else None
     await db.commit()
 
@@ -216,6 +267,11 @@ async def delete_subtask_file(
             logger.info("CRM: subtask %s other files synced after delete", subtask_id)
         except Exception as exc:
             logger.error("CRM: subtask %s other files sync failed: %s", subtask_id, exc)
+
+    await broadcast_task_event(
+        "subtask_files_updated", subtask_title,
+        exclude_user_id=user.id, sender_email=user.email, subtask_id=subtask_id,
+    )
 
     return {"other_file_paths": updated}
 

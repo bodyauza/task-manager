@@ -5,14 +5,41 @@
   DELETE /tasks/{id}/specification  — удаление ТЗ: успех, 404 (нет файла)
   POST   /tasks/{id}/files          — добавление иных документов: успех, превышение лимита
   DELETE /tasks/{id}/files/{name}   — удаление одного файла: успех, 404
+  WS-рассылка broadcast_task_event ("task_files_updated") — все 4 эндпоинта выше
+  Конкурентная загрузка (FOR NO KEY UPDATE) — lost update на other_file_paths
 """
+
+import asyncio
+import json
 
 import pytest
 from httpx import AsyncClient
 
+from src.realtime.manager import connection_manager
 from tests.conftest import register_user
 
 EMAIL = "file_task@example.com"
+
+# ID заведомо выше любого реального пользователя в тестовой БД (truncate между тестами) —
+# используется как "наблюдатель", не совпадающий с exclude_user_id актёра запроса.
+_OBSERVER_ID = 999999
+
+
+class _ObserverWebSocket:
+    """Минимальная замена starlette.WebSocket — только фиксирует отправленное.
+
+    В отличие от FakeBroadcaster в tests/test_realtime.py (юнит-тест самой
+    broadcast_task_event), здесь проверяется факт вызова broadcast_task_event
+    из реального HTTP-эндпоинта: подключаемся к process-wide connection_manager,
+    который эндпоинт использует по умолчанию (без broadcaster=), и читаем,
+    что реально дошло бы до чужого WebSocket-соединения.
+    """
+
+    def __init__(self):
+        self.sent: list[str] = []
+
+    async def send_text(self, data: str) -> None:
+        self.sent.append(data)
 
 
 # ── Тестовые байты с правильными magic-сигнатурами ───────────────────────────
@@ -227,6 +254,31 @@ async def test_delete_other_file_not_found(client, mock_smtp, upload_root):
     assert r.status_code == 404
 
 
+# ── Конкурентность / блокировки ───────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_concurrent_uploads_do_not_lose_files(client, mock_smtp, mock_magic, upload_root):
+    """Регрессионный тест на FOR NO KEY UPDATE в upload_task_files: два
+    по-настоящему параллельных запроса на загрузку разных файлов в одну и ту
+    же задачу не должны терять ни один из путей в other_file_paths (lost
+    update) — без блокировки строки здесь мог бы остаться только 1 файл
+    из 2 загруженных.
+    """
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    tid = task["id"]
+
+    r1, r2 = await asyncio.gather(
+        client.post(f"/tasks/{tid}/files", files=_other_uploads((_pdf(), "concurrent_a.pdf"))),
+        client.post(f"/tasks/{tid}/files", files=_other_uploads((_pdf(), "concurrent_b.pdf"))),
+    )
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+
+    r = await client.get(f"/tasks/{tid}")
+    assert len(r.json()["other_file_paths"]) == 2
+
+
 # ── CRM синхронизация ─────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -285,6 +337,94 @@ async def test_delete_other_file_crm_synced(client, mock_smtp, mock_magic, uploa
     mock_crm["task_mgr"].update_task.assert_called_once()
     kwargs = mock_crm["task_mgr"].update_task.call_args.kwargs
     assert len(kwargs["other_file_abs_paths"]) == 1
+
+
+# ── WS-рассылка событий (broadcast_task_event) ───────────────────────────────
+# exclude_user_id=user.id в эндпоинте исключает из рассылки самого актёра —
+# поэтому наблюдатель регистрируется под отдельным (заведомо иным) user_id.
+
+@pytest.mark.asyncio
+async def test_upload_spec_broadcasts_ws_event(client, mock_smtp, mock_magic, upload_root):
+    """Загрузка ТЗ рассылает task_files_updated с task_id задачи и её title."""
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    tid = task["id"]
+
+    observer = _ObserverWebSocket()
+    connection_manager.register(_OBSERVER_ID, observer, "observer@example.com")
+    try:
+        await client.post(f"/tasks/{tid}/specification", files=_spec_upload(_pdf()))
+    finally:
+        connection_manager.unregister(_OBSERVER_ID, observer)
+
+    assert len(observer.sent) == 1
+    payload = json.loads(observer.sent[0])
+    assert payload["type"] == "task_files_updated"
+    assert payload["task_id"] == tid
+    assert payload["title"] == task["title"]
+
+
+@pytest.mark.asyncio
+async def test_delete_spec_broadcasts_ws_event(client, mock_smtp, mock_magic, upload_root):
+    """Удаление ТЗ рассылает task_files_updated с task_id задачи."""
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    tid = task["id"]
+    await client.post(f"/tasks/{tid}/specification", files=_spec_upload(_pdf()))
+
+    observer = _ObserverWebSocket()
+    connection_manager.register(_OBSERVER_ID, observer, "observer@example.com")
+    try:
+        await client.delete(f"/tasks/{tid}/specification")
+    finally:
+        connection_manager.unregister(_OBSERVER_ID, observer)
+
+    assert len(observer.sent) == 1
+    payload = json.loads(observer.sent[0])
+    assert payload["type"] == "task_files_updated"
+    assert payload["task_id"] == tid
+
+
+@pytest.mark.asyncio
+async def test_upload_other_files_broadcasts_ws_event(client, mock_smtp, mock_magic, upload_root):
+    """Загрузка «иных документов» рассылает task_files_updated с task_id задачи."""
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    tid = task["id"]
+
+    observer = _ObserverWebSocket()
+    connection_manager.register(_OBSERVER_ID, observer, "observer@example.com")
+    try:
+        await client.post(f"/tasks/{tid}/files", files=_other_uploads((_pdf(), "a.pdf")))
+    finally:
+        connection_manager.unregister(_OBSERVER_ID, observer)
+
+    assert len(observer.sent) == 1
+    payload = json.loads(observer.sent[0])
+    assert payload["type"] == "task_files_updated"
+    assert payload["task_id"] == tid
+
+
+@pytest.mark.asyncio
+async def test_delete_other_file_broadcasts_ws_event(client, mock_smtp, mock_magic, upload_root):
+    """Удаление одного из «иных документов» рассылает task_files_updated."""
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    tid = task["id"]
+    r_up = await client.post(f"/tasks/{tid}/files", files=_other_uploads((_pdf(), "a.pdf")))
+    filename = r_up.json()["other_file_paths"][0].split("/")[-1]
+
+    observer = _ObserverWebSocket()
+    connection_manager.register(_OBSERVER_ID, observer, "observer@example.com")
+    try:
+        await client.delete(f"/tasks/{tid}/files/{filename}")
+    finally:
+        connection_manager.unregister(_OBSERVER_ID, observer)
+
+    assert len(observer.sent) == 1
+    payload = json.loads(observer.sent[0])
+    assert payload["type"] == "task_files_updated"
+    assert payload["task_id"] == tid
 
 
 # ── Интеграция GET ────────────────────────────────────────────────────────────

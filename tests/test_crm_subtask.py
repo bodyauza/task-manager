@@ -14,6 +14,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from src.crm.client import CRMClient
 from src.crm.subtask_service import SubtaskManager
 
+# Ключи полей CRM выводятся из констант SubtaskManager, а не хардкодятся строками:
+# сторонние разработчики меняют FIELD_TITLE/FIELD_DESCR/FIELD_DONE/ENTITY_ID
+# в subtask_service.py под свой demo-инстанс CRM, и эти тесты продолжают
+# проходить без правок.
+_FIELD_TITLE = f"field_{SubtaskManager.FIELD_TITLE}"
+_FIELD_DESCR = f"field_{SubtaskManager.FIELD_DESCR}"
+_FIELD_DONE  = f"field_{SubtaskManager.FIELD_DONE}"
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -61,10 +69,10 @@ async def test_create_subtask_success_dict_data():
         assert result["id"] == 55
         payload = mock_http.post.call_args.kwargs["json"]
         assert payload["action"] == "insert"
-        assert payload["entity_id"] == 32
-        assert payload["items"][0]["field_392"] == "Write test"
-        assert payload["items"][0]["field_393"] == "desc"
-        assert payload["items"][0]["field_394"] == "false"   # completed=False по умолчанию
+        assert payload["entity_id"] == SubtaskManager.ENTITY_ID
+        assert payload["items"][0][_FIELD_TITLE] == "Write test"
+        assert payload["items"][0][_FIELD_DESCR] == "desc"
+        assert payload["items"][0][_FIELD_DONE] == "false"   # completed=False по умолчанию
         assert payload["items"][0]["parent_item_id"] == 99
     finally:
         patcher.stop()
@@ -85,14 +93,14 @@ async def test_create_subtask_success_list_data():
 
 @pytest.mark.asyncio
 async def test_create_subtask_completed_true():
-    """create_subtask передаёт field_394="true" при completed=True."""
+    """create_subtask передаёт field_done="true" при completed=True."""
     patcher, mock_http = _patch_httpx(_resp({"id": "1"}))
     try:
         await SubtaskManager().create_subtask(
             parent_item_id=10, title="Done", description="", completed=True
         )
         payload = mock_http.post.call_args.kwargs["json"]
-        assert payload["items"][0]["field_394"] == "true"
+        assert payload["items"][0][_FIELD_DONE] == "true"
     finally:
         patcher.stop()
 
@@ -163,10 +171,10 @@ async def test_update_subtask_success():
         assert result["status"] == "success"
         payload = mock_http.post.call_args.kwargs["json"]
         assert payload["action"] == "update"
-        assert payload["entity_id"] == 32
-        assert payload["data"]["field_392"] == "New Title"
-        assert payload["data"]["field_394"] == "true"
-        assert "field_393" not in payload["data"]   # description не передан → не попал в data
+        assert payload["entity_id"] == SubtaskManager.ENTITY_ID
+        assert payload["data"][_FIELD_TITLE] == "New Title"
+        assert payload["data"][_FIELD_DONE] == "true"
+        assert _FIELD_DESCR not in payload["data"]   # description не передан → не попал в data
         assert payload["update_by_field"] == {"id": 55}
     finally:
         patcher.stop()
@@ -215,7 +223,7 @@ async def test_delete_subtask_success():
         assert result["status"] == "success"
         payload = mock_http.post.call_args.kwargs["json"]
         assert payload["action"] == "delete"
-        assert payload["entity_id"] == 32
+        assert payload["entity_id"] == SubtaskManager.ENTITY_ID
         assert payload["delete_by_field"] == {"id": 55}
     finally:
         patcher.stop()

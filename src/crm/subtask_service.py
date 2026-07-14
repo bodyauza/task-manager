@@ -1,4 +1,3 @@
-import base64
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -9,39 +8,23 @@ logger = logging.getLogger(__name__)              # логгер этого мо
 
 
 class SubtaskManager(CRMClient):
-    """CRUD-операции с подсущностью «Подзадачи» (entity_id=32).
+    """CRUD-операции с подсущностью «Подзадачи» (entity_id=30).
 
     parent_item_id — CRM-ID задачи из сущности «Задачи» (entity_id=29),
     то есть crm_task_id из локальной БД.
 
     Поля:
-        field_392 — Название (строка)
-        field_393 — Описание (текст)
-        field_394 — Статус   (чекбокс: "true" / "false")
+        field_322 — Название (строка)
+        field_323 — Описание (текст)
+        field_324 — Статус   (чекбокс: "true" / "false")
     """
 
-    ENTITY_ID   = 32    # ID сущности «Подзадачи» в CRM; «Задачи» — 29, «Пользователи» — 1
-    FIELD_TITLE = 392   # числовой ID поля «Название»; в payload: f"field_{392}" = "field_392"
-    FIELD_DESCR = 393   # числовой ID поля «Описание»
-    FIELD_DONE  = 394   # числовой ID поля «Статус» (чекбокс CRM принимает строки "true"/"false")
-    FIELD_SPEC  = 400   # ID поля «Техническое задание» (file upload, одиночный файл)
-    FIELD_OTHER = 401   # ID поля «Иные документы» (вложения, множественные файлы)
-
-    @staticmethod
-    def _bool_to_crm(value: bool) -> str:
-        return "true" if value else "false"     # CRM чекбокс — строка, не JSON boolean
-
-    @staticmethod
-    def _file_to_crm(abs_path: Path) -> dict:
-        """Читает файл с диска и возвращает CRM-совместимый словарь.
-
-        Аналогичен TaskManager._file_to_crm, но используется для подзадач.
-        CRM ожидает: {'name': 'filename.pdf', 'content': '<base64>'}.
-        """
-        return {
-            "name":    abs_path.name,                                    # имя файла с UUID-префиксом
-            "content": base64.b64encode(abs_path.read_bytes()).decode(), # base64-содержимое файла
-        }
+    ENTITY_ID   = 30    # ID сущности «Подзадачи» в CRM; «Задачи» — 29, «Пользователи» — 1
+    FIELD_TITLE = 322   # числовой ID поля «Название»; в payload: f"field_{322}" = "field_322"
+    FIELD_DESCR = 323   # числовой ID поля «Описание»
+    FIELD_DONE  = 324   # числовой ID поля «Статус» (чекбокс CRM принимает строки "true"/"false")
+    FIELD_SPEC  = 325   # ID поля «Техническое задание» (file upload, одиночный файл)
+    FIELD_OTHER = 326   # ID поля «Иные документы» (вложения, множественные файлы)
 
     async def create_subtask(
         self,
@@ -51,9 +34,9 @@ class SubtaskManager(CRMClient):
         completed: bool = False,
     ) -> Dict[str, Any]:
         record = {
-            f"field_{self.FIELD_TITLE}": title,             # "field_392": "Название"
-            f"field_{self.FIELD_DESCR}": description,       # "field_393": "Описание"
-            f"field_{self.FIELD_DONE}":  self._bool_to_crm(completed),  # "field_394": "false"
+            f"field_{self.FIELD_TITLE}": title,             # "field_322": "Название"
+            f"field_{self.FIELD_DESCR}": description,       # "field_323": "Описание"
+            f"field_{self.FIELD_DONE}":  self._bool_to_crm(completed),  # "field_324": "false"
             "parent_item_id": parent_item_id,               # привязка к родительской задаче в CRM
         }
         logger.info("CRM: insert subtask parent_item_id=%s title='%s'", parent_item_id, title)
@@ -85,9 +68,9 @@ class SubtaskManager(CRMClient):
     ) -> Dict[str, Any]:
         """Обновляет подзадачу по CRM-ID; передаёт только заполненные поля.
 
-        clear_specification=True: field_400 = [] (CRM удаляет вложение ТЗ).
-        other_file_abs_paths=[]: field_401 = [] (CRM очищает поле иных документов).
-        other_file_abs_paths=[p1,p2]: field_401 = [file1, file2] (полная замена содержимого поля).
+        clear_specification=True: field_325 = [] (CRM удаляет вложение ТЗ).
+        other_file_abs_paths=[]: field_326 = [] (CRM очищает поле иных документов).
+        other_file_abs_paths=[p1,p2]: field_326 = [file1, file2] (полная замена содержимого поля).
         """
         data: Dict[str, Any] = {}
         if title is not None:
@@ -99,7 +82,7 @@ class SubtaskManager(CRMClient):
         if clear_specification:
             data[f"field_{self.FIELD_SPEC}"] = []
         elif specification_abs_path is not None:
-            # field_400: одиночный файл ТЗ подзадачи; CRM принимает список из одного элемента.
+            # field_325: одиночный файл ТЗ подзадачи; CRM принимает список из одного элемента.
             data[f"field_{self.FIELD_SPEC}"] = [self._file_to_crm(specification_abs_path)]
         if other_file_abs_paths is not None:
             # None → поле не трогать; [] → очистить; [p1,…] → заменить всё содержимое.

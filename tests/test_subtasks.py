@@ -90,6 +90,36 @@ async def test_create_subtask_duplicate_title_same_task(client: AsyncClient, moc
     assert r.status_code == 409
 
 
+async def test_create_subtask_task_deleted_mid_flight_returns_404_not_409(
+    client: AsyncClient, mock_smtp: dict, mock_crm
+):
+    """Регрессионный тест на различение причин IntegrityError в create_subtask
+    (см. subtasks.py): если родительская задача удаляется прямо во время
+    best-effort CRM-вызова (между начальной проверкой task is None и локальным
+    INSERT), коммит INSERT падает с ForeignKeyViolation, а не UniqueViolation —
+    ответ должен быть 404 "Task not found", а НЕ вводящий в заблуждение 409
+    "already exists" (задачи с таким названием попросту не существует).
+
+    Удаление задачи выполняется прямо внутри side_effect мока CRM — это тот же
+    эффект, что и настоящая параллельная гонка с delete_task (который теперь
+    берёт FOR UPDATE на task), но детерминированно, без реальной конкурентности.
+    """
+    await _register_login(client, mock_smtp)
+    task = await _create_task(client)
+    tid = task["id"]
+
+    async def _delete_task_mid_flight(*args, **kwargs):
+        r = await client.delete(f"/delete-task/{tid}")
+        assert r.status_code == 200
+        return {"id": 55, "response": {"status": "success"}}
+
+    mock_crm["subtask_mgr"].create_subtask.side_effect = _delete_task_mid_flight
+
+    r = await _create_subtask(client, tid)
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Task not found"
+
+
 async def test_create_subtask_same_title_different_tasks(client: AsyncClient, mock_smtp: dict):
     # UniqueConstraint(title, task_id): "Shared" в task1 и task2 — разные пары, оба допустимы
     await _register_login(client, mock_smtp)

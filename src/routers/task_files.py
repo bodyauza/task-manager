@@ -21,9 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.auth.auth_config import current_user        # DI: текущий аутентифицированный пользователь
 from src.auth.models import User
 from src.database import get_async_session            # DI: асинхронная сессия SQLAlchemy
+from src.realtime import broadcast_task_event
 from src.task_logic.models import Task
 from src.utils.file_utils import (
     MAX_OTHER_FILES,     # лимит файлов в «Иных документах» (10 штук)
+    UPLOAD_ROOT,         # абсолютный путь к src/static/uploads/ (единая точка определения)
     parse_other_paths,   # JSONB (list[str] | None) → list[str]; [] при NULL
     read_and_validate,   # чтение + проверка размера/расширения/MIME
     safe_filename,       # добавление UUID-префикса к имени
@@ -34,15 +36,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Task files"])
 
-# Корневая директория для хранения файлов.
-# Абсолютный путь вычисляется относительно этого файла (src/routers/task_files.py):
-#   __file__ → src/routers/task_files.py
-#   .parent   → src/routers/
-#   .parent   → src/
-#   / "static" / "uploads" → src/static/uploads/
-# Абсолютный путь нужен, чтобы роутер работал независимо от CWD при запуске.
-UPLOAD_ROOT = Path(__file__).resolve().parent.parent / "static" / "uploads"
-
 """
 1. POST /create-task/           → создаём задачу, получаем {id: 5}
 2. POST /tasks/5/specification  → загружаем файл ТЗ
@@ -50,7 +43,7 @@ UPLOAD_ROOT = Path(__file__).resolve().parent.parent / "static" / "uploads"
 """
 
 # ════════════════════════════════════════════════════════════
-# Техническое задание (одиночный файл, field_395 в CRM)
+# Техническое задание (одиночный файл, field_320 в CRM)
 # ════════════════════════════════════════════════════════════
 
 @router.post("/tasks/{task_id}/specification", status_code=200)
@@ -80,11 +73,8 @@ async def upload_task_specification(
     filename = safe_filename(file.filename)
     dest_dir = UPLOAD_ROOT / "tasks" / str(task_id) / "specification"
 
-    # Удаляем предыдущий файл ТЗ если он был загружен ранее.
-    # unlink(missing_ok=True): не падает если файл уже удалён вручную или с диска.
-    if task.specification_path:
-        old_path = UPLOAD_ROOT / task.specification_path
-        old_path.unlink(missing_ok=True)
+    # Старый путь захватываем до commit; удалим файл только после успешного commit.
+    old_path = UPLOAD_ROOT / task.specification_path if task.specification_path else None
 
     # save_file: создаёт директорию и записывает байты; возвращает rel-путь от uploads/.
     rel_path = save_file(dest_dir, filename, content)
@@ -103,8 +93,19 @@ async def upload_task_specification(
             logger.error("CRM: task %s specification sync failed: %s", task_id, exc)
 
     # Обновляем путь в БД и фиксируем транзакцию.
+    task_title = task.title              # захватить до commit — иначе MissingGreenlet после expire
     task.specification_path = rel_path   # "tasks/3/specification/a1b2c3d4_tz.pdf"
     await db.commit()
+
+    # Удаляем старый файл только после успешного commit: если commit упал бы раньше,
+    # старый файл остался бы на диске и путь в БД не изменился бы → нет потери данных.
+    if old_path:
+        old_path.unlink(missing_ok=True)
+
+    await broadcast_task_event(
+        "task_files_updated", task_title,
+        exclude_user_id=user.id, sender_email=user.email, task_id=task_id,
+    )
 
     return {"specification_path": rel_path}  # URL: /uploads/{rel_path}
 
@@ -129,6 +130,7 @@ async def delete_task_specification(
     (UPLOAD_ROOT / task.specification_path).unlink(missing_ok=True)
 
     crm_task_id = task.crm_task_id
+    task_title = task.title              # захватить до commit — иначе MissingGreenlet после expire
     task.specification_path = None
     await db.commit()
 
@@ -140,11 +142,16 @@ async def delete_task_specification(
         except Exception as exc:
             logger.error("CRM: task %s specification clear failed: %s", task_id, exc)
 
+    await broadcast_task_event(
+        "task_files_updated", task_title,
+        exclude_user_id=user.id, sender_email=user.email, task_id=task_id,
+    )
+
     return {"specification_path": None}
 
 
 # ════════════════════════════════════════════════════════════
-# Иные документы (множественные файлы, field_396 в CRM)
+# Иные документы (множественные файлы, field_321 в CRM)
 # ════════════════════════════════════════════════════════════
 
 @router.post("/tasks/{task_id}/files", status_code=200)
@@ -155,8 +162,29 @@ async def upload_task_files(
     db: AsyncSession = Depends(get_async_session),
 ):
     """Добавляет файлы в «Иные документы» задачи (максимум 10 файлов суммарно)."""
+    # ⚠ Race condition (lost update) на JSONB-колонке other_file_paths: без блокировки строки
+    # между SELECT и последующим UPDATE (task.other_file_paths = updated ниже) два параллельных
+    # запроса к одной и той же задаче читают один и тот же "existing" ещё до commit друг друга —
+    # итоговый UPDATE второго запроса молча затирает результат первого:
+    #
+    #   Запрос A: existing=[], сохраняет a1b2c3d4_doc.pdf → updated=["a1b2c3d4_doc.pdf"] → commit
+    #   Запрос B: читал existing=[] ещё до commit A → сохраняет e5f6a801_doc.pdf → updated=["e5f6a801_doc.pdf"] → commit
+    #
+    # После обоих commit в БД остаётся только ["e5f6a801_doc.pdf"] — путь a1b2c3d4_doc.pdf
+    # потерян из JSONB, хотя сам файл остался лежать на диске (не отдаётся, не удаляется при чистке).
+    #
+    # Устраняется пессимистичной блокировкой строки перед чтением: with_for_update(key_share=True)
+    # рендерит FOR NO KEY UPDATE (не FOR UPDATE) — этого достаточно, чтобы сериализовать
+    # запись other_file_paths (запрос B дождётся commit запроса A и прочитает уже актуальный
+    # other_file_paths=["a1b2c3d4_doc.pdf"]), но НЕ конфликтует с FOR KEY SHARE, которую
+    # PostgreSQL автоматически берёт на родительскую задачу при INSERT подзадачи с FK на неё —
+    # параллельное создание подзадач через create_subtask (subtasks.py) не блокируется.
+    # Обычный FOR UPDATE здесь был бы избыточен: колонка other_file_paths не входит ни в PK,
+    # ни в UNIQUE-ограничение, поэтому "ключевая" блокировка не нужна.
     task = (
-        await db.execute(select(Task).where(Task.id == task_id))
+        await db.execute(
+            select(Task).where(Task.id == task_id).with_for_update(key_share=True)
+        )
     ).scalar_one_or_none()
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -176,17 +204,25 @@ async def upload_task_files(
         )
 
     dest_dir  = UPLOAD_ROOT / "tasks" / str(task_id) / "other"
-    new_paths: list[str] = []
 
+    # Проход 1: валидируем все файлы до записи на диск.
+    # Если любой файл не пройдёт проверку — HTTPException прервёт цикл до save_file,
+    # и на диске не останется частично сохранённых файлов.
+    validated: list[tuple[bytes, str]] = []
     for upload in files:
-        # Каждый файл валидируется отдельно; первый невалидный прерывает цикл с HTTPException.
         content  = await read_and_validate(upload)
-        filename = safe_filename(upload.filename)      # UUID-префикс → нет коллизий
+        filename = safe_filename(upload.filename)
+        validated.append((content, filename))
+
+    # Проход 2: все файлы валидны — сохраняем на диск.
+    new_paths: list[str] = []
+    for content, filename in validated:
         rel_path = save_file(dest_dir, filename, content)
-        new_paths.append(rel_path)                    # накапливаем пути новых файлов
+        new_paths.append(rel_path)
 
     updated = existing + new_paths
     crm_task_id = task.crm_task_id   # захватить до commit: после expire атрибут недоступен
+    task_title = task.title          # захватить до commit — иначе MissingGreenlet после expire
     # JSONB: передаём list[str] напрямую; asyncpg сериализует в бинарный JSON при INSERT/UPDATE.
     task.other_file_paths = updated
     await db.commit()
@@ -194,13 +230,18 @@ async def upload_task_files(
     if crm_task_id is not None:
         from src.crm.task_service import TaskManager
         try:
-            # field_396 в CRM заменяется целиком: передаём все текущие файлы поля.
+            # field_321 в CRM заменяется целиком: передаём все текущие файлы поля.
             # Передать только new_paths — CRM потеряет ранее загруженные файлы записи.
             all_abs = [UPLOAD_ROOT / p for p in updated]
             await TaskManager().update_task(task_id=crm_task_id, other_file_abs_paths=all_abs)
             logger.info("CRM: task %s other files synced (%d files)", task_id, len(all_abs))
         except Exception as exc:
             logger.error("CRM: task %s other files sync failed: %s", task_id, exc)
+
+    await broadcast_task_event(
+        "task_files_updated", task_title,
+        exclude_user_id=user.id, sender_email=user.email, task_id=task_id,
+    )
 
     return {"other_file_paths": updated}
 
@@ -213,8 +254,15 @@ async def delete_task_file(
     db: AsyncSession = Depends(get_async_session),
 ):
     """Удаляет один файл из «Иных документов» задачи по имени файла."""
+    # ⚠ Тот же lost-update race на other_file_paths, что и в upload_task_files выше — только
+    # в обратную сторону: если это удаление racing-ит с параллельной загрузкой нового файла,
+    # финальный UPDATE может отменить чужое добавление или воскресить путь, который параллельно
+    # удалили. Устраняется той же блокировкой FOR NO KEY UPDATE — подробный разбор выбора между
+    # FOR UPDATE и FOR NO KEY UPDATE см. в upload_task_files.
     task = (
-        await db.execute(select(Task).where(Task.id == task_id))
+        await db.execute(
+            select(Task).where(Task.id == task_id).with_for_update(key_share=True)
+        )
     ).scalar_one_or_none()
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -231,6 +279,7 @@ async def delete_task_file(
 
     updated = [p for p in existing if p != target]
     crm_task_id = task.crm_task_id
+    task_title = task.title   # захватить до commit — иначе MissingGreenlet после expire
     # NULL вместо [] при пустом списке: соответствует начальному состоянию колонки.
     task.other_file_paths = updated if updated else None
     await db.commit()
@@ -238,12 +287,17 @@ async def delete_task_file(
     if crm_task_id is not None:
         from src.crm.task_service import TaskManager
         try:
-            # [] очищает field_396 в CRM; [p1,…] заменяет всё содержимое поля.
+            # [] очищает field_321 в CRM; [p1,…] заменяет всё содержимое поля.
             remaining_abs = [UPLOAD_ROOT / p for p in updated]
             await TaskManager().update_task(task_id=crm_task_id, other_file_abs_paths=remaining_abs)
             logger.info("CRM: task %s other files synced after delete", task_id)
         except Exception as exc:
             logger.error("CRM: task %s other files sync failed: %s", task_id, exc)
+
+    await broadcast_task_event(
+        "task_files_updated", task_title,
+        exclude_user_id=user.id, sender_email=user.email, task_id=task_id,
+    )
 
     return {"other_file_paths": updated}
 

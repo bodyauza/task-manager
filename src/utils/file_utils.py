@@ -20,6 +20,12 @@ MAX_FILE_SIZE = 100 * 1024 * 1024   # 100 МБ в байтах
 # Проверяется в роутере: len(existing) + len(new_files) > MAX_OTHER_FILES → 422.
 MAX_OTHER_FILES = 10
 
+# Единая точка определения корня файлового хранилища.
+# Вычисляется относительно этого файла (src/utils/file_utils.py):
+#   parent → src/utils/, parent → src/, / "static" / "uploads" → src/static/uploads/
+# Импортируется роутерами task_files.py и subtask_files.py — константа не дублируется.
+UPLOAD_ROOT = Path(__file__).resolve().parent.parent / "static" / "uploads"
+
 # Белый список допустимых расширений и соответствующих им MIME-типов.
 # Ключ — расширение в нижнем регистре (с точкой).
 # Значение — множество допустимых MIME-типов для этого расширения.
@@ -60,6 +66,12 @@ async def read_and_validate(file: UploadFile) -> bytes:
             status_code=413,
             detail=f"Размер файла превышает лимит {MAX_FILE_SIZE // (1024 * 1024)} МБ",
         )
+
+    # UploadFile.filename типизирован как Optional[str]: клиент может прислать
+    # multipart-часть без Content-Disposition filename → filename=None.
+    # Path(None) бросает TypeError → 500; явная проверка даёт 422.
+    if not file.filename:
+        raise HTTPException(status_code=422, detail="Имя файла не указано")
 
     suffix = Path(file.filename).suffix.lower()  # ".PDF" → ".pdf"; суффикс с точкой
     if suffix not in ALLOWED:
@@ -119,7 +131,9 @@ def save_file(dest_dir: Path, filename: str, content: bytes) -> str:
     # Строим относительный путь: всё, что идёт после директории "uploads/" в abs-пути.
     # Пример: .../src/static/uploads/tasks/3/specification → "tasks/3/specification/file.pdf"
     parts = dest_dir.parts
-    uploads_idx = next(i for i, p in enumerate(parts) if p == "uploads")  # индекс папки uploads
+    uploads_idx = next((i for i, p in enumerate(parts) if p == "uploads"), None)
+    if uploads_idx is None:
+        raise ValueError(f"Директория 'uploads' не найдена в пути: {dest_dir}")
     rel = "/".join(parts[uploads_idx + 1:]) + f"/{filename}"  # "tasks/3/specification/file.pdf"
     return rel
 

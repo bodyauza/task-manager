@@ -388,7 +388,7 @@ Task Manager интегрирован с CRM-системой [«Руковод�
 | Создание задачи | `action=insert`, entity_id=29 | Задача сохраняется в БД, `crm_task_id=NULL`, предупреждение в UI |
 | Обновление задачи | `action=update`, `update_by_field={id: crm_task_id}` | Задача обновляется в БД, `crm_synced=false` в ответе |
 | Удаление задачи | `action=delete`, `delete_by_field={id: crm_task_id}` | Задача удаляется из БД, `crm_synced=false` в ответе |
-| Создание подзадачи | `action=insert`, entity_id=32 (только если `task.crm_task_id` не NULL) | Подзадача сохраняется в БД, `crm_subtask_id=NULL`, `crm_synced=false` |
+| Создание подзадачи | `action=insert`, entity_id=30 (только если `task.crm_task_id` не NULL) | Подзадача сохраняется в БД, `crm_subtask_id=NULL`, `crm_synced=false` |
 | Обновление подзадачи | `action=update`, `update_by_field={id: crm_subtask_id}` (только если `crm_subtask_id` не NULL) | Подзадача обновляется в БД, `crm_synced=false` в ответе |
 | Удаление подзадачи | `action=delete`, `delete_by_field={id: crm_subtask_id}` (только если `crm_subtask_id` не NULL) | Подзадача удаляется из БД, `crm_synced=false` в ответе |
 
@@ -397,7 +397,8 @@ Task Manager интегрирован с CRM-системой [«Руковод�
 | Сущность | entity_id | Поля |
 |---|---|---|
 | Пользователи | 1 | `group_id`, `firstname`, `lastname`, `username` (= email до `@`), `email`, `password` |
-| Задачи | 29 | `field_311` — название, `field_312` — описание, `field_313` — статус (чекбокс: `"true"` / `"false"`) |
+| Задачи | 29 | `field_317` — название, `field_318` — описание, `field_319` — статус (чекбокс: `"true"` / `"false"`) |
+| Подзадачи | 30 | `field_322` — название, `field_323` — описание, `field_324` — статус (чекбокс: `"true"` / `"false"`) |
 
 ### Конфигурация
 
@@ -421,7 +422,7 @@ src/crm/
 ├── client.py           # базовый HTTP-клиент (httpx async), метод _call()
 ├── user_service.py     # поиск пользователя по email (используется при логине)
 ├── task_service.py     # CRUD-операции с задачами (entity_id=29)
-└── subtask_service.py  # CRUD-операции с подзадачами (entity_id=32)
+└── subtask_service.py  # CRUD-операции с подзадачами (entity_id=30)
 ```
 
 ### HTTP-клиент
@@ -461,9 +462,9 @@ src/crm/
     "entity_id": 29,
     "items": [
         {
-            "field_311": "Название задачи",
-            "field_312": "Описание задачи",
-            "field_313": "false"
+            "field_317": "Название задачи",
+            "field_318": "Описание задачи",
+            "field_319": "false"
         }
     ]
 }
@@ -533,8 +534,8 @@ src/crm/
     "action": "update",
     "entity_id": 29,
     "data": {
-        "field_311": "Новое название задачи",
-        "field_313": "true"
+        "field_317": "Новое название задачи",
+        "field_319": "true"
     },
     "update_by_field": {"id": 42}
 }
