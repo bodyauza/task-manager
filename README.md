@@ -2,23 +2,45 @@
 
 ## Screenshots
 
-### Protected task board page
+### Task board page
 
-![Task Board](src/screenshots/task_board.png)
+![Task Board](src/screenshots/task-board_1.png)
+
+### Task page
+
+![Task page](src/screenshots/task-detail.png)
 
 ### List of tasks in CRM
 
-![List of tasks in CRM](src/screenshots/crm_list_of_tasks.png)
+![List of tasks in CRM](src/screenshots/crm_task.png)
 
-### Change task status in web application
+### Attaching files to a task in the web application
 
-![Change task status](src/screenshots/change_task_status.png)
+![Attaching files to a task in the web application](src/screenshots/task-detail_with_files.png)
 
-![Task status has changed in web application](src/screenshots/task_status_has_changed_in_web_application.png)
+#### The files have been successfully attached to the task in the CRM
 
-### Task status has changed in CRM
+![The files have been successfully attached to the task in the CRM](src/screenshots/crm_task_with_files.png)
 
-![Task status has changed in CRM](src/screenshots/task_status_has_changed_in_CRM.png)
+### Board of subtasks linked to a parent task
+
+![Board of subtasks linked to a parent task](src/screenshots/subtask-board.png)
+
+### List of subtasks in CRM
+
+![List of subtasks in CRM](src/screenshots/crm_subtask.png)
+
+### Subtask page
+
+![Subtask page](src/screenshots/subtask-detail_with_files.png)
+
+#### The files have been successfully attached to the subtask in the CRM
+
+![The files have been successfully attached to the subtask in the CRM](src/screenshots/crm_subtask_with_files.png)
+
+### Task status has changed in the web application
+
+![Task status has changed in the web application](src/screenshots/task_completed.png)
 
 ### Protected user profile page
 
@@ -41,6 +63,18 @@
 ### Users entity in CRM
 
 ![Users entity in CRM](src/screenshots/Users_entity_in_CRM.png)
+
+### Swagger UI
+
+![](src/screenshots/swagger_1.png)
+
+![](src/screenshots/swagger_2.png)
+
+![](src/screenshots/swagger_3.png)
+
+![](src/screenshots/swagger_4.png)
+
+![](src/screenshots/swagger_5.png)
 
 ## Technological Stack
 
@@ -68,7 +102,7 @@
 - **FastAPI Users**: 15.0.2
 
 ### ASGI web server
-- **uvicorn**: 0.35.0 (с `websockets`: без него WS-рукопожатие возвращает 404)
+- **uvicorn**: 0.35.0 (с `websockets`)
 
 ### File uploads
 - **python-magic-bin**: 0.4.14 — определение MIME-типа по сигнатуре байтов (Windows-сборка libmagic; на Linux/macOS — `python-magic` + системный `libmagic1`)
@@ -128,9 +162,9 @@ sequenceDiagram
         S->>D: SELECT registration_pending WHERE email=?
         Note right of S: expires_at прошёл → 400 CODE_EXPIRED<br/>attempts >= 3 → 400 TOO_MANY_ATTEMPTS<br/>bcrypt.verify fail → 400 INVALID_CODE
         S->>D: DELETE registration_pending
-        Note right of S: jwt.encode(sub=email, purpose=registration,<br/>exp=now+15мин, secret=REG_TOKEN_SECRET)
+        Note right of S: jwt.encode(sub=email, purpose=registration,<br/>exp=now+20мин, secret=REG_TOKEN_SECRET)
         S-->>C: 200 OK
-        Note left of C: Set-Cookie: reg_token=eyJ...<br/>HttpOnly, SameSite=Strict, Max-Age=900
+        Note left of C: Set-Cookie: reg_token=eyJ...<br/>HttpOnly, SameSite=Strict, Max-Age=1200
     end
 
     rect rgb(209, 250, 229)
@@ -297,7 +331,7 @@ sequenceDiagram
 
 ### WebSocket
 
-`ws://<host>/ws/tasks/{user_id}` — подключение требует куку `access_token`. Без неё сервер закрывает соединение с кодом `1008 Policy Violation`. Один и тот же маршрут используют `task-board.html` (полный клиент с чатом) и страницы деталей `task-detail.html`/`subtask-detail.html` (только реакция на файловые события своей задачи/подзадачи).
+`ws://<host>/ws/tasks/{client_id}` — подключение требует куку `access_token`. Без неё сервер закрывает соединение с кодом `1008 Policy Violation`. Один и тот же маршрут используют `task-board.html` (полный клиент с чатом), `subtask-board.html` и страницы деталей `task-detail.html`/`subtask-detail.html` (реакция на события своей задачи/подзадачи — без чата).
 
 Реестр соединений (`src/realtime/manager.py`) хранит **набор** WebSocket-соединений на каждого пользователя (`dict[user_id, set[WebSocket]]`), а не одно — несколько одновременно открытых вкладок/устройств получают события независимо, новое подключение не вытесняет предыдущие.
 
@@ -307,15 +341,17 @@ sequenceDiagram
 |---|---|---|
 | `chat` | Все кроме отправителя (все его вкладки) | `sender: text` |
 | `task_created` | Все кроме инициатора | `email: Создана задача: title` |
-| `task_updated` | Все кроме инициатора | `email: Обновлена задача: title` |
-| `task_deleted` | Все кроме инициатора | `email: Удалена задача: title` |
-| `task_files_updated` | Все кроме инициатора | payload: `title`, `sender`, `task_id` — страница `task-detail.html` перечитывает задачу, если `data.task_id` совпадает с открытой |
-| `subtask_created` | Все, включая инициатора | инициатор: `Subtask for task 'X' created: 'Y'`; остальные: `email: Создана подзадача «Y» [X]` |
-| `subtask_updated` | Все, включая инициатора | инициатор: `Subtask for task 'X' updated: 'Y'`; остальные: `email: Обновлена подзадача «Y» [X]` |
-| `subtask_deleted` | Все, включая инициатора | инициатор: `Subtask for task 'X' deleted: 'Y'`; остальные: `email: Удалена подзадача «Y» [X]` |
-| `subtask_files_updated` | Все кроме инициатора | payload: `title`, `sender`, `subtask_id` — страница `subtask-detail.html` перечитывает подзадачу, если `data.subtask_id` совпадает с открытой |
+| `task_updated` | Все кроме инициатора | `email: Обновлена задача: title`; `task-detail.html` этой задачи перечитывает её через `loadTask()` |
+| `task_deleted` | Все кроме инициатора | `email: Удалена задача: title`; `task-detail.html`/`subtask-board.html` этой задачи показывают алерт и переходят на `/task-board` — иначе следующее действие пользователя упёрлось бы в `404 Task not found` |
+| `task_files_updated` | **Все, включая инициатора** | `action: "uploaded"` \| `"deleted"` различает загрузку/удаление; инициатор (англ.): `Files added/removed to/from task "X"`; остальные: `email: Добавлены/Удалены файлы у задачи «X»`; `task-detail.html` этой задачи перечитывает её через `loadTask()` (кроме самого инициатора — тот уже увидел результат из ответа `fetch`) |
+| `subtask_created` | Все, включая инициатора | инициатор: `Subtask for task 'X' created: 'Y'`; остальные: `email: Создана подзадача «Y» [X]`; `subtask-board.html` этой задачи перечитывает список (кроме инициатора) |
+| `subtask_updated` | Все, включая инициатора | инициатор: `Subtask for task 'X' updated: 'Y'`; остальные: `email: Обновлена подзадача «Y» [X]`; `subtask-board.html`/`subtask-detail.html` перечитывают данные (кроме инициатора) |
+| `subtask_deleted` | Все, включая инициатора | инициатор: `Subtask for task 'X' deleted: 'Y'`; остальные: `email: Удалена подзадача «Y» [X]`; `subtask-board.html` перечитывает список, `subtask-detail.html` этой подзадачи — алерт и переход на `/subtask-board/{task_id}` (кроме инициатора — его страница уже уходит туда через собственный `DELETE`-ответ) |
+| `subtask_files_updated` | **Все, включая инициатора** | `action: "uploaded"` \| `"deleted"`; инициатор (англ.): `Files added/removed to/from subtask "Y" [X]`; остальные: `email: Добавлены/Удалены файлы у подзадачи «Y» [X]`; `subtask-detail.html` этой подзадачи перечитывает её через `loadSubtask()` (кроме инициатора) |
 
-Для событий задач инициатор исключён из рассылки — он получает подтверждение через HTTP-ответ (`addMessage` в обработчике `resp.ok`). Для событий подзадач broadcast идёт всем; клиент разделяет форматы по полю `actor_id` из payload (`String(data.actor_id) === userId`). Для файловых событий исключение инициатора (`exclude_user_id`) исключает все его открытые вкладки разом.
+Событий с «Все кроме инициатора» (`task_*`) и «Все, включая инициатора» (`subtask_*`, `*_files_updated`) — намеренно два разных паттерна, не оплошность: `task_*` рассылаются через `exclude_user_id` — инициатор получает подтверждение из HTTP-ответа, а не из WS; `subtask_*`/`*_files_updated` уходят всем без исключений, и клиент сам решает формат по `String(data.actor_id) === userId` (или пропускает повторную обработку — например, `task-detail.html` не перечитывает задачу по своему же `task_files_updated`, т.к. уже отрисовал результат из ответа `fetch`). `exclude_user_id`, когда используется, исключает все открытые вкладки инициатора разом, а не только ту, с которой пришёл запрос.
+
+`task_deleted`/`subtask_deleted` дополнительно решают проблему гонки «страница открыта — сущность удалена другим пользователем»: без авто-редиректа пользователь видел бы устаревшую страницу и получал непонятный `404 Task/Subtask not found` при следующем действии (сохранении, загрузке файла и т.д.).
 
 При разрыве соединения клиент переподключается через 3 секунды. История чата (только на `task-board.html`) сохраняется в `localStorage`.
 
@@ -389,6 +425,7 @@ registration_pending
 | `0009` | Замена глобального `UNIQUE(task.title)` на `UNIQUE(task.title, task.owner_id)` |
 | `0010` | Добавление `specification_path` (VARCHAR) и `other_file_paths` (Text) в `task` и `subtask` |
 | `0011` | Конвертация `other_file_paths` из `Text` в `JSONB` (`ALTER COLUMN ... TYPE JSONB USING ...::jsonb`) |
+| `0012` | Добавление недостающего `uq_person_email` (обнаружено `alembic check` — 0002 задумывался, но constraint не был применён); объединение `registration_pending.email` в один unique index вместо `constraint + дублирующий обычный индекс` |
 
 ---
 

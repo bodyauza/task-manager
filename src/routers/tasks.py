@@ -45,12 +45,13 @@ async def create_task(
             select(Task).where(Task.title == task.title, Task.owner_id == user.id)
         )
     ).scalar_one_or_none()
-    # scalar_one_or_none(): берёт первую (и единственную) колонку каждой строки результата
-    # (здесь — объект Task целиком, т.к. select(Task) возвращает ORM-сущность одной колонкой)
-    # и возвращает её. Если строк 0 — вернёт None вместо исключения (в отличие от scalar_one(),
-    # которому 0 строк — уже ошибка). Если строк больше одной — поднимет MultipleResultsFound;
-    # здесь это невозможно даже под гонкой, т.к. UNIQUE(title, owner_id) не даст двум строкам
-    # с одинаковой парой существовать одновременно.
+    # scalar_one_or_none() = .scalars() (берёт первую колонку каждой строки — здесь
+    # она единственная, т.к. select(Task) возвращает объект Task целиком одной колонкой)
+    # + .one_or_none() (отдельно проверяет количество строк: 0 — вернёт None вместо
+    # исключения, в отличие от scalar_one(), которому 0 строк — уже ошибка; больше
+    # одной — поднимет MultipleResultsFound). Больше одной строки здесь невозможно
+    # даже под гонкой, т.к. UNIQUE(title, owner_id) не даст двум строкам с одинаковой
+    # парой существовать одновременно.
     if existing is not None:
         raise HTTPException(
             status_code=409,
@@ -222,7 +223,12 @@ async def update_task(
         crm_synced = False
         logger.warning("Task id=%s has no crm_task_id — CRM update skipped", task_id)
 
-    await broadcast_task_event("task_updated", db_task.title, exclude_user_id=user.id, sender_email=user.email)
+    # task_id в payload: детальная страница задачи (task-detail.js) сравнивает его со своим
+    # taskId и перечитывает задачу через loadTask(), если её отредактировал другой пользователь.
+    await broadcast_task_event(
+        "task_updated", db_task.title,
+        exclude_user_id=user.id, sender_email=user.email, task_id=task_id,
+    )
     result = TaskResponse.model_validate(db_task)
     result.crm_synced = crm_synced
     return result
@@ -245,7 +251,7 @@ async def delete_task(
     # успела туда синхронизироваться) остались бы сиротами, так как не попали бы в snapshot
     # subtask_ids/crm_subtask_ids ниже (он читается ДО того, как гонка успела бы что-то вставить).
     # Конкурентный create_subtask после разблокировки получит IntegrityError (FK violation) —
-    # обработка этого случая (отличие от дубликата title) добавлена в subtasks.py::create_subtask.
+    # обработка этого случая добавлена в subtasks.py::create_subtask.
     task = (
         await db.execute(select(Task).where(Task.id == task_id).with_for_update())
     ).scalar_one_or_none()
@@ -313,5 +319,10 @@ async def delete_task(
         snapshot.crm_synced = False
         logger.warning("Task id=%s has no crm_task_id — CRM delete skipped", task_id)
 
-    await broadcast_task_event("task_deleted", snapshot.title, exclude_user_id=user.id, sender_email=user.email)
+    # task_id в payload: детальная страница удалённой задачи (task-detail.js) сравнивает его
+    # со своим taskId и делает автоматический редирект на /task-board, если совпало.
+    await broadcast_task_event(
+        "task_deleted", snapshot.title,
+        exclude_user_id=user.id, sender_email=user.email, task_id=task_id,
+    )
     return snapshot

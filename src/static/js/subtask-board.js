@@ -3,6 +3,12 @@
 // десятичная база; строка "08" без радиуса трактовалась бы как восьмеричное число в ES3.
 const taskId = parseInt(document.getElementById('taskId').value, 10);
 
+// user.id из <input type="hidden" id="userId">. Нужен для URL WebSocket-соединения
+// (/ws/tasks/{userId}) и для сравнения с data.actor_id — отличить свои же действия
+// (уже отражённые в списке локально) от событий других пользователей.
+const userId = document.getElementById('userId').value;
+let socket;
+
 // Срез данных текущей страницы: массив объектов подзадач, которые сейчас видны в списке.
 // Заполняется в displaySubtasks() при каждом вызове loadSubtasks().
 // Нужен в двух местах:
@@ -13,7 +19,6 @@ let currentSubtasks = [];
 // Номер текущей страницы пагинации (отсчёт с 1, не с 0).
 // Обновляется в loadSubtasks() при каждом переходе.
 // Читается в deleteSubtask() для решения: перейти на предыдущую страницу или остаться.
-// WS-обработчиков нет — subtask-board.js не подключает WebSocket.
 let currentPage = 1;
 
 // Размер страницы: сколько подзадач запрашивать за один вызов GET /subtasks/.
@@ -316,10 +321,53 @@ async function deleteSubtask(id) {
     }
 }
 
+// ── WebSocket ─────────────────────────────────────────────────────────────────
+// Упрощённая версия connectWebSocket из task-board.js — без чата, только реакция
+// на изменения подзадач этой задачи и на удаление самой задачи другим пользователем.
+// Без этого список подзадач молча устаревает: пользователь видит уже удалённую другим
+// человеком подзадачу и, кликнув по ней «Изменить»/«Удалить», получает 404 Subtask not found
+// вместо актуального списка.
+
+function connectWebSocket() {
+    try {
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        socket = new WebSocket(`${wsProtocol}//${window.location.host}/ws/tasks/${userId}`);
+
+        socket.onmessage = function(event) {
+            try {
+                const data = JSON.parse(event.data);
+                if (
+                    (data.type === 'subtask_created' || data.type === 'subtask_updated' || data.type === 'subtask_deleted')
+                    && data.task_id === taskId
+                ) {
+                    // Своё же действие уже отражено локально сразу после ответа fetch —
+                    // повторная перезагрузка списка по этому же событию была бы лишней.
+                    if (String(data.actor_id) === userId) return;
+                    loadSubtasks(currentPage);
+                    showToast(`${data.sender}: список подзадач обновлён`, 'info');
+                } else if (data.type === 'task_deleted' && data.task_id === taskId) {
+                    // Задачу, чьи подзадачи мы просматриваем, удалил другой пользователь —
+                    // страница подзадач для неё больше не существует (404 при любом действии).
+                    alert('Задача была удалена другим пользователем');
+                    window.location.href = '/task-board';
+                }
+            } catch (e) { /* нераспознанное сообщение — игнорируем */ }
+        };
+
+        socket.onclose = function(event) {
+            if (event.code === 1008) { window.location.href = '/'; return; }
+            setTimeout(connectWebSocket, 3000);   // переподключение при разрыве
+        };
+    } catch (error) {
+        setTimeout(connectWebSocket, 3000);
+    }
+}
+
 window.addEventListener('load', function() {
     // 'load' срабатывает после полной загрузки DOM и ресурсов;
     // все getElementById ниже вернут не null.
     loadSubtasks(1);
+    connectWebSocket();
 
     document.getElementById('saveEditBtn').addEventListener('click', submitEdit);
     document.getElementById('cancelEditBtn').addEventListener('click', closeEditModal);

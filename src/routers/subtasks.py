@@ -95,6 +95,8 @@ async def create_subtask(
         "subtask_created", db_subtask.title,
         sender_email=user.email,  # email актора → data.sender для других пользователей
         task_title=task_title,    # название родительской задачи → data.task_title в payload
+        task_id=subtask.task_id,  # subtask-board.js сравнивает с своим taskId, чтобы решить,
+        # относится ли событие к странице подзадач, которая сейчас открыта у клиента
         actor_id=user.id,         # попадает в payload через **extra → data.actor_id на фронте;
         # exclude_user_id не передаётся (None по умолчанию): broadcast идёт всем, включая актора.
         # Актор и остальные получают один payload; разделение форматов — на фронте:
@@ -186,6 +188,9 @@ async def update_subtask(
         "subtask_updated", db_subtask.title,
         sender_email=user.email,  # email актора → data.sender для других пользователей
         task_title=task_title,    # название родительской задачи → data.task_title в payload
+        task_id=db_subtask.task_id,  # subtask-board.js сравнивает с своим taskId
+        subtask_id=subtask_id,    # детальная страница подзадачи (subtask-detail.js) сравнивает
+        # с своим subtaskId и перечитывает подзадачу через loadSubtask()
         actor_id=user.id,         # попадает в payload через **extra → data.actor_id на фронте;
         # exclude_user_id не передаётся (None по умолчанию): broadcast идёт всем, включая актора.
         # Актор и остальные получают один payload; разделение форматов — на фронте:
@@ -234,6 +239,7 @@ async def delete_subtask(
     #     raise HTTPException(status_code=403, detail="Forbidden")
 
     task_title = task.title                          # захватить до commit (объект будет expired)
+    parent_task_id = subtask.task_id                 # захватить до commit — для payload task_id
     snapshot = SubtaskResponse.model_validate(subtask)
     # snapshot создаётся ДО удаления: после db.delete+commit объект в состоянии detached,
     # атрибуты недоступны; snapshot хранит данные для возврата в ответе
@@ -250,7 +256,10 @@ async def delete_subtask(
         "subtask_deleted", snapshot.title,
         sender_email=user.email,  # email актора → data.sender для других пользователей
         task_title=task_title,    # название родительской задачи → data.task_title в payload
+        task_id=parent_task_id,   # subtask-board.js сравнивает с своим taskId, чтобы обновить список
         actor_id=user.id,         # попадает в payload через **extra → data.actor_id на фронте;
+        subtask_id=subtask_id,    # детальная страница подзадачи сравнивает с своим subtaskId
+        # и делает автоматический редирект на /subtask-board/{task_id}, если совпало.
         # exclude_user_id не передаётся (None по умолчанию): broadcast идёт всем, включая актора.
         # Актор и остальные получают один payload; разделение форматов — на фронте:
         #   String(data.actor_id) === userId → "Subtask for task '...' deleted: '...'"

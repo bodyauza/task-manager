@@ -27,8 +27,9 @@
         button.update:hover { background-color: #bf360c; }
         a.btn-open { display: inline-block; padding: 5px 12px; font-size: 12px; font-family: inherit; font-weight: 600; background-color: #003f6b; color: white; border-radius: 2px; text-decoration: none; transition: background-color .2s; }
         a.btn-open:hover { background-color: #002b4e; color: white; }
-        a.btn-back { display: inline-block; margin-bottom: 16px; font-size: 13px; color: #003f6b; text-decoration: none; font-weight: 600; }
+        a.btn-back { display: inline-block; margin-bottom: 16px; font-size: 16px; color: #003f6b; text-decoration: none; font-weight: 600; }
         a.btn-back:hover { text-decoration: underline; }
+        .btn-back-arrow { display: inline-block; font-size: 1.4em; line-height: 1; vertical-align: -0.1em; }
         .task-item { border: 1px solid #dee2e6; border-left: 3px solid #003f6b; border-radius: 0 2px 2px 0; padding: 14px; margin-bottom: 10px; background-color: #fafafa; }
         .task-item.completed { background-color: #e8f5e9; border-left-color: #198754; border-color: #c8e6c9; }
         .task-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; gap: 8px; }
@@ -61,11 +62,12 @@
 </head>
 <body>
     <input type="hidden" id="taskId" value="{{ task_id }}">
+    <input type="hidden" id="userId" value="{{ user }}">
 
     {% include '_navbar.html' %}
 
     <div class="board-wrapper">
-        <a class="btn-back" href="/task-board">← Вернуться к задачам</a>
+        <a class="btn-back" href="/task-board"><span class="btn-back-arrow">←</span> Вернуться к задачам</a>
         <h2 class="board-header">Подзадачи</h2>
         <div class="board-subheader">Задача: {{ task_title }}</div>
 
@@ -119,6 +121,6 @@
         </div>
     </div>
 
-    <script src="/static/js/subtask-board.js" defer></script>
+    <script src="/static/js/subtask-board.js?v=2" defer></script>
 </body>
 </html>

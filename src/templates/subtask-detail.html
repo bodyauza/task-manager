@@ -22,8 +22,9 @@
         button.delete:hover { background-color: #961515; }
         button.secondary { background-color: #546e7a; }
         button.secondary:hover { background-color: #37474f; }
-        a.btn-back { display: inline-block; margin-bottom: 16px; font-size: 13px; color: #003f6b; text-decoration: none; font-weight: 600; }
+        a.btn-back { display: inline-block; margin-bottom: 16px; font-size: 16px; color: #003f6b; text-decoration: none; font-weight: 600; }
         a.btn-back:hover { text-decoration: underline; }
+        .btn-back-arrow { display: inline-block; font-size: 1.4em; line-height: 1; vertical-align: -0.1em; }
         .field-row { display: flex; flex-direction: column; gap: 4px; margin-bottom: 16px; }
         .field-label { font-size: 11px; font-weight: 700; color: #6c757d; text-transform: uppercase; letter-spacing: 0.7px; }
         .field-value { font-size: 15px; color: #212529; line-height: 1.5; }
@@ -57,6 +58,9 @@
         .file-list { list-style: none; padding: 0; margin: 6px 0 0; }
         .file-list li { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
         .files-counter { font-size: 11px; color: #6c757d; margin-left: 4px; }
+        /* ── Файлы, ещё не отправленные на сервер (визуально отличны от уже загруженных) ── */
+        .pending-caption { font-size: 11px; font-weight: 700; color: #e65100; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 8px; }
+        .file-pending-name { font-size: 13px; color: #6c757d; font-style: italic; word-break: break-all; }
     </style>
 </head>
 <body>
@@ -67,7 +71,7 @@
     {% include '_navbar.html' %}
 
     <div class="detail-wrapper">
-        <a class="btn-back" href="/subtask-board/{{ task_id }}">← Вернуться к подзадачам</a>
+        <a class="btn-back" href="/subtask-board/{{ task_id }}"><span class="btn-back-arrow">←</span> Вернуться к подзадачам</a>
         <h2 class="board-header">Подзадача</h2>
 
         <div class="card">
@@ -113,8 +117,17 @@
                     </span>
                     <!-- other-files-list заполняется JS при loadSubtask() -->
                     <ul class="file-list" id="otherFilesList"></ul>
+                    <!-- otherPendingCaption/otherPendingList: файлы, выбранные, но ещё не отправленные
+                         на сервер — визуально отличаются от уже загруженных (серый курсив, подпись),
+                         чтобы не выглядеть как реально сохранённые кликабельные файлы. Заполняется
+                         накопительно на фронтенде — каждое открытие диалога выбора добавляет файлы
+                         к этому списку, а не заменяет предыдущий выбор. -->
+                    <span class="pending-caption" id="otherPendingCaption" style="display:none;">Не отправлено — нажмите «Добавить файлы»</span>
+                    <ul class="file-list" id="otherPendingList"></ul>
                     <div class="file-upload-row">
-                        <!-- multiple: позволяет выбрать несколько файлов за раз -->
+                        <!-- multiple: позволяет выбрать несколько файлов за раз; input можно открывать
+                             повторно — новые файлы добавляются к otherPendingList, не заменяя старые.
+                             Отправка на сервер — только по явному клику на otherUploadBtn. -->
                         <input type="file" id="otherInput" multiple
                                accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png,.txt">
                         <button class="btn-upload" id="otherUploadBtn">Добавить файлы</button>
@@ -151,6 +164,6 @@
         </div>
     </div>
 
-    <script src="/static/js/subtask-detail.js" defer></script>
+    <script src="/static/js/subtask-detail.js?v=5" defer></script>
 </body>
 </html>

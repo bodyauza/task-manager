@@ -10,6 +10,7 @@
 В БД хранятся только пути относительно uploads/ — байты файлов в БД не попадают.
 """
 
+import asyncio
 import logging
 import shutil
 from pathlib import Path
@@ -77,7 +78,9 @@ async def upload_task_specification(
     old_path = UPLOAD_ROOT / task.specification_path if task.specification_path else None
 
     # save_file: создаёт директорию и записывает байты; возвращает rel-путь от uploads/.
-    rel_path = save_file(dest_dir, filename, content)
+    # asyncio.to_thread: mkdir+write_bytes — синхронный блокирующий I/O, без выноса
+    # в поток он держит event loop занятым на время записи (для больших файлов заметно).
+    rel_path = await asyncio.to_thread(save_file, dest_dir, filename, content)
 
     # CRM-синхронизация — best-effort: только если задача зарегистрирована в CRM.
     # Ошибка CRM логируется, но не блокирует сохранение файла локально.
@@ -102,9 +105,12 @@ async def upload_task_specification(
     if old_path:
         old_path.unlink(missing_ok=True)
 
+    # exclude_user_id не передаётся: broadcast идёт всем, включая актора — актор должен увидеть
+    # собственное сообщение в чате (см. task-board.js). action="uploaded" различает
+    # формулировку "Добавлены файлы"/"Files added" от "Удалены файлы"/"Files removed" на фронте.
     await broadcast_task_event(
         "task_files_updated", task_title,
-        exclude_user_id=user.id, sender_email=user.email, task_id=task_id,
+        sender_email=user.email, task_id=task_id, actor_id=user.id, action="uploaded",
     )
 
     return {"specification_path": rel_path}  # URL: /uploads/{rel_path}
@@ -144,7 +150,7 @@ async def delete_task_specification(
 
     await broadcast_task_event(
         "task_files_updated", task_title,
-        exclude_user_id=user.id, sender_email=user.email, task_id=task_id,
+        sender_email=user.email, task_id=task_id, actor_id=user.id, action="deleted",
     )
 
     return {"specification_path": None}
@@ -162,7 +168,7 @@ async def upload_task_files(
     db: AsyncSession = Depends(get_async_session),
 ):
     """Добавляет файлы в «Иные документы» задачи (максимум 10 файлов суммарно)."""
-    # ⚠ Race condition (lost update) на JSONB-колонке other_file_paths: без блокировки строки
+    # Race condition (lost update) на JSONB-колонке other_file_paths: без блокировки строки
     # между SELECT и последующим UPDATE (task.other_file_paths = updated ниже) два параллельных
     # запроса к одной и той же задаче читают один и тот же "existing" ещё до commit друг друга —
     # итоговый UPDATE второго запроса молча затирает результат первого:
@@ -205,20 +211,31 @@ async def upload_task_files(
 
     dest_dir  = UPLOAD_ROOT / "tasks" / str(task_id) / "other"
 
-    # Проход 1: валидируем все файлы до записи на диск.
-    # Если любой файл не пройдёт проверку — HTTPException прервёт цикл до save_file,
-    # и на диске не останется частично сохранённых файлов.
-    validated: list[tuple[bytes, str]] = []
-    for upload in files:
-        content  = await read_and_validate(upload)
+    # Проход 1: валидируем все файлы до записи на диск — параллельно через asyncio.gather.
+    # return_exceptions=True вместо того чтобы дать gather самому оборвать ожидание на первой
+    # ошибке: поток ОС, уже занятый magic.from_buffer() для другого файла, всё равно не
+    # остановить снаружи — он доработает сам по себе, просто впустую. Дожидаемся всех
+    # результатов и поднимаем первую ошибку сами — так на диске по-прежнему не остаётся
+    # частично сохранённых файлов (сохранение всё ещё начинается только после этой проверки).
+    async def _validate_one(upload: UploadFile) -> tuple[bytes, str]:
+        content = await read_and_validate(upload)
         filename = safe_filename(upload.filename)
-        validated.append((content, filename))
+        return content, filename
 
-    # Проход 2: все файлы валидны — сохраняем на диск.
-    new_paths: list[str] = []
-    for content, filename in validated:
-        rel_path = save_file(dest_dir, filename, content)
-        new_paths.append(rel_path)
+    validation_results = await asyncio.gather(
+        *[_validate_one(upload) for upload in files], return_exceptions=True
+    )
+    for result in validation_results:
+        if isinstance(result, BaseException):
+            raise result
+    validated: list[tuple[bytes, str]] = validation_results  # после цикла выше — только tuple
+
+    # Проход 2: все файлы валидны — сохраняем на диск параллельно. В отличие от MIME-проверки
+    # выше (сериализована общим локом внутри python-magic), запись на диск такого ограничения
+    # не имеет — у каждого файла свой UUID-префикс от safe_filename(), коллизий имён нет.
+    new_paths: list[str] = list(await asyncio.gather(
+        *[asyncio.to_thread(save_file, dest_dir, filename, content) for content, filename in validated]
+    ))
 
     updated = existing + new_paths
     crm_task_id = task.crm_task_id   # захватить до commit: после expire атрибут недоступен
@@ -240,7 +257,7 @@ async def upload_task_files(
 
     await broadcast_task_event(
         "task_files_updated", task_title,
-        exclude_user_id=user.id, sender_email=user.email, task_id=task_id,
+        sender_email=user.email, task_id=task_id, actor_id=user.id, action="uploaded",
     )
 
     return {"other_file_paths": updated}
@@ -254,11 +271,9 @@ async def delete_task_file(
     db: AsyncSession = Depends(get_async_session),
 ):
     """Удаляет один файл из «Иных документов» задачи по имени файла."""
-    # ⚠ Тот же lost-update race на other_file_paths, что и в upload_task_files выше — только
-    # в обратную сторону: если это удаление racing-ит с параллельной загрузкой нового файла,
+    # Если это удаление racing-ит с параллельной загрузкой нового файла,
     # финальный UPDATE может отменить чужое добавление или воскресить путь, который параллельно
-    # удалили. Устраняется той же блокировкой FOR NO KEY UPDATE — подробный разбор выбора между
-    # FOR UPDATE и FOR NO KEY UPDATE см. в upload_task_files.
+    # удалили. Устраняется той же блокировкой FOR NO KEY UPDATE (см. в upload_task_files)
     task = (
         await db.execute(
             select(Task).where(Task.id == task_id).with_for_update(key_share=True)
@@ -296,7 +311,7 @@ async def delete_task_file(
 
     await broadcast_task_event(
         "task_files_updated", task_title,
-        exclude_user_id=user.id, sender_email=user.email, task_id=task_id,
+        sender_email=user.email, task_id=task_id, actor_id=user.id, action="deleted",
     )
 
     return {"other_file_paths": updated}

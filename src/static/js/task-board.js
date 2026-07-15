@@ -211,6 +211,28 @@ function connectWebSocket() {
                         addMessage(`${data.sender}: Удалена подзадача «${data.title}» [${data.task_title}]`);
                     }
                     loadTasks(currentPage);
+                } else if (data.type === 'task_files_updated') {
+                    // Список задач не показывает файлы — loadTasks() здесь не нужен,
+                    // событие влияет только на открытую страницу деталей задачи (task-detail.js).
+                    if (String(data.actor_id) === userId) {
+                        addMessage(data.action === 'deleted'
+                            ? `Files removed from task "${data.title}"`
+                            : `Files added to task "${data.title}"`);
+                    } else {
+                        addMessage(data.action === 'deleted'
+                            ? `${data.sender}: Удалены файлы у задачи «${data.title}»`
+                            : `${data.sender}: Добавлены файлы к задаче «${data.title}»`);
+                    }
+                } else if (data.type === 'subtask_files_updated') {
+                    if (String(data.actor_id) === userId) {
+                        addMessage(data.action === 'deleted'
+                            ? `Files removed from subtask "${data.title}" [${data.task_title}]`
+                            : `Files added to subtask "${data.title}" [${data.task_title}]`);
+                    } else {
+                        addMessage(data.action === 'deleted'
+                            ? `${data.sender}: Удалены файлы у подзадачи «${data.title}» [${data.task_title}]`
+                            : `${data.sender}: Добавлены файлы к подзадаче «${data.title}» [${data.task_title}]`);
+                    }
                 } else {
                     addMessage(event.data);
                 }

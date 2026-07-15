@@ -12,6 +12,7 @@
   - CRM-поля: field_325 (ТЗ) и field_326 (иные документы)
 """
 
+import asyncio
 import logging
 import shutil
 from pathlib import Path
@@ -24,7 +25,7 @@ from src.auth.auth_config import current_user
 from src.auth.models import User
 from src.database import get_async_session
 from src.realtime import broadcast_task_event
-from src.task_logic.models import Subtask
+from src.task_logic.models import Subtask, Task
 from src.utils.file_utils import (
     MAX_OTHER_FILES,
     UPLOAD_ROOT,         # абсолютный путь к src/static/uploads/ (единая точка определения)
@@ -68,7 +69,9 @@ async def upload_subtask_specification(
     # Старый путь захватываем до commit; удалим файл только после успешного commit.
     old_path = UPLOAD_ROOT / subtask.specification_path if subtask.specification_path else None
 
-    rel_path = save_file(dest_dir, filename, content)  # записать на диск → rel-путь
+    # asyncio.to_thread: mkdir+write_bytes — синхронный блокирующий I/O, без выноса
+    # в поток он держит event loop занятым на время записи.
+    rel_path = await asyncio.to_thread(save_file, dest_dir, filename, content)  # → rel-путь
 
     # CRM best-effort: синхронизируем только если подзадача зарегистрирована в CRM.
     if subtask.crm_subtask_id is not None:
@@ -83,6 +86,9 @@ async def upload_subtask_specification(
             logger.error("CRM: subtask %s specification sync failed: %s", subtask_id, exc)
 
     subtask_title = subtask.title            # захватить до commit — иначе MissingGreenlet после expire
+    # task_title нужен для payload "[Task-title]" в чате task-board.js — подзадача сама
+    # по себе неоднозначна без указания родительской задачи.
+    task_title = (await db.get(Task, subtask.task_id)).title
     subtask.specification_path = rel_path   # "subtasks/7/specification/a1b2_spec.pdf"
     await db.commit()
 
@@ -90,9 +96,11 @@ async def upload_subtask_specification(
     if old_path:
         old_path.unlink(missing_ok=True)
 
+    # exclude_user_id не передаётся: broadcast идёт всем, включая актора (см. task-board.js).
     await broadcast_task_event(
         "subtask_files_updated", subtask_title,
-        exclude_user_id=user.id, sender_email=user.email, subtask_id=subtask_id,
+        sender_email=user.email, subtask_id=subtask_id, task_title=task_title,
+        actor_id=user.id, action="uploaded",
     )
 
     return {"specification_path": rel_path}
@@ -118,6 +126,7 @@ async def delete_subtask_specification(
 
     crm_subtask_id = subtask.crm_subtask_id
     subtask_title = subtask.title   # захватить до commit — иначе MissingGreenlet после expire
+    task_title = (await db.get(Task, subtask.task_id)).title
     subtask.specification_path = None
     await db.commit()
 
@@ -131,7 +140,8 @@ async def delete_subtask_specification(
 
     await broadcast_task_event(
         "subtask_files_updated", subtask_title,
-        exclude_user_id=user.id, sender_email=user.email, subtask_id=subtask_id,
+        sender_email=user.email, subtask_id=subtask_id, task_title=task_title,
+        actor_id=user.id, action="deleted",
     )
 
     return {"specification_path": None}
@@ -187,22 +197,36 @@ async def upload_subtask_files(
 
     dest_dir  = UPLOAD_ROOT / "subtasks" / str(subtask_id) / "other"
 
-    # Проход 1: валидируем все файлы до записи на диск.
-    validated: list[tuple[bytes, str]] = []
-    for upload in files:
-        content  = await read_and_validate(upload)
+    # Проход 1: валидируем все файлы до записи на диск — параллельно через asyncio.gather.
+    # return_exceptions=True вместо того чтобы дать gather самому оборвать ожидание на первой
+    # ошибке: поток ОС, уже занятый magic.from_buffer() для другого файла, всё равно не
+    # остановить снаружи — он доработает сам по себе, просто впустую. Дожидаемся всех
+    # результатов и поднимаем первую ошибку сами — так на диске по-прежнему не остаётся
+    # частично сохранённых файлов (сохранение всё ещё начинается только после этой проверки).
+    async def _validate_one(upload: UploadFile) -> tuple[bytes, str]:
+        content = await read_and_validate(upload)
         filename = safe_filename(upload.filename)
-        validated.append((content, filename))
+        return content, filename
 
-    # Проход 2: все файлы валидны — сохраняем на диск.
-    new_paths: list[str] = []
-    for content, filename in validated:
-        rel_path = save_file(dest_dir, filename, content)
-        new_paths.append(rel_path)
+    validation_results = await asyncio.gather(
+        *[_validate_one(upload) for upload in files], return_exceptions=True
+    )
+    for result in validation_results:
+        if isinstance(result, BaseException):
+            raise result
+    validated: list[tuple[bytes, str]] = validation_results  # после цикла выше — только tuple
+
+    # Проход 2: все файлы валидны — сохраняем на диск параллельно. В отличие от MIME-проверки
+    # выше (сериализована общим локом внутри python-magic), запись на диск такого ограничения
+    # не имеет — у каждого файла свой UUID-префикс от safe_filename(), коллизий имён нет.
+    new_paths: list[str] = list(await asyncio.gather(
+        *[asyncio.to_thread(save_file, dest_dir, filename, content) for content, filename in validated]
+    ))
 
     updated = existing + new_paths
     crm_subtask_id = subtask.crm_subtask_id
     subtask_title = subtask.title   # захватить до commit — иначе MissingGreenlet после expire
+    task_title = (await db.get(Task, subtask.task_id)).title
     subtask.other_file_paths = updated
     await db.commit()
 
@@ -217,7 +241,8 @@ async def upload_subtask_files(
 
     await broadcast_task_event(
         "subtask_files_updated", subtask_title,
-        exclude_user_id=user.id, sender_email=user.email, subtask_id=subtask_id,
+        sender_email=user.email, subtask_id=subtask_id, task_title=task_title,
+        actor_id=user.id, action="uploaded",
     )
 
     return {"other_file_paths": updated}
@@ -256,6 +281,7 @@ async def delete_subtask_file(
     updated = [p for p in existing if p != target]
     crm_subtask_id = subtask.crm_subtask_id
     subtask_title = subtask.title   # захватить до commit — иначе MissingGreenlet после expire
+    task_title = (await db.get(Task, subtask.task_id)).title
     subtask.other_file_paths = updated if updated else None
     await db.commit()
 
@@ -270,7 +296,8 @@ async def delete_subtask_file(
 
     await broadcast_task_event(
         "subtask_files_updated", subtask_title,
-        exclude_user_id=user.id, sender_email=user.email, subtask_id=subtask_id,
+        sender_email=user.email, subtask_id=subtask_id, task_title=task_title,
+        actor_id=user.id, action="deleted",
     )
 
     return {"other_file_paths": updated}

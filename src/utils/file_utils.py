@@ -4,6 +4,7 @@
 Логика валидации вынесена сюда, а не в роутеры, чтобы не дублировать код.
 """
 
+import asyncio
 import magic                        # python-magic-bin: MIME-детектор по сигнатуре байтов
 from pathlib import Path
 from uuid import uuid4
@@ -85,7 +86,16 @@ async def read_and_validate(file: UploadFile) -> bytes:
     # magic.from_buffer определяет MIME по сигнатуре байтов файла (не по расширению).
     # Например, PDF начинается с %PDF-1.x; PNG — с \x89PNG\r\n\x1a\n.
     # mime=True: возвращает строку MIME-типа, а не текстовое описание.
-    detected_mime: str = magic.from_buffer(content, mime=True)
+    # asyncio.to_thread: magic.from_buffer — синхронный CPU-bound вызов libmagic;
+    # без выноса в поток он блокирует event loop на время анализа сигнатуры байтов,
+    # замораживая вообще все остальные запросы приложения в этот момент. Сам
+    # python-magic потокобезопасен (Magic.from_buffer использует внутренний
+    # threading.Lock — общий на процесс, т.к. magic.from_buffer() переиспользует
+    # один и тот же закешированный экземпляр Magic), поэтому конкурентные вызовы
+    # из разных потоков не портят результат — но и не ускоряют друг друга: лок
+    # сериализует их между собой. Выигрыш здесь — не в скорости самого MIME-анализа,
+    # а в том, что во время его ожидания event loop свободен для других запросов.
+    detected_mime: str = await asyncio.to_thread(magic.from_buffer, content, mime=True)
 
     if detected_mime not in ALLOWED[suffix]:
         # 422: MIME не совпадает с ожидаемым для этого расширения.
