@@ -56,3 +56,16 @@ class TaskResponse(BaseModel):
     # True  = последняя синхронизация прошла успешно.
     # False = последняя синхронизация завершилась ошибкой.
     crm_synced: Optional[bool] = None
+    # subtask_count вычисляется через подзапрос в read_tasks; None в остальных эндпоинтах.
+    subtask_count: Optional[int] = None
+
+    # Путь к файлу ТЗ относительно src/static/uploads/.
+    # None — файл не загружен. Пример: "tasks/3/specification/a1b2_tz.pdf".
+    # URL доступа: /uploads/tasks/3/specification/a1b2_tz.pdf (через StaticFiles mount).
+    specification_path: Optional[str] = None
+
+    # Список путей к иным документам.
+    # ORM-колонка JSONB: asyncpg десериализует JSONB → list[str] при чтении автоматически.
+    # Pydantic получает готовый list[str] — ручной десериализации не требуется.
+    # None/[] — документов нет.
+    other_file_paths: Optional[list[str]] = None

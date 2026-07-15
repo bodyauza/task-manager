@@ -1,3 +1,5 @@
+import asyncio
+
 from httpx import AsyncClient
 
 from tests.conftest import register_user
@@ -202,3 +204,34 @@ async def test_all_users_see_all_tasks(client: AsyncClient, mock_smtp: dict):
     r = await client.get("/tasks/")
     assert r.status_code == 200
     assert "Visible To All" in [t["title"] for t in r.json()]
+
+
+# ── Concurrency / locking ────────────────────────────────────────────────────
+
+async def test_concurrent_delete_and_create_subtask_no_crash(client: AsyncClient, mock_smtp: dict):
+    """Регрессионный тест на FOR UPDATE в delete_task + обработку FK-violation
+    в create_subtask (см. subtasks.py::create_subtask): по-настоящему
+    параллельные delete_task и create_subtask для одной и той же задачи не
+    должны приводить ни к 500 (необработанная ошибка), ни к подзадаче-сироте,
+    ни к вводящему в заблуждение "already exists" при фактически удалённой
+    задаче — только к 201 (подзадача успела создаться до удаления) либо к
+    осмысленной 404/409.
+    """
+    await _register_login(client, mock_smtp)
+    task = (await _create(client, title="RaceParent")).json()
+    tid = task["id"]
+
+    delete_resp, create_resp = await asyncio.gather(
+        client.delete(f"/delete-task/{tid}"),
+        client.post(
+            "/create-subtask/",
+            json={"task_id": tid, "title": "RaceSub", "description": ""},
+        ),
+    )
+
+    assert delete_resp.status_code == 200
+    assert create_resp.status_code in (201, 404, 409)
+    if create_resp.status_code == 404:
+        assert create_resp.json()["detail"] == "Task not found"
+    if create_resp.status_code == 409:
+        assert "already exists" in create_resp.json()["detail"]

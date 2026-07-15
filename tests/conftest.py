@@ -65,7 +65,8 @@ def mock_crm():
     # поэтому там используются реальные экземпляры с httpx-мок.
     with patch("src.crm.client.CRMClient") as mock_crm_cls, \
          patch("src.crm.user_service.CRMUserSelector") as mock_selector_cls, \
-         patch("src.crm.task_service.TaskManager") as mock_task_mgr_cls:
+         patch("src.crm.task_service.TaskManager") as mock_task_mgr_cls, \
+         patch("src.crm.subtask_service.SubtaskManager") as mock_subtask_mgr_cls:
 
         mock_crm_instance = AsyncMock()
         mock_crm_instance.register_user.return_value = {"status": "success", "data": {"id": "99"}}
@@ -83,10 +84,18 @@ def mock_crm():
         mock_task_mgr.delete_task.return_value = {}
         mock_task_mgr_cls.return_value = mock_task_mgr
 
+        mock_subtask_mgr = AsyncMock()
+        # id=55: роутер делает crm_subtask_id=55 → crm_synced=True в ответе по умолчанию
+        mock_subtask_mgr.create_subtask.return_value = {"id": 55, "response": {"status": "success"}}
+        mock_subtask_mgr.update_subtask.return_value = {"status": "success"}
+        mock_subtask_mgr.delete_subtask.return_value = {"status": "success"}
+        mock_subtask_mgr_cls.return_value = mock_subtask_mgr
+
         yield {
             "crm": mock_crm_instance,
             "selector": mock_selector,
             "task_mgr": mock_task_mgr,
+            "subtask_mgr": mock_subtask_mgr,
         }
 
 
@@ -104,6 +113,47 @@ def mock_smtp():
         side_effect=_fake_send,
     ):
         yield captured
+
+
+@pytest.fixture
+def mock_magic():
+    """Патчит magic.from_buffer для имитации MIME-детектирования по magic bytes.
+
+    Логика определения типа по первым байтам (без зависимости от libmagic):
+      b'%PDF...'  → "application/pdf"
+      b'\\x89PNG'  → "image/png"
+      b'PK...'    → docx/xlsx (ZIP-based OpenXML)
+      иначе       → "application/octet-stream"  (неизвестный формат)
+
+    Это позволяет тестам проверять MIME-валидацию без установки libmagic в CI.
+    """
+    def _detect(content, mime=True):
+        if content[:4] == b'%PDF':
+            return "application/pdf"
+        if content[:4] == b'\x89PNG':
+            return "image/png"
+        if content[:2] == b'PK':
+            # docx и xlsx — ZIP-архивы; magic возвращает MIME openxmlformats
+            return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        return "application/octet-stream"  # неизвестная сигнатура
+
+    with patch("src.utils.file_utils.magic.from_buffer", side_effect=_detect):
+        yield
+
+
+@pytest.fixture
+def upload_root(tmp_path):
+    """Временная директория uploads/ для изоляции файловых тестов от диска.
+
+    Патчит UPLOAD_ROOT в обоих файловых роутерах (task_files, subtask_files).
+    Путь содержит 'uploads' в Path.parts — это обязательно для save_file(),
+    которая вычисляет rel-путь через поиск 'uploads' в дереве директорий.
+    """
+    root = tmp_path / "uploads"
+    root.mkdir()
+    with patch("src.routers.task_files.UPLOAD_ROOT", root), \
+         patch("src.routers.subtask_files.UPLOAD_ROOT", root):
+        yield root
 
 
 async def register_user(

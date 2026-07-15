@@ -2,23 +2,45 @@
 
 ## Screenshots
 
-### Protected task board page
+### Task board page
 
-![Task Board](src/screenshots/task_board.png)
+![Task Board](src/screenshots/task-board_1.png)
+
+### Task page
+
+![Task page](src/screenshots/task-detail.png)
 
 ### List of tasks in CRM
 
-![List of tasks in CRM](src/screenshots/crm_list_of_tasks.png)
+![List of tasks in CRM](src/screenshots/crm_task.png)
 
-### Change task status in web application
+### Attaching files to a task in the web application
 
-![Change task status](src/screenshots/change_task_status.png)
+![Attaching files to a task in the web application](src/screenshots/task-detail_with_files.png)
 
-![Task status has changed in web application](src/screenshots/task_status_has_changed_in_web_application.png)
+#### The files have been successfully attached to the task in the CRM
 
-### Task status has changed in CRM
+![The files have been successfully attached to the task in the CRM](src/screenshots/crm_task_with_files.png)
 
-![Task status has changed in CRM](src/screenshots/task_status_has_changed_in_CRM.png)
+### Board of subtasks linked to a parent task
+
+![Board of subtasks linked to a parent task](src/screenshots/subtask-board.png)
+
+### List of subtasks in CRM
+
+![List of subtasks in CRM](src/screenshots/crm_subtask.png)
+
+### Subtask page
+
+![Subtask page](src/screenshots/subtask-detail_with_files.png)
+
+#### The files have been successfully attached to the subtask in the CRM
+
+![The files have been successfully attached to the subtask in the CRM](src/screenshots/crm_subtask_with_files.png)
+
+### Task status has changed in the web application
+
+![Task status has changed in the web application](src/screenshots/task_completed.png)
 
 ### Protected user profile page
 
@@ -41,6 +63,18 @@
 ### Users entity in CRM
 
 ![Users entity in CRM](src/screenshots/Users_entity_in_CRM.png)
+
+### Swagger UI
+
+![](src/screenshots/swagger_1.png)
+
+![](src/screenshots/swagger_2.png)
+
+![](src/screenshots/swagger_3.png)
+
+![](src/screenshots/swagger_4.png)
+
+![](src/screenshots/swagger_5.png)
 
 ## Technological Stack
 
@@ -68,7 +102,10 @@
 - **FastAPI Users**: 15.0.2
 
 ### ASGI web server
-- **uvicorn**: 0.35.0
+- **uvicorn**: 0.35.0 (с `websockets`)
+
+### File uploads
+- **python-magic-bin**: 0.4.14 — определение MIME-типа по сигнатуре байтов (Windows-сборка libmagic; на Linux/macOS — `python-magic` + системный `libmagic1`)
 
 ### Database
 - **PostgreSQL**: 18.0
@@ -125,9 +162,9 @@ sequenceDiagram
         S->>D: SELECT registration_pending WHERE email=?
         Note right of S: expires_at прошёл → 400 CODE_EXPIRED<br/>attempts >= 3 → 400 TOO_MANY_ATTEMPTS<br/>bcrypt.verify fail → 400 INVALID_CODE
         S->>D: DELETE registration_pending
-        Note right of S: jwt.encode(sub=email, purpose=registration,<br/>exp=now+15мин, secret=REG_TOKEN_SECRET)
+        Note right of S: jwt.encode(sub=email, purpose=registration,<br/>exp=now+20мин, secret=REG_TOKEN_SECRET)
         S-->>C: 200 OK
-        Note left of C: Set-Cookie: reg_token=eyJ...<br/>HttpOnly, SameSite=Strict, Max-Age=900
+        Note left of C: Set-Cookie: reg_token=eyJ...<br/>HttpOnly, SameSite=Strict, Max-Age=1200
     end
 
     rect rgb(209, 250, 229)
@@ -249,13 +286,40 @@ sequenceDiagram
 
 ### Задачи (требуют действующий `access_token`)
 
-> **Shared board:** все аутентифицированные пользователи видят один общий список и могут редактировать или удалять любую задачу. Инициатор каждого изменения передаётся остальным через WebSocket (`sender: "user@example.com"`).
+> **Shared board:** все аутентифицированные пользователи видят один общий список и могут создавать, редактировать и удалять любую задачу. Инициатор каждого изменения передаётся остальным через WebSocket (`sender: "user@example.com"`).
 
 - `GET /tasks/` — список всех задач. Параметры: `skip` (≥ 0, по умолчанию 0), `limit` (1–100, по умолчанию 5). Общее число задач — в заголовке `X-Total-Count`.
 - `GET /tasks/search?title=...` — поиск по части названия (регистронезависимый ILIKE с экранированием спецсимволов). Поддерживает те же параметры пагинации.
-- `POST /create-task/` — создать задачу. `409 Conflict` при дублировании названия.
+- `GET /tasks/{task_id}` — получить задачу по ID; включает поле `subtask_count`. `404` если задача не найдена.
+- `POST /create-task/` — создать задачу. `409 Conflict` при дублировании названия у того же владельца.
 - `PATCH /tasks/{task_id}` — частичное обновление задачи (только переданные поля). `409 Conflict` при переименовании в существующее название.
-- `DELETE /delete-task/{task_id}` — удалить задачу.
+- `DELETE /delete-task/{task_id}` — удалить задачу; каскадно удаляет все её подзадачи.
+
+### Подзадачи (требуют действующий `access_token`)
+
+> Все аутентифицированные пользователи могут создавать, редактировать и удалять подзадачи любой задачи.
+
+- `POST /create-subtask/` — создать подзадачу. Тело: `{ task_id, title, description }`. `404` если родительская задача не найдена. `409 Conflict` при дублировании названия в рамках той же задачи.
+- `GET /subtasks/` — список подзадач задачи. Параметры: `task_id` (обязательный), `skip` (≥ 0), `limit` (1–100, по умолчанию 5). Общее число — в заголовке `X-Total-Count`.
+- `GET /subtasks/{subtask_id}` — получить подзадачу по ID. `404` если не найдена.
+- `PATCH /subtasks/{subtask_id}` — частичное обновление подзадачи. `409 Conflict` при дублировании названия.
+- `DELETE /delete-subtask/{subtask_id}` — удалить подзадачу.
+
+### Файлы задач (требуют действующий `access_token`)
+
+Файлы хранятся на диске в `src/static/uploads/tasks/{task_id}/...`; в БД — только относительные пути (`specification_path`, `other_file_paths`). Раздача — не `StaticFiles`-mount, а отдельный маршрут `GET /uploads/{path}` с `Depends(current_user)`: файлы недоступны без авторизации. Допустимые форматы: `.pdf`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.jpg`, `.jpeg`, `.png`, `.txt` (расширение и MIME-сигнатура по magic bytes проверяются отдельно). Лимит размера — 100 МБ на файл. Загрузка/удаление синхронизируется с CRM best-effort и рассылает WebSocket-событие `task_files_updated`.
+
+- `POST /tasks/{task_id}/specification` — загрузить (или заменить) файл технического задания. `multipart/form-data`, поле `file`. `404` если задача не найдена, `413` при превышении размера, `422` при недопустимом расширении/MIME.
+- `DELETE /tasks/{task_id}/specification` — удалить файл ТЗ. `404` если файл не загружен.
+- `POST /tasks/{task_id}/files` — добавить файлы в «Иные документы» (до 10 файлов суммарно на задачу). `422` при превышении лимита.
+- `DELETE /tasks/{task_id}/files/{filename}` — удалить один файл из «Иных документов» по имени. `404` если файл не найден.
+
+### Файлы подзадач (требуют действующий `access_token`)
+
+Аналогичные маршруты для подзадач, файлы — в `src/static/uploads/subtasks/{subtask_id}/...`, событие — `subtask_files_updated`:
+
+- `POST /subtasks/{subtask_id}/specification`, `DELETE /subtasks/{subtask_id}/specification`
+- `POST /subtasks/{subtask_id}/files`, `DELETE /subtasks/{subtask_id}/files/{filename}`
 
 ### Управление пользователями (требуют роль `admin`)
 
@@ -267,18 +331,29 @@ sequenceDiagram
 
 ### WebSocket
 
-`ws://<host>/ws/tasks/{user_id}` — подключение требует куку `access_token`. Без неё сервер закрывает соединение с кодом `1008 Policy Violation`.
+`ws://<host>/ws/tasks/{client_id}` — подключение требует куку `access_token`. Без неё сервер закрывает соединение с кодом `1008 Policy Violation`. Один и тот же маршрут используют `task-board.html` (полный клиент с чатом), `subtask-board.html` и страницы деталей `task-detail.html`/`subtask-detail.html` (реакция на события своей задачи/подзадачи — без чата).
+
+Реестр соединений (`src/realtime/manager.py`) хранит **набор** WebSocket-соединений на каждого пользователя (`dict[user_id, set[WebSocket]]`), а не одно — несколько одновременно открытых вкладок/устройств получают события независимо, новое подключение не вытесняет предыдущие.
 
 Типы событий:
 
-| `type` | Когда отправляется |
-|---|---|
-| `chat` | Текстовое сообщение от пользователя |
-| `task_created` | Другой пользователь создал задачу |
-| `task_updated` | Другой пользователь обновил задачу |
-| `task_deleted` | Другой пользователь удалил задачу |
+| `type` | Получатели | Формат сообщения в чате |
+|---|---|---|
+| `chat` | Все кроме отправителя (все его вкладки) | `sender: text` |
+| `task_created` | Все кроме инициатора | `email: Создана задача: title` |
+| `task_updated` | Все кроме инициатора | `email: Обновлена задача: title`; `task-detail.html` этой задачи перечитывает её через `loadTask()` |
+| `task_deleted` | Все кроме инициатора | `email: Удалена задача: title`; `task-detail.html`/`subtask-board.html` этой задачи показывают алерт и переходят на `/task-board` — иначе следующее действие пользователя упёрлось бы в `404 Task not found` |
+| `task_files_updated` | **Все, включая инициатора** | `action: "uploaded"` \| `"deleted"` различает загрузку/удаление; инициатор (англ.): `Files added/removed to/from task "X"`; остальные: `email: Добавлены/Удалены файлы у задачи «X»`; `task-detail.html` этой задачи перечитывает её через `loadTask()` (кроме самого инициатора — тот уже увидел результат из ответа `fetch`) |
+| `subtask_created` | Все, включая инициатора | инициатор: `Subtask for task 'X' created: 'Y'`; остальные: `email: Создана подзадача «Y» [X]`; `subtask-board.html` этой задачи перечитывает список (кроме инициатора) |
+| `subtask_updated` | Все, включая инициатора | инициатор: `Subtask for task 'X' updated: 'Y'`; остальные: `email: Обновлена подзадача «Y» [X]`; `subtask-board.html`/`subtask-detail.html` перечитывают данные (кроме инициатора) |
+| `subtask_deleted` | Все, включая инициатора | инициатор: `Subtask for task 'X' deleted: 'Y'`; остальные: `email: Удалена подзадача «Y» [X]`; `subtask-board.html` перечитывает список, `subtask-detail.html` этой подзадачи — алерт и переход на `/subtask-board/{task_id}` (кроме инициатора — его страница уже уходит туда через собственный `DELETE`-ответ) |
+| `subtask_files_updated` | **Все, включая инициатора** | `action: "uploaded"` \| `"deleted"`; инициатор (англ.): `Files added/removed to/from subtask "Y" [X]`; остальные: `email: Добавлены/Удалены файлы у подзадачи «Y» [X]`; `subtask-detail.html` этой подзадачи перечитывает её через `loadSubtask()` (кроме инициатора) |
 
-Инициатор действия не получает серверное эхо. При разрыве соединения клиент переподключается через 3 секунды. История чата сохраняется в `localStorage`.
+Событий с «Все кроме инициатора» (`task_*`) и «Все, включая инициатора» (`subtask_*`, `*_files_updated`) — намеренно два разных паттерна, не оплошность: `task_*` рассылаются через `exclude_user_id` — инициатор получает подтверждение из HTTP-ответа, а не из WS; `subtask_*`/`*_files_updated` уходят всем без исключений, и клиент сам решает формат по `String(data.actor_id) === userId` (или пропускает повторную обработку — например, `task-detail.html` не перечитывает задачу по своему же `task_files_updated`, т.к. уже отрисовал результат из ответа `fetch`). `exclude_user_id`, когда используется, исключает все открытые вкладки инициатора разом, а не только ту, с которой пришёл запрос.
+
+`task_deleted`/`subtask_deleted` дополнительно решают проблему гонки «страница открыта — сущность удалена другим пользователем»: без авто-редиректа пользователь видел бы устаревшую страницу и получал непонятный `404 Task/Subtask not found` при следующем действии (сохранении, загрузке файла и т.д.).
+
+При разрыве соединения клиент переподключается через 3 секунды. История чата (только на `task-board.html`) сохраняется в `localStorage`.
 
 ---
 
@@ -305,12 +380,26 @@ person
 └── is_verified     BOOLEAN
 
 task
-├── id          INTEGER PK
-├── title       VARCHAR(100) UNIQUE
-├── description VARCHAR(2000)
-├── completed   BOOLEAN
-├── owner_id    INTEGER FK → person.id
-└── crm_task_id INTEGER NULL            (NULL = не синхронизировано с CRM)
+├── id                 INTEGER PK
+├── title              VARCHAR(100)
+├── description        VARCHAR(2000)
+├── completed          BOOLEAN
+├── owner_id           INTEGER FK → person.id
+├── crm_task_id        INTEGER NULL      (NULL = не синхронизировано с CRM)
+├── specification_path VARCHAR NULL      (rel-путь к файлу ТЗ в uploads/)
+├── other_file_paths   JSONB NULL        (список rel-путей «иных документов», до 10)
+└── UNIQUE(title, owner_id)              (название уникально в рамках владельца)
+
+subtask
+├── id                 INTEGER PK
+├── title              VARCHAR(100)
+├── description        VARCHAR(2000)
+├── completed          BOOLEAN
+├── task_id            INTEGER FK → task.id (ondelete CASCADE)
+├── crm_subtask_id     INTEGER NULL      (NULL = не синхронизировано с CRM)
+├── specification_path VARCHAR NULL      (rel-путь к файлу ТЗ в uploads/)
+├── other_file_paths   JSONB NULL        (список rel-путей «иных документов», до 10)
+└── UNIQUE(title, task_id)               (название уникально в рамках задачи)
 
 registration_pending
 ├── id          INTEGER PK
@@ -332,6 +421,11 @@ registration_pending
 | `0005` | Создание таблицы `registration_pending` |
 | `0006` | Добавление `patronymic` (nullable) в `person` |
 | `0007` | `TIMESTAMP WITH TIME ZONE` для `registered_at`, `expires_at`, `created_at`; `person.username` → `VARCHAR(255)` |
+| `0008` | Создание таблицы `subtask`; FK → `task.id` с `ondelete CASCADE`; `UNIQUE(title, task_id)` |
+| `0009` | Замена глобального `UNIQUE(task.title)` на `UNIQUE(task.title, task.owner_id)` |
+| `0010` | Добавление `specification_path` (VARCHAR) и `other_file_paths` (Text) в `task` и `subtask` |
+| `0011` | Конвертация `other_file_paths` из `Text` в `JSONB` (`ALTER COLUMN ... TYPE JSONB USING ...::jsonb`) |
+| `0012` | Добавление недостающего `uq_person_email` (обнаружено `alembic check` — 0002 задумывался, но constraint не был применён); объединение `registration_pending.email` в один unique index вместо `constraint + дублирующий обычный индекс` |
 
 ---
 
@@ -360,13 +454,19 @@ Task Manager интегрирован с CRM-системой [«Руковод�
 | Создание задачи | `action=insert`, entity_id=29 | Задача сохраняется в БД, `crm_task_id=NULL`, предупреждение в UI |
 | Обновление задачи | `action=update`, `update_by_field={id: crm_task_id}` | Задача обновляется в БД, `crm_synced=false` в ответе |
 | Удаление задачи | `action=delete`, `delete_by_field={id: crm_task_id}` | Задача удаляется из БД, `crm_synced=false` в ответе |
+| Создание подзадачи | `action=insert`, entity_id=30 (только если `task.crm_task_id` не NULL) | Подзадача сохраняется в БД, `crm_subtask_id=NULL`, `crm_synced=false` |
+| Обновление подзадачи | `action=update`, `update_by_field={id: crm_subtask_id}` (только если `crm_subtask_id` не NULL) | Подзадача обновляется в БД, `crm_synced=false` в ответе |
+| Удаление подзадачи | `action=delete`, `delete_by_field={id: crm_subtask_id}` (только если `crm_subtask_id` не NULL) | Подзадача удаляется из БД, `crm_synced=false` в ответе |
 
 ### Сущности CRM
 
 | Сущность | entity_id | Поля |
 |---|---|---|
 | Пользователи | 1 | `group_id`, `firstname`, `lastname`, `username` (= email до `@`), `email`, `password` |
-| Задачи | 29 | `field_311` — название, `field_312` — описание, `field_313` — статус (чекбокс: `"true"` / `"false"`) |
+| Задачи | 29 | `field_317` — название, `field_318` — описание, `field_319` — статус (чекбокс: `"true"` / `"false"`), `field_320` — ТЗ (файл), `field_321` — иные документы (файлы) |
+| Подзадачи | 30 | `field_322` — название, `field_323` — описание, `field_324` — статус (чекбокс: `"true"` / `"false"`), `field_325` — ТЗ (файл), `field_326` — иные документы (файлы) |
+
+Файловые поля (`field_320`/`field_321`, `field_325`/`field_326`) принимают массив объектов `{"name": "...", "content": "<base64>"}`. Полная замена содержимого поля: `other_file_abs_paths=[]` очищает поле, `[p1, p2]` заменяет весь список — передать только новый файл нельзя, CRM потеряет остальные.
 
 ### Конфигурация
 
@@ -386,10 +486,11 @@ CRM_USER_GROUP_ID=6   # ID группы «Сотрудник» в CRM
 
 ```
 src/crm/
-├── config.py        # чтение CRM_* переменных окружения через os.getenv()
-├── client.py        # базовый HTTP-клиент (httpx async), метод _call()
-├── user_service.py  # поиск пользователя по email (используется при логине)
-└── task_service.py  # CRUD-операции с задачами (entity_id=29)
+├── config.py           # чтение CRM_* переменных окружения через os.getenv()
+├── client.py           # базовый HTTP-клиент (httpx async), метод _call()
+├── user_service.py     # поиск пользователя по email (используется при логине)
+├── task_service.py     # CRUD-операции с задачами (entity_id=29)
+└── subtask_service.py  # CRUD-операции с подзадачами (entity_id=30)
 ```
 
 ### HTTP-клиент
@@ -429,9 +530,9 @@ src/crm/
     "entity_id": 29,
     "items": [
         {
-            "field_311": "Название задачи",
-            "field_312": "Описание задачи",
-            "field_313": "false"
+            "field_317": "Название задачи",
+            "field_318": "Описание задачи",
+            "field_319": "false"
         }
     ]
 }
@@ -501,8 +602,8 @@ src/crm/
     "action": "update",
     "entity_id": 29,
     "data": {
-        "field_311": "Новое название задачи",
-        "field_313": "true"
+        "field_317": "Новое название задачи",
+        "field_319": "true"
     },
     "update_by_field": {"id": 42}
 }
@@ -629,7 +730,7 @@ CREATE DATABASE clients;
 alembic upgrade head
 ```
 
-Миграции создают таблицы `role`, `person`, `task`, `registration_pending`.
+Миграции создают таблицы `role`, `person`, `task`, `subtask`, `registration_pending`.
 При первом запуске приложения lifespan заполняет `role` базовыми ролями (`user`, `admin`).
 
 Добавить новую миграцию после изменения моделей:
@@ -774,8 +875,10 @@ docker exec src-web-1 python -m pytest tests/ -v
 |---|---|---|
 | `setup_and_reset` | function, autouse | `drop_all + create_all` + безусловная вставка ролей. Teardown отсутствует — следующий тест начнёт с drop_all |
 | `client` | function | `httpx.AsyncClient` с `ASGITransport` — HTTP-запросы к приложению без TCP |
-| `mock_crm` | function, autouse | Патч `CRMClient`, `CRMUserSelector`, `TaskManager` через `unittest.mock.patch` |
+| `mock_crm` | function, autouse | Патч `CRMClient`, `CRMUserSelector`, `TaskManager`, `SubtaskManager` через `unittest.mock.patch` |
 | `mock_smtp` | function, autouse | Перехват `send_confirmation_code`; код сохраняется в `dict[email, code]` |
+| `mock_magic` | function | Патч `magic.from_buffer` — определение MIME по сигнатурам без установки libmagic в CI |
+| `upload_root` | function | Временная директория (`tmp_path/uploads`) для `UPLOAD_ROOT` в `task_files.py`/`subtask_files.py` — файловые тесты не трогают реальный диск |
 | `registered_user` | function | Полный трёхшаговый flow регистрации через HTTP; возвращает `{"email": ..., "password": ...}` |
 | `register_user` | — (async helper) | Вспомогательная функция: прогоняет три шага регистрации; используется в тестах напрямую |
 | `promote_to_admin` | — (async helper) | Повышает пользователя до `role_id=2` в БД. Требует повторного логина для обновления JWT |
@@ -789,7 +892,12 @@ docker exec src-web-1 python -m pytest tests/ -v
 |---|---|
 | `test_auth.py` | Логин (успех / неверный пароль / несуществующий пользователь), logout (JS-вариант / без авторизации), refresh-токен (успех / без куки) |
 | `test_registration_flow.py` | request-code (успех / нормализация email / невалидный email / дубль / rate-limit), verify-code (успех / нет pending / неверный код / счётчик попыток / лимит исчерпан / невалидный формат), complete (успех / без токена / слабый пароль / пустой firstname), полный flow + немедленный логин, patronymic (с отчеством / без / хранение NULL) |
-| `test_tasks.py` | Создание (успех / дубль title / без авторизации / пустой title), чтение (пустой список / пагинация / вторая страница / невалидный limit / невалидный skip), поиск (найдено / не найдено / без авторизации), обновление (успех / частичное / дубль title / 404 / без авторизации), удаление (успех / 404 / без авторизации), совместный доступ |
+| `test_tasks.py` | Создание (успех / дубль title / без авторизации / пустой title), чтение (пустой список / пагинация / вторая страница / невалидный limit / невалидный skip), поиск (найдено / не найдено / без авторизации), обновление (успех / частичное / дубль title / 404 / без авторизации), удаление (успех / 404 / без авторизации), совместный доступ, конкурентные `delete_task` + `create_subtask` (не должны давать 500 или вводящий в заблуждение 409) |
 | `test_users.py` | Список (admin — успех / user — 403 / без авторизации — 401), удаление (успех / 403 / 404), редактирование (успех / 403) |
 | `test_crm.py` | CRMClient: register_user (успех / ConnectError / таймаут / CRM API error / невалидный JSON); find_user_by_email (найден / не найден / ConnectError); TaskManager: create_task / update_task / delete_task (успех и ошибки); _bool_to_crm |
 | `test_pages.py` | HTML-маршруты: login / register / task-board (аутентифицированный и нет) |
+| `test_subtasks.py` | Создание (успех / 401 / 404 / пустой title / whitespace нормализация / дубль в задаче / одинаковый title в разных задачах / без описания / ошибка CRM / задача без crm_task_id / задача удалена «на лету» между проверкой и commit → 404, не вводящий в заблуждение 409), чтение списка (пустой / 401 / пагинация / вторая страница / невалидный limit/skip / несуществующий task_id), чтение по ID (успех / 404 / 401), обновление (успех / частичное / 404 / 401 / дубль title / ошибка CRM / нет crm_subtask_id), удаление (успех / 404 / 401 / физическое удаление / ошибка CRM / cascade при удалении задачи) |
+| `test_crm_subtask.py` | SubtaskManager: create_subtask (dict-ответ / list-ответ / completed=True / ConnectError / таймаут / CRM API error / невалидный JSON), update_subtask (успех / нет полей / ConnectError / CRM API error), delete_subtask (успех / ConnectError / CRM API error), _bool_to_crm |
+| `test_task_files.py` | Загрузка/замена ТЗ (успех / 413 / 422 расширение / 422 MIME / 404 / 401), удаление ТЗ (успех / 404), иные документы (загрузка / превышение лимита 10 / удаление одного / удаление последнего / 404), CRM-синхронизация файлов, каскадная очистка при удалении задачи, WS-рассылка `task_files_updated`, конкурентная загрузка (lost update на `other_file_paths`) |
+| `test_subtask_files.py` | Тот же набор сценариев для подзадач; событие `subtask_files_updated` |
+| `test_realtime.py` | `ConnectionManager`: несколько соединений на пользователя, регистрация/снятие с регистрации, `broadcast` с `exclude_user_id`, удаление мёртвых соединений; `broadcast_task_event`: форма payload, DI через `Broadcaster` |

@@ -1,14 +1,16 @@
 import os
 from typing import Optional
 
-from fastapi import APIRouter, Cookie, Depends, Request
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.auth_config import current_user
 from src.auth.models import Role, User
 from src.database import get_async_session
+from src.task_logic.models import Subtask, Task
 
 router = APIRouter(tags=["Pages"])
 
@@ -48,6 +50,67 @@ async def task_board(request: Request, user: User = Depends(current_user)):
     # current_page передаётся в _navbar.html для выделения активной ссылки меню.
     return templates.TemplateResponse(
         request, "task-board.html", {"user": user.id, "current_page": "tasks"}
+    )
+
+
+@router.get("/subtask-board/{task_id}", response_class=HTMLResponse)
+async def subtask_board(
+    request: Request,
+    task_id: int,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return templates.TemplateResponse(
+        request, "subtask-board.html", {
+            "user": user.id,
+            "task_id": task_id,
+            "task_title": task.title,
+            "current_page": "tasks",
+        }
+    )
+
+
+@router.get("/task/{task_id}", response_class=HTMLResponse)
+async def task_detail(
+    request: Request,
+    task_id: int,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return templates.TemplateResponse(
+        request, "task-detail.html", {
+            "user": user.id,
+            "task_id": task_id,
+            "current_page": "tasks",
+        }
+    )
+
+
+@router.get("/subtask/{subtask_id}", response_class=HTMLResponse)
+async def subtask_detail(
+    request: Request,
+    subtask_id: int,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    subtask = (
+        await db.execute(select(Subtask).where(Subtask.id == subtask_id))
+    ).scalar_one_or_none()
+    if subtask is None:
+        raise HTTPException(status_code=404, detail="Subtask not found")
+    return templates.TemplateResponse(
+        request, "subtask-detail.html", {
+            "user": user.id,
+            "subtask_id": subtask_id,
+            "task_id": subtask.task_id,
+            "current_page": "tasks",
+        }
     )
 
 

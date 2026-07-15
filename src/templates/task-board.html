@@ -196,6 +196,35 @@
             font-size: 12px;
         }
 
+        a.btn-subtasks {
+            display: inline-block;
+            padding: 5px 12px;
+            font-size: 12px;
+            font-family: inherit;
+            font-weight: 600;
+            background-color: #546e7a;
+            color: white;
+            border-radius: 2px;
+            text-decoration: none;
+            letter-spacing: 0.3px;
+            transition: background-color 0.2s;
+        }
+        a.btn-subtasks:hover { background-color: #37474f; color: white; }
+        a.btn-open { display: inline-block; padding: 5px 12px; font-size: 12px; font-family: inherit; font-weight: 600; background-color: #003f6b; color: white; border-radius: 2px; text-decoration: none; letter-spacing: 0.3px; transition: background-color .2s; }
+        a.btn-open:hover { background-color: #002b4e; color: white; }
+
+        .subtask-count {
+            display: inline-block;
+            background-color: #37474f;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 2px;
+            font-size: 11px;
+            font-weight: 700;
+            white-space: nowrap;
+            letter-spacing: 0.3px;
+        }
+
         .crm-badge {
             display: inline-block;
             background-color: #b71c1c;
@@ -432,6 +461,6 @@
         </div>
     </div>
 
-    <script src="/static/js/task-board.js" defer></script>
+    <script src="/static/js/task-board.js?v=2" defer></script>
 </body>
 </html>

@@ -1,4 +1,6 @@
+import base64
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -60,9 +62,9 @@ class CRMClient:
     Параметр "items" — массив (list) словарей. Каждый словарь — одна
     создаваемая запись. Все поля сущности передаются внутри элемента массива.
 
-    Ключи — str:  "field_311", "field_312", "group_id", "email" ...
+    Ключи — str:  "field_317", "field_318", "group_id", "email" ...
     Значения — Any: "false" (str), 6 (int), "Иван" (str) ...
-    {"field_311": "Название", "field_313": "false", "group_id": 6}
+    {"field_317": "Название", "field_319": "false", "group_id": 6}
 
     Для сущности entity_id=29 (Задачи) поля именуются как "field_<ID>",
     где ID — числовой идентификатор поля в CRM:
@@ -73,14 +75,14 @@ class CRMClient:
             "entity_id": 29,
             "items": [
                 {
-                    "field_311": "Название задачи",
-                    "field_312": "Описание задачи",
-                    "field_313": "false"
+                    "field_317": "Название задачи",
+                    "field_318": "Описание задачи",
+                    "field_319": "false"
                 }
             ]
         }
 
-    Поле field_313 (статус) — чекбокс; значения строковые: "true" / "false".
+    Поле field_319 (статус) — чекбокс; значения строковые: "true" / "false".
     items может содержать несколько словарей (batch-создание), но в данном
     приложении всегда передаётся ровно один элемент.
 
@@ -144,8 +146,8 @@ class CRMClient:
             "action": "update",
             "entity_id": 29,
             "data": {
-                "field_311": "Новое название задачи",
-                "field_313": "true"
+                "field_317": "Новое название задачи",
+                "field_319": "true"
             },
             "update_by_field": {"id": 42}
         }
@@ -183,6 +185,22 @@ class CRMClient:
     _call() проверяет все перечисленные варианты и поднимает Exception,
     если ни один признак успеха не найден.
     """
+
+    @staticmethod
+    def _bool_to_crm(value: bool) -> str:
+        """Преобразует bool в строковый формат поля-чекбокса CRM («true»/«false»)."""
+        return "true" if value else "false"
+
+    @staticmethod
+    def _file_to_crm(abs_path: Path) -> dict:
+        """Читает файл с диска и возвращает CRM-совместимый словарь.
+
+        CRM ожидает файлы в виде {'name': 'filename.pdf', 'content': '<base64>'}.
+        """
+        return {
+            "name":    abs_path.name,
+            "content": base64.b64encode(abs_path.read_bytes()).decode(),
+        }
 
     # Разделяемый клиент на уровне класса: новый TCP-пул и TLS-хендшейк при каждом
     # запросе (как в async with AsyncClient()) обходятся в ~10–20 мс накладных расходов.
@@ -259,8 +277,12 @@ class CRMClient:
                 payload[key] = value
 
         # Не логируем api_key и password во избежание утечки секретов
+        # DEBUG, а не INFO: для файловых операций (specification_abs_path,
+        # other_file_abs_paths) в data попадает base64-контент самого файла —
+        # при MAX_FILE_SIZE=100 МБ это до ~133 МБ на одну строку лога.
+        # Короткие сводки в task_service.py/subtask_service.py остаются на INFO.
         safe_payload = {k: v for k, v in payload.items() if k not in ("key", "password")}
-        logger.info("CRM → %s | %s", full_url, safe_payload)
+        logger.debug("CRM → %s | %s", full_url, safe_payload)
 
         client = self._get_client()
         try:
@@ -273,7 +295,7 @@ class CRMClient:
         except httpx.TimeoutException:
             raise Exception("CRM request timed out")
 
-        logger.info("CRM ← %s", response.text)
+        logger.debug("CRM ← %s", response.text)
         try:
             result = response.json()
         except Exception:

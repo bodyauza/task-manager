@@ -3,6 +3,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.auth_config import require_permission
@@ -80,9 +81,15 @@ async def update_user(
         setattr(user, field, value)
 
     # commit() запускает unit of work: SQLAlchemy формирует UPDATE person SET ... WHERE id=$1
-    # только для изменённых столбцов и фиксирует транзакцию. При нарушении ограничений
-    # (например, уникальный username уже занят) — IntegrityError, транзакция откатывается.
-    await db.commit()
+    # только для изменённых столбцов. username здесь не UNIQUE (см. auth/models.py) — IntegrityError
+    # маловероятен, но возможен (например, role_id указывает на роль, удалённую конкурентным
+    # запросом ровно между валидацией выше и этим commit — FK-нарушение). try/except не даёт
+    # такому конфликту улететь наверх голым 500.
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="Update conflicts with an existing user")
 
     # После commit() SQLAlchemy переводит все атрибуты объекта в состояние expired.
     # В async-контексте обращение к expired-атрибуту вызвало бы MissingGreenlet —

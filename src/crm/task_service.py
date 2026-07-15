@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from src.crm.client import CRMClient
@@ -10,20 +11,17 @@ class TaskManager(CRMClient):
     """CRUD-операции с сущностью «Задачи» (entity_id=29).
 
     Поля:
-        field_311 — Название    (строка, уникальное)
-        field_312 — Описание    (текст)
-        field_313 — Статус      (чекбокс: "true" / "false")
+        field_317 — Название    (строка, уникальное)
+        field_318 — Описание    (текст)
+        field_319 — Статус      (чекбокс: "true" / "false")
     """
 
-    ENTITY_ID   = 29
-    FIELD_TITLE = 311
-    FIELD_DESCR = 312
-    FIELD_DONE  = 313
-
-    @staticmethod
-    def _bool_to_crm(value: bool) -> str:
-        """Преобразует bool в строковый формат поля-чекбокса CRM."""
-        return "true" if value else "false"
+    ENTITY_ID   = 29    # числовой ID сущности «Задачи» в CRM Руководитель
+    FIELD_TITLE = 317   # ID поля «Название»
+    FIELD_DESCR = 318   # ID поля «Описание»
+    FIELD_DONE  = 319   # ID поля «Статус» (чекбокс: "true" / "false")
+    FIELD_SPEC  = 320   # ID поля «Техническое задание» (file upload, одиночный файл)
+    FIELD_OTHER = 321   # ID поля «Иные документы» (вложения, множественные файлы)
 
     async def create_task(
         self,
@@ -62,8 +60,16 @@ class TaskManager(CRMClient):
         title: Optional[str] = None,
         description: Optional[str] = None,
         completed: Optional[bool] = None,
+        specification_abs_path: Optional[Path] = None,
+        clear_specification: bool = False,
+        other_file_abs_paths: Optional[list[Path]] = None,
     ) -> Dict[str, Any]:
-        """Обновляет задачу по CRM-ID; передаёт только заполненные поля."""
+        """Обновляет задачу по CRM-ID; передаёт только заполненные поля.
+
+        clear_specification=True: field_320 = [] (CRM удаляет вложение ТЗ).
+        other_file_abs_paths=[]: field_321 = [] (CRM очищает поле иных документов).
+        other_file_abs_paths=[p1,p2]: field_321 = [file1, file2] (полная замена содержимого поля).
+        """
         data: Dict[str, Any] = {}
         if title is not None:
             data[f"field_{self.FIELD_TITLE}"] = title
@@ -71,6 +77,17 @@ class TaskManager(CRMClient):
             data[f"field_{self.FIELD_DESCR}"] = description
         if completed is not None:
             data[f"field_{self.FIELD_DONE}"] = self._bool_to_crm(completed)
+
+        if clear_specification:
+            # [] — CRM-формат для очистки файлового поля: запись обновляется без вложений.
+            data[f"field_{self.FIELD_SPEC}"] = []
+        elif specification_abs_path is not None:
+            # Одиночный файл ТЗ: CRM принимает список из одного элемента.
+            data[f"field_{self.FIELD_SPEC}"] = [self._file_to_crm(specification_abs_path)]
+
+        if other_file_abs_paths is not None:
+            # None → поле не трогать; [] → очистить; [p1,…] → заменить всё содержимое.
+            data[f"field_{self.FIELD_OTHER}"] = [self._file_to_crm(p) for p in other_file_abs_paths]
 
         if not data:
             return {"status": "skipped", "message": "No fields to update"}
@@ -80,7 +97,7 @@ class TaskManager(CRMClient):
             action="update",
             entity_id=self.ENTITY_ID,
             data=data,
-            update_by_field={"id": task_id},
+            update_by_field={"id": task_id},  # критерий обновления — CRM-ID задачи
         )
 
     async def delete_task(self, task_id: int) -> Dict[str, Any]:

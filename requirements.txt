@@ -48,3 +48,9 @@ aiosmtplib>=3.0.0
 
 # Alembic migrations
 alembic==1.14.0
+
+# Определение MIME-типа файла по сигнатуре байтов (magic bytes).
+# python-magic-bin — Windows-вариант: содержит скомпилированные DLL libmagic,
+# не требует системной установки. На Linux/macOS использовать python-magic==0.4.27
+# (требует системный пакет: apt install libmagic1 / brew install libmagic).
+python-magic-bin==0.4.14
