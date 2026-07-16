@@ -1,10 +1,31 @@
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Protocol
 
 from src.crm.client import CRMClient              # базовый клиент: _call(), _http, аутентификация
 
 logger = logging.getLogger(__name__)              # логгер этого модуля для INFO/ERROR записей
+
+
+class SubtaskCRMSync(Protocol):
+    """Абстракция CRM-синхронизации подзадач (см. TaskCRMSync в task_service.py — тот же DIP)."""
+
+    async def create_subtask(
+        self, parent_item_id: int, title: str, description: str, completed: bool = False,
+    ) -> Dict[str, Any]: ...
+
+    async def update_subtask(
+        self,
+        subtask_id: int,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        completed: Optional[bool] = None,
+        specification_abs_path: Optional[Path] = None,
+        clear_specification: bool = False,
+        other_file_abs_paths: Optional[list[Path]] = None,
+    ) -> Dict[str, Any]: ...
+
+    async def delete_subtask(self, subtask_id: int) -> Dict[str, Any]: ...
 
 
 class SubtaskManager(CRMClient):
@@ -105,3 +126,10 @@ class SubtaskManager(CRMClient):
             entity_id=self.ENTITY_ID,
             delete_by_field={"id": subtask_id}, # CRM удалит запись по CRM-ID подзадачи
         )
+
+
+def get_subtask_crm_sync() -> SubtaskCRMSync:
+    """FastAPI-зависимость: единственная точка, знающая, что SubtaskCRMSync
+    реализует именно SubtaskManager — роутеры/сервисы работают только с протоколом.
+    """
+    return SubtaskManager()

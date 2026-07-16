@@ -11,6 +11,7 @@ from src.auth.auth_config import (auth_backend, current_user,
                                   refresh_cookie_transport)
 from src.auth.manager import UserManager, get_user_manager
 from src.auth.user_schemas import is_valid_email_format, is_valid_password_format, PASSWORD_ERROR
+from src.crm.user_service import UserLookup, get_user_lookup
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ def _apply_transport_cookies(target_response: Response, transport_response: Resp
 async def login(
         credentials: OAuth2PasswordRequestForm = Depends(),
         user_manager: UserManager = Depends(get_user_manager),
+        user_lookup: UserLookup = Depends(get_user_lookup),
 ):
     # Предварительная валидация формата снижает нагрузку на БД при явно невалидных данных.
     if not is_valid_email_format(credentials.username):
@@ -55,11 +57,8 @@ async def login(
     # Проверка наличия записи в CRM при каждом входе: регистрация в CRM предшествует
     # INSERT в person, но в случае ручного добавления в БД или сбоя при регистрации
     # запись в CRM может отсутствовать — вход блокируется с кодом 403.
-    from src.crm.user_service import CRMUserSelector
-
     try:
-        selector = CRMUserSelector()
-        crm_user = await selector.find_user_by_email(user.email)
+        crm_user = await user_lookup.find_user_by_email(user.email)
     except Exception as exc:
         logger.error("CRM check failed for user %d (%s): %s", user.id, user.email, exc)
         raise HTTPException(

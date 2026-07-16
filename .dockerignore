@@ -1,0 +1,61 @@
+# Docker build-context exclusions.
+#
+# Расположение: корень репозитория, а не src/. src/docker-compose.yml собирает
+# образ с `context: ..` (см. build.context в этом файле) — Docker ищет
+# .dockerignore именно в корне контекста сборки, а не рядом с Dockerfile.
+# Файл src/.dockerignore, лежавший здесь раньше, не действовал вообще: при
+# context=.. Docker его не читает ни при одном сценарии сборки (ни как
+# "<context>/.dockerignore", ни как "<context>/<dockerfile>.dockerignore" —
+# для второго варианта имя должно быть src/Dockerfile.dockerignore, не
+# src/.dockerignore). Итог до этой правки: COPY . . в Dockerfile копировал
+# в образ .git/, .venv/, docs/ и, что важнее, файлы с секретами
+# (src/.dev.env, src/.tests.env) — ни один из них не был исключён.
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+env
+venv
+.venv
+
+# IDE / local tooling
+.idea
+.vscode
+.claude
+
+# VCS
+.git
+
+# Secrets — реальные имена файлов проекта (src/config.py грузит их по этим
+# именам через load_dotenv). Прежняя версия ловила только ".env"/".env.*" —
+# .dev.env и .tests.env под этот шаблон не попадают (имя начинается не с
+# ".env", а с ".dev"/".tests"), то есть оба фактически использующихся в
+# проекте секретных файла раньше НЕ исключались.
+.env
+.dev.env
+.tests.env
+.env.*
+
+# Локальная документация (см. .gitignore — тот же файл не должен ни
+# коммититься, ни попадать в образ; ~800 КБ, не нужен рантайму).
+docs
+
+# Тестовые артефакты — не нужны образу, генерируются локально/в CI заново.
+.pytest_cache
+.coverage
+htmlcov
+
+# Скриншоты для README — не используются приложением (не подключены ни одним
+# шаблоном/статикой), нужны только человеку, читающему README на GitHub.
+src/screenshots
+
+# Загруженные пользователями файлы — рантайм-данные, не артефакт сборки.
+# В docker-compose.yml они и так доступны контейнеру через volumes: ..:/app;
+# запекать их в образ на этапе COPY . . не нужно и потенциально утечка данных
+# при сборке образа на машине, где уже есть локальные загрузки.
+src/static/uploads

@@ -1,6 +1,17 @@
 """
 Поток инициализации тестового окружения (корневой conftest.py)
 ──────────────────────────────────────────────────────────────
+Почему этот файл лежит в корне репозитория, а не только в tests/: pytest
+автоматически подхватывает conftest.py на каждом уровне каталогов от корня
+запуска вниз до тестового файла (без импорта — это часть механизма discovery
+самого pytest, "rootdir"-конфигурация). Файл tests/conftest.py импортирует
+`from src.main import app`, поэтому к моменту, когда pytest доходит до
+tests/conftest.py, весь модуль src.main (а вместе с ним src.config) уже
+должен быть готов к импорту с правильными переменными окружения — сделать
+это позже, внутри tests/conftest.py, было бы поздно: Python кэширует модули
+в sys.modules при первом импорте, повторный импорт с другими os.environ
+ничего не изменит.
+
 pytest выполняет conftest.py ДО импорта любого тестового модуля.
 tests/conftest.py импортирует src.main → src.config → get_settings() кэшируется.
 Весь код ниже должен отработать раньше этой цепочки.
@@ -47,6 +58,11 @@ from dotenv import load_dotenv
 # asyncpg падает с ProactorEventLoop (умолчание Python 3.8+ на Windows):
 # asyncpg использует низкоуровневые сокетные операции, несовместимые с Proactor.
 # SelectorEventLoop поддерживает те же примитивы на всех ОС.
+# sys.platform == "win32": проверка нужна только потому, что WindowsSelectorEventLoopPolicy
+# существует исключительно в модуле asyncio на Windows — на Linux/macOS обращение к этому
+# атрибуту упало бы AttributeError. На этих ОС SelectorEventLoop и так используется по
+# умолчанию (Proactor — Windows-специфичный механизм ввода-вывода на базе IOCP), поэтому
+# для них никакого дополнительного действия не требуется.
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 

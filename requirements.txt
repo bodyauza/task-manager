@@ -53,4 +53,18 @@ alembic==1.14.0
 # python-magic-bin — Windows-вариант: содержит скомпилированные DLL libmagic,
 # не требует системной установки. На Linux/macOS использовать python-magic==0.4.27
 # (требует системный пакет: apt install libmagic1 / brew install libmagic).
-python-magic-bin==0.4.14
+#
+# Раньше здесь была безусловная строка "python-magic-bin==0.4.14" — pip пытался
+# установить её на ЛЮБОЙ платформе, включая Linux (см. src/Dockerfile, образ
+# python:3.13-slim). На PyPI у python-magic-bin нет ни одного дистрибутива для
+# Linux (пакет собирается только под Windows), поэтому `pip install -r
+# requirements.txt` внутри Docker-сборки падал на этой строке со 100%
+# воспроизводимостью: "ERROR: No matching distribution found for
+# python-magic-bin==0.4.14" — контейнер web не собирался вообще, независимо от
+# остального кода. PEP 508 environment marker (`; sys_platform == "..."`) ниже
+# заставляет pip выбирать нужный пакет по целевой платформе автоматически —
+# один requirements.txt работает и для локальной разработки на Windows, и для
+# Linux-образа Docker. python-magic (Linux/macOS-вариант) дополнительно требует
+# системную библиотеку libmagic1, устанавливаемую через apt в src/Dockerfile.
+python-magic-bin==0.4.14; sys_platform == "win32"
+python-magic==0.4.27; sys_platform != "win32"

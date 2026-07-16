@@ -19,6 +19,7 @@ from src.auth.user_schemas import (
     is_valid_password_format,
 )
 from src.config import settings
+from src.crm.client import CRMUnavailableError
 from src.database import get_async_session
 
 logger = logging.getLogger(__name__)
@@ -301,12 +302,11 @@ async def complete_registration(
 
     try:
         # user_manager.create: регистрирует в CRM → затем INSERT в person.
-        # При сбое CRM бросает HTTPException(503), которая перехватывается ниже.
         await user_manager.create(user_create)
-    except HTTPException:
-        # HTTPException от user_manager.create (CRM_UNAVAILABLE, 503) —
-        # пропускаем дальше без оборачивания, клиент получит оригинальный ответ.
-        raise
+    except CRMUnavailableError:
+        # Перевод доменного исключения в HTTP-ответ — граница ответственности
+        # эндпоинта, а не UserManager (см. auth/manager.py::create).
+        raise HTTPException(status_code=503, detail="CRM_UNAVAILABLE")
     except Exception as exc:
         from fastapi_users import exceptions as fu_exc
         if isinstance(exc, fu_exc.UserAlreadyExists):

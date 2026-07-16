@@ -10,6 +10,16 @@ from src.crm.config import crm_settings
 logger = logging.getLogger(__name__)
 
 
+class CRMUnavailableError(Exception):
+    """CRM-операция завершилась ошибкой (сеть, таймаут, невалидный ответ и т.д.).
+
+    Выбрасывается на границе доменной логики (например, UserManager.create()),
+    а не как есть — HTTPException, — чтобы не завязывать доменный слой на
+    HTTP-статусы. Перевод в конкретный HTTP-код — забота эндпоинта, который
+    ловит это исключение и решает, что ответить клиенту.
+    """
+
+
 class CRMClient:
     """Асинхронный HTTP-клиент для REST API CRM «Руководитель».
 
@@ -319,38 +329,3 @@ class CRMClient:
             raise Exception(f"CRM API error: {error_msg}")
 
         return result
-
-    async def register_user(
-        self,
-        group_id: int,
-        firstname: str,
-        lastname: str,
-        username: str,
-        email: str,
-        password: str = "",
-        notify: bool = True,
-        login_url: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Регистрирует пользователя в сущности «Пользователи» (entity_id=1).
-
-        :param username: Логин в CRM = часть email до '@'
-        """
-        record: Dict[str, Any] = {
-            "group_id":  group_id,
-            "firstname": firstname,
-            "lastname":  lastname,
-            "username":  username,
-            "email":     email,
-        }
-        if password:
-            record["password"] = password
-        if login_url is None:
-            login_url = self.login_url
-
-        return await self._call(
-            action="insert",
-            entity_id=1,
-            items=[record],
-            notify=notify,
-            login_url=login_url,
-        )
