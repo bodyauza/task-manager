@@ -10,7 +10,8 @@ from src.auth.auth_config import (auth_backend, current_user,
                                   get_access_strategy, get_refresh_strategy,
                                   refresh_cookie_transport)
 from src.auth.manager import UserManager, get_user_manager
-from src.auth.user_schemas import is_valid_email_format, is_valid_password_format, PASSWORD_ERROR
+from src.auth.user_schemas import is_valid_email_format
+from src.crm.user_service import UserLookup, get_user_lookup
 
 logger = logging.getLogger(__name__)
 
@@ -29,17 +30,20 @@ def _apply_transport_cookies(target_response: Response, transport_response: Resp
 async def login(
         credentials: OAuth2PasswordRequestForm = Depends(),
         user_manager: UserManager = Depends(get_user_manager),
+        user_lookup: UserLookup = Depends(get_user_lookup),
 ):
-    # Предварительная валидация формата снижает нагрузку на БД при явно невалидных данных.
+    # Предварительная валидация формата email снижает нагрузку на БД при явно невалидных данных.
+    # Формат пароля здесь намеренно НЕ проверяется: /auth/login верифицирует уже существующий
+    # секрет (совпадает ли с сохранённым хешем), а не создаёт новый — валидация формы пароля
+    # уместна только там, где пароль задаётся (UserCreate, /auth/register/complete). Проверка
+    # формата на входе в систему означала бы вторую, независимую от хеша копию правил пароля:
+    # если PASSWORD_REGEX когда-нибудь изменится, пользователи с корректным, но не подходящим
+    # под новое правило паролем не смогут войти, хотя их хеш в БД никто не менял.
+    # Некорректный пароль и так корректно даст LOGIN_BAD_CREDENTIALS через authenticate() ниже.
     if not is_valid_email_format(credentials.username):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid email format",
-        )
-    if not is_valid_password_format(credentials.password):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=PASSWORD_ERROR,
         )
 
     user = await user_manager.authenticate(credentials)
@@ -55,11 +59,8 @@ async def login(
     # Проверка наличия записи в CRM при каждом входе: регистрация в CRM предшествует
     # INSERT в person, но в случае ручного добавления в БД или сбоя при регистрации
     # запись в CRM может отсутствовать — вход блокируется с кодом 403.
-    from src.crm.user_service import CRMUserSelector
-
     try:
-        selector = CRMUserSelector()
-        crm_user = await selector.find_user_by_email(user.email)
+        crm_user = await user_lookup.find_user_by_email(user.email)
     except Exception as exc:
         logger.error("CRM check failed for user %d (%s): %s", user.id, user.email, exc)
         raise HTTPException(

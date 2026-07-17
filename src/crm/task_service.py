@@ -1,10 +1,36 @@
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Protocol
 
 from src.crm.client import CRMClient
 
 logger = logging.getLogger(__name__)
+
+
+class TaskCRMSync(Protocol):
+    """Абстракция CRM-синхронизации задач, на которую опираются роутеры/сервисы задач.
+
+    Роутеры зависят от этого протокола, а не от конкретного TaskManager (DIP) —
+    подмена в тестах происходит через FastAPI Depends-override, без патчинга
+    пути импорта.
+    """
+
+    async def create_task(
+        self, title: str, description: str, completed: bool = False,
+    ) -> Dict[str, Any]: ...
+
+    async def update_task(
+        self,
+        task_id: int,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        completed: Optional[bool] = None,
+        specification_abs_path: Optional[Path] = None,
+        clear_specification: bool = False,
+        other_file_abs_paths: Optional[list[Path]] = None,
+    ) -> Dict[str, Any]: ...
+
+    async def delete_task(self, task_id: int) -> Dict[str, Any]: ...
 
 
 class TaskManager(CRMClient):
@@ -108,3 +134,10 @@ class TaskManager(CRMClient):
             entity_id=self.ENTITY_ID,
             delete_by_field={"id": task_id},
         )
+
+
+def get_task_crm_sync() -> TaskCRMSync:
+    """FastAPI-зависимость: единственная точка, которая знает, что TaskCRMSync
+    реализует именно TaskManager — роутеры/сервисы работают только с протоколом.
+    """
+    return TaskManager()

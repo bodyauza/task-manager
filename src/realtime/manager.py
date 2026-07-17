@@ -9,6 +9,7 @@ Open/Closed на практике: чтобы завтра добавить, н�
 новой функции в events.py, использующей уже существующий broadcast().
 """
 
+import asyncio
 import json
 import logging
 from typing import Protocol
@@ -96,17 +97,32 @@ class ConnectionManager:
         исключение) собираются в отдельный список пар (uid, connection) и
         удаляются через unregister после завершения итерации — изменять
         набор во время итерации по нему запрещено в Python.
+
+        asyncio.gather вместо вложенного цикла с последовательным await:
+        время рассылки одного события раньше росло линейно с числом открытых
+        соединений (N последовательных await send_text) — тот же приём, что
+        уже применён для cascade-удаления подзадач в CRM
+        (services/tasks.py::delete_task). return_exceptions=True не даёт
+        падению отправки в одно соединение прервать сбор результатов для
+        остальных (хотя _send_safe и так перехватывает исключения сама —
+        дополнительная защита на случай, если это изменится в будущем).
         """
         data = json.dumps(payload)
-        dead: list[tuple[int, WebSocket]] = []
-        for uid, sockets in list(self._connections.items()):
-            if uid == exclude_user_id:
-                continue
-            for connection in list(sockets):
-                if not await self._send_safe(connection, data):
-                    dead.append((uid, connection))
-        for uid, connection in dead:
-            self.unregister(uid, connection)
+        targets: list[tuple[int, WebSocket]] = [
+            (uid, connection)
+            for uid, sockets in list(self._connections.items())
+            if uid != exclude_user_id
+            for connection in list(sockets)
+        ]
+        if not targets:
+            return
+        results = await asyncio.gather(
+            *(self._send_safe(connection, data) for _, connection in targets),
+            return_exceptions=True,
+        )
+        for (uid, connection), ok in zip(targets, results):
+            if ok is not True:
+                self.unregister(uid, connection)
 
 
 # Единственный экземпляр на процесс — как и раньше в routers/tasks.py,

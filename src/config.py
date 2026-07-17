@@ -37,6 +37,18 @@ class Settings(BaseSettings):
     DB_DRIVER_SYNC: str
     DB_DRIVER_ASYNC: str
 
+    # Дефолты = встроенные дефолты SQLAlchemy QueuePool (5 + 10 = максимум 15 соединений
+    # на процесс) — раньше эти значения были неявными (SQLAlchemy подставляла их сама,
+    # если pool_size/max_overflow не переданы в create_async_engine). Здесь они не меняют
+    # текущее поведение, а делают его видимым и настраиваемым per-deployment: правильное
+    # значение зависит от max_connections на стороне PostgreSQL и от числа воркеров uvicorn
+    # (UVICORN_WORKERS в src/Dockerfile) — каждый воркер держит свой собственный пул, поэтому
+    # (DB_POOL_SIZE + DB_MAX_OVERFLOW) × число_воркеров не должно приближаться к
+    # max_connections БД. Наугад увеличивать нельзя: каждое соединение пула — это реальный
+    # процесс postgres на стороне БД.
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 10
+
     SMTP_HOST: str = "smtp.yandex.ru"
     SMTP_PORT: int = 465
     SMTP_USER: str = ""

@@ -1,21 +1,22 @@
 import logging
 import os
 from contextlib import asynccontextmanager
-from pathlib import Path
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
+from starlette.middleware.gzip import GZipMiddleware
 
-from src.auth.auth_config import current_user, fastapi_users
+from src.auth.auth_config import fastapi_users
 from src.auth.endpoints import auth_router
 from src.auth.models import Role
 from src.auth.registration_endpoints import registration_router
 from src.auth.user_schemas import UserCreate, UserRead
 from src.config import settings
+from src.crm.client import aclose_http_client
 from src.database import async_session_maker
 from src.realtime import websocket_router
 from src.routers.pages import router as pages_router
@@ -23,6 +24,7 @@ from src.routers.subtasks import router as subtasks_router
 from src.routers.subtask_files import router as subtask_files_router   # файлы подзадач
 from src.routers.tasks import router as tasks_router
 from src.routers.task_files import router as task_files_router         # файлы задач
+from src.routers.uploads import router as uploads_router               # раздача /uploads/*
 from src.routers.users import router as users_router
 
 logging.basicConfig(level=logging.INFO)
@@ -76,17 +78,17 @@ async def create_initial_roles():
 async def lifespan(app: FastAPI):
     # lifespan заменяет устаревший on_event("startup"/"shutdown") начиная с FastAPI 0.93.
     # Код до yield — инициализация при старте; после yield — завершение при остановке.
+    #
+    # Директория uploads/ отдельно здесь не создаётся: src.routers.uploads (импортирован
+    # выше, до определения lifespan) уже гарантирует её существование на уровне модуля —
+    # через UPLOAD_ROOT.mkdir(...), путь к которому вычисляется от __file__, а не от cwd
+    # процесса.
     await create_initial_roles()
-
-    # Гарантируем существование директории uploads/ при старте приложения.
-    # mkdir(parents=True, exist_ok=True): создаёт всю цепочку вложенных папок;
-    # не падает если директория уже существует.
-    # StaticFiles mount на /uploads требует, чтобы директория существовала
-    # ещё до первого запроса — иначе Starlette бросает RuntimeError при инициализации.
-    from pathlib import Path
-    Path("src/static/uploads").mkdir(parents=True, exist_ok=True)
-
     yield
+    # Закрываем разделяемый httpx.AsyncClient CRM-модуля, иначе TCP-соединения
+    # из его пула остаются открытыми до завершения процесса. Парная операция к
+    # ленивому созданию клиента в src/crm/client.py::_get_shared_http_client().
+    await aclose_http_client()
 
 """
 uvicorn запускает приложение
@@ -129,31 +131,6 @@ _static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 # name="static" — псевдоним для url_path_for("static", path="...") в шаблонах Jinja2.
 app.mount("/static", StaticFiles(directory=_static_dir), name="static")
 
-# StaticFiles (Starlette mount) обходит FastAPI Depends — добавить Depends(current_user)
-# через app.mount() невозможно. Вместо mount используется обычный роутер с зависимостью,
-# который читает файл с диска и возвращает FileResponse.
-# Директория создаётся здесь (до первого запроса), чтобы Path.resolve() работал корректно.
-_uploads_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "uploads")
-os.makedirs(_uploads_dir, exist_ok=True)
-
-
-@app.get("/uploads/{file_path:path}", include_in_schema=False)
-async def serve_upload(
-    file_path: str,
-    user=Depends(current_user),   # 401 без токена; StaticFiles mount это не умеет
-):
-    abs_path = Path(_uploads_dir) / file_path
-    # Защита от path-traversal: resolved path должен оставаться внутри _uploads_dir.
-    try:
-        abs_path = abs_path.resolve()
-        uploads_root = Path(_uploads_dir).resolve()
-        abs_path.relative_to(uploads_root)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid file path")
-    if not abs_path.exists() or not abs_path.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(abs_path)
-
 # cors_origins задан для dev-окружения. В production список нужно сузить
 # до реального домена приложения и убрать все localhost-адреса.
 app.add_middleware(
@@ -169,6 +146,26 @@ app.add_middleware(
         "Authorization",
     ],
 )
+
+# minimum_size=1000: не сжимать совсем маленькие ответы — сам overhead gzip-заголовков
+# и CPU на сжатие/разжатие для них не окупается. JS/CSS/JSON-ответы обычно заметно
+# больше этого порога и от сжатия реально выигрывают.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+@app.middleware("http")
+async def add_static_cache_header(request: Request, call_next):
+    response = await call_next(request)
+    # Cache-Control только для /static/*: имена файлов НЕ версионируются (нет хеша
+    # в пути вроде task-board.abcd1234.js), поэтому immutable/год кеша здесь были бы
+    # ловушкой — после деплоя новой версии JS браузер продолжал бы отдавать старый
+    # файл из кеша до истечения срока. max-age=3600 — разумный компромисс: ощутимо
+    # снижает число повторных запросов статики внутри одной сессии пользователя, но
+    # не рискует держать устаревший JS сутками после деплоя.
+    if request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
+
 
 @app.middleware("http")
 async def add_csp_header(request: Request, call_next):
@@ -205,6 +202,7 @@ app.include_router(websocket_router)      # /ws/tasks/{client_id}
 app.include_router(task_files_router)     # /tasks/{id}/specification, /tasks/{id}/files
 app.include_router(subtasks_router)
 app.include_router(subtask_files_router)  # /subtasks/{id}/specification, /subtasks/{id}/files
+app.include_router(uploads_router)        # /uploads/{file_path} — аутентифицированная раздача файлов
 app.include_router(users_router)
 app.include_router(pages_router)          # HTML-страницы монтируются последними
 

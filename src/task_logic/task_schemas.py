@@ -61,7 +61,8 @@ class TaskResponse(BaseModel):
 
     # Путь к файлу ТЗ относительно src/static/uploads/.
     # None — файл не загружен. Пример: "tasks/3/specification/a1b2_tz.pdf".
-    # URL доступа: /uploads/tasks/3/specification/a1b2_tz.pdf (через StaticFiles mount).
+    # URL доступа: /uploads/tasks/3/specification/a1b2_tz.pdf (через routers/uploads.py,
+    # аутентифицированный роутер, а не StaticFiles mount — см. src/routers/uploads.py).
     specification_path: Optional[str] = None
 
     # Список путей к иным документам.

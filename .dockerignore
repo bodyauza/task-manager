@@ -1,0 +1,39 @@
+# Docker build-context exclusions.
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+env
+venv
+.venv
+
+# IDE / local tooling
+.idea
+.vscode
+.claude
+
+# VCS
+.git
+
+.env
+.dev.env
+.tests.env
+.env.*
+
+# Локальная документация
+docs
+
+# Тестовые артефакты — не нужны образу, генерируются локально/в CI заново.
+.pytest_cache
+.coverage
+htmlcov
+
+src/screenshots
+
+# Загруженные пользователями файлы — рантайм-данные, не артефакт сборки.
+src/static/uploads

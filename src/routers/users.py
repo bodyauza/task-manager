@@ -91,12 +91,13 @@ async def update_user(
         await db.rollback()
         raise HTTPException(status_code=409, detail="Update conflicts with an existing user")
 
-    # После commit() SQLAlchemy переводит все атрибуты объекта в состояние expired.
-    # В async-контексте обращение к expired-атрибуту вызвало бы MissingGreenlet —
-    # lazy SELECT в async недопустим. refresh() выполняет явный SELECT прямо сейчас,
-    # пока сессия ещё открыта, и заполняет атрибуты актуальными значениями из БД.
-    await db.refresh(user)
-
+    # db.refresh() здесь не нужен: async_session_maker сконфигурирован с
+    # expire_on_commit=False (src/database.py) — commit() НЕ переводит атрибуты
+    # объекта в состояние expired (это поведение по умолчанию при expire_on_commit=True,
+    # но не в этом проекте). Проверено эмпирически: обращение к атрибутам ORM-объекта
+    # сразу после commit(), без промежуточного refresh(), не вызывает MissingGreenlet
+    # и не требует дополнительного SELECT.
+    #
     # FastAPI вызывает UserRead.model_validate(user) (from_attributes=True) и сериализует
     # ORM-объект в JSON согласно схеме UserRead.
     return user

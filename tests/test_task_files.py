@@ -216,7 +216,7 @@ async def test_upload_other_files_limit_exceeded(
 ):
     """Суммарное количество файлов > MAX_OTHER_FILES → 422."""
     # Устанавливаем лимит = 1 для предсказуемого теста
-    monkeypatch.setattr("src.routers.task_files.MAX_OTHER_FILES", 1)
+    monkeypatch.setattr("src.services.attachments.MAX_OTHER_FILES", 1)
     await _auth(client, mock_smtp)
     task = await _make_task(client)
     tid = task["id"]

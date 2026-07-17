@@ -51,7 +51,9 @@ async def read_and_validate(file: UploadFile) -> bytes:
     """Читает файл из запроса и проверяет размер, расширение и MIME-тип.
 
     Последовательность проверок:
-    1. Размер: file.read() читает всё в память; если > MAX_FILE_SIZE → 413.
+    1. Размер: файл читается чанками с накоплением счётчика; как только он
+       превышает MAX_FILE_SIZE → немедленный 413, без чтения и буферизации
+       остатка файла.
     2. Расширение: суффикс имени файла должен быть в ALLOWED → иначе 422.
     3. MIME-тип: magic.from_buffer анализирует первые байты файла по сигнатуре
        (magic bytes) — не зависит от расширения. Должен совпадать с допустимым
@@ -59,14 +61,29 @@ async def read_and_validate(file: UploadFile) -> bytes:
 
     Возвращает байты файла для последующей записи на диск.
     """
-    content: bytes = await file.read()  # читаем файл целиком в память для проверки размера
-
-    if len(content) > MAX_FILE_SIZE:
-        # 413 Request Entity Too Large: файл превышает лимит.
-        raise HTTPException(
-            status_code=413,
-            detail=f"Размер файла превышает лимит {MAX_FILE_SIZE // (1024 * 1024)} МБ",
-        )
+    # Потоковое чтение чанками вместо file.read() целиком: при файле, заметно
+    # превышающем лимит (например, отправленном намеренно — DoS-паттерн из
+    # нескольких конкурентных запросов на «Иные документы»), проверка размера
+    # срабатывает на середине чтения, а не после того как весь файл уже лежит
+    # в памяти процесса. Пиковое потребление памяти ограничено ~MAX_FILE_SIZE
+    # + один чанк, а не размером присланного файла.
+    _CHUNK_SIZE = 1024 * 1024  # 1 МБ — компромисс между числом чтений и пиковой памятью
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_FILE_SIZE:
+            # 413 Request Entity Too Large: файл превышает лимит.
+            # Обрываем чтение немедленно — оставшаяся часть файла в поток не читается.
+            raise HTTPException(
+                status_code=413,
+                detail=f"Размер файла превышает лимит {MAX_FILE_SIZE // (1024 * 1024)} МБ",
+            )
+        chunks.append(chunk)
+    content: bytes = b"".join(chunks)
 
     # UploadFile.filename типизирован как Optional[str]: клиент может прислать
     # multipart-часть без Content-Disposition filename → filename=None.

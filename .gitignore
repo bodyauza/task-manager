@@ -25,4 +25,5 @@ env/
 htmlcov/
 
 docs/
-/src/static/uploads/
+src/static/uploads/subtasks
+src/static/uploads/tasks

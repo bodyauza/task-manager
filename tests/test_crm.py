@@ -11,9 +11,8 @@ import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.crm.client import CRMClient
 from src.crm.task_service import TaskManager
-from src.crm.user_service import CRMUserSelector
+from src.crm.user_service import CRMUserRegistrar, CRMUserSelector
 
 # Ключи полей CRM выводятся из констант TaskManager, а не хардкодятся строками:
 # сторонние разработчики меняют FIELD_TITLE/FIELD_DESCR/FIELD_DONE в task_service.py
@@ -46,10 +45,14 @@ def _err_resp(msg: str) -> MagicMock:
 
 
 def _patch_httpx(return_value=None, side_effect=None):
-    """Патчит CRMClient._http напрямую — _get_client() возвращает его без вызова конструктора.
+    """Патчит module-level singleton _shared_http_client напрямую — _get_shared_http_client()
+    возвращает его без вызова конструктора httpx.AsyncClient.
 
-    CRMClient кеширует AsyncClient в _http (класс-переменная). patch.object заменяет
-    значение на mock и восстанавливает None после patcher.stop().
+    Клиент — не атрибут класса CRMClient (см. src/crm/client.py: cls._http = ... в
+    classmethod создавал бы отдельный атрибут в каждом подклассе, а не мутировал
+    бы базовый — отсюда и перенос на module-level переменную), а module-level
+    переменная в src.crm.client. patch() подменяет её значение и восстанавливает
+    исходное (None) после patcher.stop().
     """
     mock_http = AsyncMock()
     if side_effect:
@@ -57,7 +60,7 @@ def _patch_httpx(return_value=None, side_effect=None):
     else:
         mock_http.post = AsyncMock(return_value=return_value)
 
-    patcher = patch.object(CRMClient, "_http", new=mock_http)
+    patcher = patch("src.crm.client._shared_http_client", new=mock_http)
     patcher.start()
     return patcher, mock_http
 
@@ -69,7 +72,7 @@ async def test_register_user_success():
     """register_user возвращает ответ CRM при успешном запросе."""
     patcher, mock_http = _patch_httpx(_resp({"id": "42"}))
     try:
-        result = await CRMClient().register_user(
+        result = await CRMUserRegistrar().register_user(
             group_id=6, firstname="Ivan", lastname="Petrov",
             username="ivan", email="ivan@example.com",
         )
@@ -88,7 +91,7 @@ async def test_register_user_connection_error():
     patcher, _ = _patch_httpx(side_effect=httpx.ConnectError("refused"))
     try:
         with pytest.raises(Exception, match="Connection error"):
-            await CRMClient().register_user(
+            await CRMUserRegistrar().register_user(
                 group_id=6, firstname="Ivan", lastname="Petrov",
                 username="ivan", email="ivan@example.com",
             )
@@ -102,7 +105,7 @@ async def test_register_user_timeout():
     patcher, _ = _patch_httpx(side_effect=httpx.TimeoutException("timeout"))
     try:
         with pytest.raises(Exception, match="timed out"):
-            await CRMClient().register_user(
+            await CRMUserRegistrar().register_user(
                 group_id=6, firstname="Ivan", lastname="Petrov",
                 username="ivan", email="ivan@example.com",
             )
@@ -116,7 +119,7 @@ async def test_register_user_crm_api_error():
     patcher, _ = _patch_httpx(_err_resp("Email already exists"))
     try:
         with pytest.raises(Exception, match="CRM API error"):
-            await CRMClient().register_user(
+            await CRMUserRegistrar().register_user(
                 group_id=6, firstname="Ivan", lastname="Petrov",
                 username="ivan", email="ivan@example.com",
             )
@@ -136,7 +139,7 @@ async def test_register_user_invalid_json():
     patcher, _ = _patch_httpx(mock_resp)
     try:
         with pytest.raises(Exception, match="invalid JSON"):
-            await CRMClient().register_user(
+            await CRMUserRegistrar().register_user(
                 group_id=6, firstname="Ivan", lastname="Petrov",
                 username="ivan", email="ivan@example.com",
             )

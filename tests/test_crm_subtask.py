@@ -11,7 +11,6 @@ import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.crm.client import CRMClient
 from src.crm.subtask_service import SubtaskManager
 
 # Ключи полей CRM выводятся из констант SubtaskManager, а не хардкодятся строками:
@@ -46,12 +45,14 @@ def _err_resp(msg: str) -> MagicMock:
 
 
 def _patch_httpx(return_value=None, side_effect=None):
+    # _shared_http_client — module-level singleton в src.crm.client (не атрибут
+    # класса CRMClient), см. пояснение в tests/test_crm.py::_patch_httpx.
     mock_http = AsyncMock()
     if side_effect:
         mock_http.post = AsyncMock(side_effect=side_effect)
     else:
         mock_http.post = AsyncMock(return_value=return_value)
-    patcher = patch.object(CRMClient, "_http", new=mock_http)
+    patcher = patch("src.crm.client._shared_http_client", new=mock_http)
     patcher.start()
     return patcher, mock_http
 

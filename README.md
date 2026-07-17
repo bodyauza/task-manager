@@ -160,7 +160,7 @@ sequenceDiagram
         C->>S: POST /auth/register/verify-code
         Note left of C: body: email, code
         S->>D: SELECT registration_pending WHERE email=?
-        Note right of S: expires_at прошёл → 400 CODE_EXPIRED<br/>attempts >= 3 → 400 TOO_MANY_ATTEMPTS<br/>bcrypt.verify fail → 400 INVALID_CODE
+        Note right of S: expires_at прошёл → DELETE + 400 CODE_EXPIRED<br/>attempts >= 3 → 400 TOO_MANY_ATTEMPTS (pending НЕ удаляется — держит created_at для rate-limit шага 1)<br/>bcrypt.verify fail → 400 INVALID_CODE
         S->>D: DELETE registration_pending
         Note right of S: jwt.encode(sub=email, purpose=registration,<br/>exp=now+20мин, secret=REG_TOKEN_SECRET)
         S-->>C: 200 OK
@@ -191,7 +191,7 @@ sequenceDiagram
 | `request-code` | 503 | `SMTP_ERROR` | SMTP-сервер недоступен |
 | `verify-code` | 400 | `NO_PENDING_REGISTRATION` | Нет записи в `registration_pending` |
 | `verify-code` | 400 | `CODE_EXPIRED` | `expires_at` истёк (15 мин) |
-| `verify-code` | 400 | `TOO_MANY_ATTEMPTS` | 3 неверные попытки исчерпаны |
+| `verify-code` | 400 | `TOO_MANY_ATTEMPTS` | 3 неверные попытки исчерпаны; запись `registration_pending` **не удаляется** (иначе следующий `request-code` обходил бы 60-секундный rate-limit — см. таблицу `registration_pending` ниже) |
 | `verify-code` | 400 | `INVALID_CODE:<rem>` | Неверный код, `rem` — оставшихся попыток |
 | `complete` | 401 | `MISSING_REG_TOKEN` | Кука `reg_token` отсутствует |
 | `complete` | 401 | `REG_TOKEN_INVALID` | JWT не прошёл проверку подписи/срока |
@@ -487,17 +487,24 @@ CRM_USER_GROUP_ID=6   # ID группы «Сотрудник» в CRM
 ```
 src/crm/
 ├── config.py           # чтение CRM_* переменных окружения через os.getenv()
-├── client.py           # базовый HTTP-клиент (httpx async), метод _call()
-├── user_service.py     # поиск пользователя по email (используется при логине)
+├── client.py           # базовый HTTP-клиент (httpx async), метод _call(); CRMUnavailableError
+├── user_service.py     # CRMUserSelector — поиск по email (логин); CRMUserRegistrar — регистрация (register_user)
 ├── task_service.py     # CRUD-операции с задачами (entity_id=29)
 └── subtask_service.py  # CRUD-операции с подзадачами (entity_id=30)
 ```
 
+Каждый из четырёх сервисных файлов (`user_service.py` дважды — по одному Protocol на каждый класс)
+дополнительно экспортирует пару «`Protocol` + `Depends`-провайдер» (`TaskCRMSync`/`get_task_crm_sync()`,
+`SubtaskCRMSync`/`get_subtask_crm_sync()`, `UserLookup`/`get_user_lookup()`, `UserRegistrar`/`get_user_registrar()`) —
+роутеры и `UserManager` зависят от этих протоколов через `Depends()`, а не от конкретных классов
+напрямую (Dependency Inversion). `register_user()` — метод только `CRMUserRegistrar`, не базового
+`CRMClient`: `TaskManager`/`SubtaskManager` его не наследуют (Interface Segregation).
+
 ### HTTP-клиент
 
-`CRMClient` держит один `httpx.AsyncClient` на весь срок жизни процесса (`_http` — класс-переменная, lazy-инициализация при первом запросе). TCP-соединение к CRM переиспользуется между вызовами через HTTP/1.1 keep-alive.
+Один `httpx.AsyncClient` на весь срок жизни процесса, общий для всех CRM-классов (`TaskManager`, `SubtaskManager`, `CRMUserSelector`, `CRMUserRegistrar`) — module-level singleton (`_shared_http_client` в `src/crm/client.py`), а не атрибут класса `CRMClient`. Ранее это была class-переменная с ленивой инициализацией через `classmethod`, но `cls._http = ...` внутри `classmethod` пишет атрибут в `__dict__` того класса, что передан как `cls`, а не мутирует `CRMClient` — при инстанцировании только через подклассы (`CRMClient` напрямую нигде не создаётся) каждый из четырёх наследников заводил свой собственный `AsyncClient` вместо одного разделяемого. Module-level переменная вне иерархии классов этой проблеме не подвержена. TCP-соединение к CRM переиспользуется между вызовами через HTTP/1.1 keep-alive.
 
-`aclose()` не вызывается явно: при завершении процесса OS закрывает сокеты. Для production с k8s/systemd потребуется инициализация в `lifespan` с явным `await CRMClient._http.aclose()` — это обеспечит drain in-flight запросов до `SIGKILL`.
+`aclose_http_client()` вызывается явно в `lifespan()` (`src/main.py`) при shutdown — graceful-закрытие с drain in-flight запросов до `SIGKILL`, парная операция к ленивой инициализации при первом CRM-запросе.
 
 ### Формат запросов к API
 
@@ -779,30 +786,45 @@ REFRESH_SECRET=another_random_secret_32_chars_min
 
 > `DB_HOST` указывать не нужно — docker-compose переопределяет его на `db` (имя сервиса внутри Docker-сети).
 
+> **Обязателен флаг `--env-file src/.dev.env`.** Сервис `web` получает переменные через
+> `env_file: .dev.env` — это механизм времени выполнения контейнера, он не влияет на
+> подстановку `${DB_USER}`/`${DB_PASS}`/`${DB_NAME}` в блоке `environment:` сервиса `db`.
+> Подстановку `${VAR}` в самом YAML выполняет CLI `docker compose` **до** старта
+> контейнеров, используя свой собственный `.env` (по умолчанию ищется в каталоге compose-файла,
+> т.е. `src/.env` — такого файла в проекте нет) или явный `--env-file`. Без этого флага
+> `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` резолвятся в пустые строки — образ
+> `postgres:18` тогда либо стартует с дефолтным пользователем `postgres` без пароля, либо
+> вовсе отказывается инициализироваться («Database is uninitialized and superuser
+> password is not specified»), в зависимости от версии образа.
+
 ### Команды
 
 ```bash
 # Сборка и запуск
-docker-compose -f src/docker-compose.yml up --build
+docker compose --env-file src/.dev.env -f src/docker-compose.yml up --build
 
 # Запуск в фоне
-docker-compose -f src/docker-compose.yml up -d
+docker compose --env-file src/.dev.env -f src/docker-compose.yml up -d
 
 # Логи
-docker-compose -f src/docker-compose.yml logs -f web
+docker compose --env-file src/.dev.env -f src/docker-compose.yml logs -f web
 
 # Остановка
-docker-compose -f src/docker-compose.yml down
+docker compose --env-file src/.dev.env -f src/docker-compose.yml down
 
 # Остановка с удалением данных БД
-docker-compose -f src/docker-compose.yml down -v
+docker compose --env-file src/.dev.env -f src/docker-compose.yml down -v
 ```
 
 ### Применение миграций
 
 ```
-docker-compose -f src/docker-compose.yml exec web alembic upgrade head
+docker compose --env-file src/.dev.env -f src/docker-compose.yml exec web alembic upgrade head
 ```
+
+> `exec` подключается к уже запущенному контейнеру — `--env-file` здесь для единообразия
+> команды с остальными (сам `exec` переменные `${VAR}` в YAML повторно не резолвит, но
+> флаг безвреден, если контейнеры уже подняты корректно).
 
 ### Доступ
 
@@ -875,10 +897,10 @@ docker exec src-web-1 python -m pytest tests/ -v
 |---|---|---|
 | `setup_and_reset` | function, autouse | `drop_all + create_all` + безусловная вставка ролей. Teardown отсутствует — следующий тест начнёт с drop_all |
 | `client` | function | `httpx.AsyncClient` с `ASGITransport` — HTTP-запросы к приложению без TCP |
-| `mock_crm` | function, autouse | Патч `CRMClient`, `CRMUserSelector`, `TaskManager`, `SubtaskManager` через `unittest.mock.patch` |
+| `mock_crm` | function, autouse | `app.dependency_overrides[get_task_crm_sync] = lambda: mock_task_mgr` (и аналогично для `get_subtask_crm_sync`/`get_user_lookup`/`get_user_registrar`) — подмена на уровне графа зависимостей FastAPI, не патчингом пути импорта |
 | `mock_smtp` | function, autouse | Перехват `send_confirmation_code`; код сохраняется в `dict[email, code]` |
 | `mock_magic` | function | Патч `magic.from_buffer` — определение MIME по сигнатурам без установки libmagic в CI |
-| `upload_root` | function | Временная директория (`tmp_path/uploads`) для `UPLOAD_ROOT` в `task_files.py`/`subtask_files.py` — файловые тесты не трогают реальный диск |
+| `upload_root` | function | Временная директория (`tmp_path/uploads`) для `UPLOAD_ROOT` в `src/services/attachments.py` — файловые тесты не трогают реальный диск |
 | `registered_user` | function | Полный трёхшаговый flow регистрации через HTTP; возвращает `{"email": ..., "password": ...}` |
 | `register_user` | — (async helper) | Вспомогательная функция: прогоняет три шага регистрации; используется в тестах напрямую |
 | `promote_to_admin` | — (async helper) | Повышает пользователя до `role_id=2` в БД. Требует повторного логина для обновления JWT |
@@ -893,8 +915,10 @@ docker exec src-web-1 python -m pytest tests/ -v
 | `test_auth.py` | Логин (успех / неверный пароль / несуществующий пользователь), logout (JS-вариант / без авторизации), refresh-токен (успех / без куки) |
 | `test_registration_flow.py` | request-code (успех / нормализация email / невалидный email / дубль / rate-limit), verify-code (успех / нет pending / неверный код / счётчик попыток / лимит исчерпан / невалидный формат), complete (успех / без токена / слабый пароль / пустой firstname), полный flow + немедленный логин, patronymic (с отчеством / без / хранение NULL) |
 | `test_tasks.py` | Создание (успех / дубль title / без авторизации / пустой title), чтение (пустой список / пагинация / вторая страница / невалидный limit / невалидный skip), поиск (найдено / не найдено / без авторизации), обновление (успех / частичное / дубль title / 404 / без авторизации), удаление (успех / 404 / без авторизации), совместный доступ, конкурентные `delete_task` + `create_subtask` (не должны давать 500 или вводящий в заблуждение 409) |
+| `test_task_service.py` | Юнит-тесты `src/services/tasks.py` напрямую, без HTTP — фейковый `TaskCRMSync` вместо мока по пути импорта: создание (успех / дубль не доходит до CRM повторно / CRM-сбой best-effort), список (пагинация), обновление (404 / CRM-синхронизация), удаление (удаление строки + вызов CRM / 404) |
+| `test_subtask_service.py` | Юнит-тесты `src/services/subtasks.py` напрямую — фейковый `SubtaskCRMSync`; в т.ч. пропуск CRM-вызова, если родительская задача не синхронизирована |
 | `test_users.py` | Список (admin — успех / user — 403 / без авторизации — 401), удаление (успех / 403 / 404), редактирование (успех / 403) |
-| `test_crm.py` | CRMClient: register_user (успех / ConnectError / таймаут / CRM API error / невалидный JSON); find_user_by_email (найден / не найден / ConnectError); TaskManager: create_task / update_task / delete_task (успех и ошибки); _bool_to_crm |
+| `test_crm.py` | `CRMUserRegistrar`: register_user (успех / ConnectError / таймаут / CRM API error / невалидный JSON); `CRMUserSelector`: find_user_by_email (найден / не найден / ConnectError); `TaskManager`: create_task / update_task / delete_task (успех и ошибки); _bool_to_crm |
 | `test_pages.py` | HTML-маршруты: login / register / task-board (аутентифицированный и нет) |
 | `test_subtasks.py` | Создание (успех / 401 / 404 / пустой title / whitespace нормализация / дубль в задаче / одинаковый title в разных задачах / без описания / ошибка CRM / задача без crm_task_id / задача удалена «на лету» между проверкой и commit → 404, не вводящий в заблуждение 409), чтение списка (пустой / 401 / пагинация / вторая страница / невалидный limit/skip / несуществующий task_id), чтение по ID (успех / 404 / 401), обновление (успех / частичное / 404 / 401 / дубль title / ошибка CRM / нет crm_subtask_id), удаление (успех / 404 / 401 / физическое удаление / ошибка CRM / cascade при удалении задачи) |
 | `test_crm_subtask.py` | SubtaskManager: create_subtask (dict-ответ / list-ответ / completed=True / ConnectError / таймаут / CRM API error / невалидный JSON), update_subtask (успех / нет полей / ConnectError / CRM API error), delete_subtask (успех / ConnectError / CRM API error), _bool_to_crm |

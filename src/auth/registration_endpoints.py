@@ -19,6 +19,7 @@ from src.auth.user_schemas import (
     is_valid_password_format,
 )
 from src.config import settings
+from src.crm.client import CRMUnavailableError
 from src.database import get_async_session
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,9 @@ class _CompleteBody(BaseModel):
     # patronymic не является обязательным полем: отсутствие в теле запроса
     # не вызывает ошибку валидации — Pydantic подставляет None по умолчанию.
     patronymic: Optional[str] = Field(default=None, max_length=255)
-    password:   str
+    # max_length=72: bcrypt учитывает только первые 72 байта пароля и молча
+    # обрезает остальное — см. пояснение в src/auth/user_schemas.py::UserCreate.password.
+    password:   str = Field(..., min_length=5, max_length=72)
 
 
 # ─── JWT helpers ──────────────────────────────────────────────────────────────
@@ -223,9 +226,18 @@ async def verify_registration_code(
 
     # Лимит проверяется до verify_and_update: bcrypt-хеширование занимает ~0.5 с,
     # эту задержку нельзя тратить на заведомо заблокированный запрос.
+    #
+    # НЕ удаляем pending здесь (в отличие от ветки CODE_EXPIRED выше): created_at
+    # этой записи — точка отсчёта для 60-секундного кулдауна в
+    # request_registration_code(). Если удалить запись сразу при исчерпании
+    # попыток, следующий request-code для того же email не найдёт pending и
+    # пропустит проверку кулдауна целиком — рабочий обход rate-limit'а
+    # (запросить код → 4×неверный код → мгновенный новый код без ожидания).
+    # Запись останется заблокированной (эта же проверка сработает повторно на
+    # любой следующий verify-code) и будет корректно заменена свежей только
+    # когда пройдут все 60 секунд — тем же путём, что и обычная замена
+    # просроченного кулдауна в request_registration_code().
     if pending.attempts >= _MAX_ATTEMPTS:
-        await db.delete(pending)
-        await db.commit()
         raise HTTPException(status_code=400, detail="TOO_MANY_ATTEMPTS")
 
     # verify_and_update: сверяет код с хешем и при необходимости возвращает
@@ -301,12 +313,11 @@ async def complete_registration(
 
     try:
         # user_manager.create: регистрирует в CRM → затем INSERT в person.
-        # При сбое CRM бросает HTTPException(503), которая перехватывается ниже.
         await user_manager.create(user_create)
-    except HTTPException:
-        # HTTPException от user_manager.create (CRM_UNAVAILABLE, 503) —
-        # пропускаем дальше без оборачивания, клиент получит оригинальный ответ.
-        raise
+    except CRMUnavailableError:
+        # Перевод доменного исключения в HTTP-ответ — граница ответственности
+        # эндпоинта, а не UserManager (см. auth/manager.py::create).
+        raise HTTPException(status_code=503, detail="CRM_UNAVAILABLE")
     except Exception as exc:
         from fastapi_users import exceptions as fu_exc
         if isinstance(exc, fu_exc.UserAlreadyExists):

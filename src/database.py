@@ -28,6 +28,14 @@ _is_test = settings.api_mode in ("test", "testing")
 engine_kwargs = {"echo": not _is_prod}
 if _is_test:
     engine_kwargs["poolclass"] = NullPool
+else:
+    # pool_size/max_overflow: явно заданы через settings (см. src/config.py) вместо
+    # неявных дефолтов SQLAlchemy — конкретное значение настраивается per-deployment
+    # через DB_POOL_SIZE/DB_MAX_OVERFLOW в .env, не хардкодится здесь. NullPool
+    # (тестовый режим, ветка выше) не принимает pool_size/max_overflow вовсе —
+    # у него нет пула соединений как такового, поэтому это только для dev/prod.
+    engine_kwargs["pool_size"] = settings.DB_POOL_SIZE
+    engine_kwargs["max_overflow"] = settings.DB_MAX_OVERFLOW
 
 engine = create_async_engine(settings.ASYNC_DATABASE_URL, **engine_kwargs)
 

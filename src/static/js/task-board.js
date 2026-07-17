@@ -171,7 +171,13 @@ function connectWebSocket() {
             statusDiv.className = 'connection-status status-connected';
             // Первичная загрузка задач выполняется здесь, а не в window.onload:
             // гарантирует, что список обновится после восстановления разорванного соединения.
-            loadTasks(1);
+            // loadTasks(currentPage), а не loadTasks(1): connectWebSocket() вызывается и при
+            // первом подключении, и при каждом реконнекте (onclose → setTimeout(connectWebSocket)) —
+            // с хардкодом loadTasks(1) любой кратковременный обрыв связи (сон ноутбука, просадка
+            // сети) молча переносил пользователя на первую страницу списка, даже если он листал
+            // пятую. currentPage изначально равен 1, так что для самого первого подключения
+            // поведение не меняется.
+            loadTasks(currentPage);
         };
 
         socket.onmessage = function(event) {
@@ -284,8 +290,8 @@ function sendMessage() {
 
 // Singleton-промис для обновления access-токена.
 // Сценарий без синглтона: loadTasks() и updateTask() параллельно получают 401,
-// каждый вызывает POST /auth/access-token — бэкенд инвалидирует предыдущий refresh-токен
-// при выдаче нового, второй запрос приходит с уже недействительным токеном и падает с 401.
+// каждый вызывает POST /auth/access-token — без синглтона это лишний дублирующий
+// round-trip к серверу за одним и тем же новым access_token.
 // Синглтон: первый 401 стартует refresh, остальные await-ят тот же промис — один round-trip.
 let _refreshPromise = null;
 

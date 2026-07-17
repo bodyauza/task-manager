@@ -5,6 +5,9 @@ from sqlalchemy import select
 from unittest.mock import AsyncMock, patch
 
 from src.auth.models import Role, User
+from src.crm.subtask_service import get_subtask_crm_sync
+from src.crm.task_service import get_task_crm_sync
+from src.crm.user_service import get_user_lookup, get_user_registrar
 from src.database import async_session_maker, engine, Base
 from src.main import app
 
@@ -57,46 +60,49 @@ async def promote_to_admin(email: str) -> None:
 
 @pytest.fixture(autouse=True)
 def mock_crm():
-    # Патчим на уровне src.crm.*, а не в местах использования (manager.py, endpoints.py),
-    # т.к. там применяются отложенные импорты внутри функций. Каждый вызов
-    # `from src.crm.X import Y` читает атрибут из кэшированного модуля — патч
-    # на уровне модуля-источника перехватывает все такие вызовы.
-    # test_crm.py импортирует классы на уровне модуля до активации патча,
-    # поэтому там используются реальные экземпляры с httpx-мок.
-    with patch("src.crm.client.CRMClient") as mock_crm_cls, \
-         patch("src.crm.user_service.CRMUserSelector") as mock_selector_cls, \
-         patch("src.crm.task_service.TaskManager") as mock_task_mgr_cls, \
-         patch("src.crm.subtask_service.SubtaskManager") as mock_subtask_mgr_cls:
+    # Подмена через app.dependency_overrides, а не patch() по пути импорта: роутеры,
+    # UserManager и /auth/login получают CRM-абстракции через
+    # Depends(get_task_crm_sync)/Depends(get_subtask_crm_sync)/Depends(get_user_registrar)/
+    # Depends(get_user_lookup) (см. src/crm/*) — тест подставляет фейковую реализацию прямо
+    # в граф зависимостей FastAPI, не завися от того, где и как именно вызывающий код
+    # импортирует конкретный класс.
+    # test_crm.py работает с TaskManager/CRMClient/CRMUserSelector напрямую (не через app),
+    # поэтому эта фикстура на него не влияет.
+    mock_crm_instance = AsyncMock()
+    mock_crm_instance.register_user.return_value = {"status": "success", "data": {"id": "99"}}
 
-        mock_crm_instance = AsyncMock()
-        mock_crm_instance.register_user.return_value = {"status": "success", "data": {"id": "99"}}
-        mock_crm_cls.return_value = mock_crm_instance
+    mock_selector = AsyncMock()
+    # find_user_by_email возвращает dict с id: login-эндпоинт проверяет,
+    # что пользователь существует в CRM перед выдачей токенов.
+    mock_selector.find_user_by_email.return_value = {"id": "99"}
 
-        mock_selector = AsyncMock()
-        # find_user_by_email возвращает dict с id: login-эндпоинт проверяет,
-        # что пользователь существует в CRM перед выдачей токенов.
-        mock_selector.find_user_by_email.return_value = {"id": "99"}
-        mock_selector_cls.return_value = mock_selector
+    mock_task_mgr = AsyncMock()
+    mock_task_mgr.create_task.return_value = {"id": 99}
+    mock_task_mgr.update_task.return_value = {}
+    mock_task_mgr.delete_task.return_value = {}
 
-        mock_task_mgr = AsyncMock()
-        mock_task_mgr.create_task.return_value = {"id": 99}
-        mock_task_mgr.update_task.return_value = {}
-        mock_task_mgr.delete_task.return_value = {}
-        mock_task_mgr_cls.return_value = mock_task_mgr
+    mock_subtask_mgr = AsyncMock()
+    # id=55: роутер делает crm_subtask_id=55 → crm_synced=True в ответе по умолчанию
+    mock_subtask_mgr.create_subtask.return_value = {"id": 55, "response": {"status": "success"}}
+    mock_subtask_mgr.update_subtask.return_value = {"status": "success"}
+    mock_subtask_mgr.delete_subtask.return_value = {"status": "success"}
 
-        mock_subtask_mgr = AsyncMock()
-        # id=55: роутер делает crm_subtask_id=55 → crm_synced=True в ответе по умолчанию
-        mock_subtask_mgr.create_subtask.return_value = {"id": 55, "response": {"status": "success"}}
-        mock_subtask_mgr.update_subtask.return_value = {"status": "success"}
-        mock_subtask_mgr.delete_subtask.return_value = {"status": "success"}
-        mock_subtask_mgr_cls.return_value = mock_subtask_mgr
+    app.dependency_overrides[get_user_registrar] = lambda: mock_crm_instance
+    app.dependency_overrides[get_user_lookup] = lambda: mock_selector
+    app.dependency_overrides[get_task_crm_sync] = lambda: mock_task_mgr
+    app.dependency_overrides[get_subtask_crm_sync] = lambda: mock_subtask_mgr
 
-        yield {
-            "crm": mock_crm_instance,
-            "selector": mock_selector,
-            "task_mgr": mock_task_mgr,
-            "subtask_mgr": mock_subtask_mgr,
-        }
+    yield {
+        "crm": mock_crm_instance,
+        "selector": mock_selector,
+        "task_mgr": mock_task_mgr,
+        "subtask_mgr": mock_subtask_mgr,
+    }
+
+    del app.dependency_overrides[get_user_registrar]
+    del app.dependency_overrides[get_user_lookup]
+    del app.dependency_overrides[get_task_crm_sync]
+    del app.dependency_overrides[get_subtask_crm_sync]
 
 
 @pytest.fixture(autouse=True)
@@ -145,14 +151,14 @@ def mock_magic():
 def upload_root(tmp_path):
     """Временная директория uploads/ для изоляции файловых тестов от диска.
 
-    Патчит UPLOAD_ROOT в обоих файловых роутерах (task_files, subtask_files).
+    Патчит UPLOAD_ROOT в src.services.attachments — единственном месте, где
+    роутеры task_files/subtask_files теперь строят пути (см. AttachmentConfig).
     Путь содержит 'uploads' в Path.parts — это обязательно для save_file(),
     которая вычисляет rel-путь через поиск 'uploads' в дереве директорий.
     """
     root = tmp_path / "uploads"
     root.mkdir()
-    with patch("src.routers.task_files.UPLOAD_ROOT", root), \
-         patch("src.routers.subtask_files.UPLOAD_ROOT", root):
+    with patch("src.services.attachments.UPLOAD_ROOT", root):
         yield root
 
 
