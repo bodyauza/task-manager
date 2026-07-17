@@ -121,8 +121,19 @@ window.addEventListener('DOMContentLoaded', () => {
             } else {
                 const data = await r.json();
                 errorDiv.textContent = formatError(data.detail);
-                resendBtn.disabled = false;
-                resendBtn.textContent = 'Отправить повторно';
+                if (data.detail && data.detail.startsWith('RATE_LIMIT:')) {
+                    // Сервер всё ещё держит кулдаун (например, попытки были исчерпаны
+                    // меньше 60 секунд назад) — пересчитываем SENT_AT_KEY под реальный
+                    // остаток sec и перезапускаем отсчёт, вместо того чтобы тут же
+                    // снова разблокировать кнопку с надписью "Отправить повторно",
+                    // которая при клике опять получит тот же 429.
+                    const sec = parseInt(data.detail.split(':')[1], 10);
+                    sessionStorage.setItem(SENT_AT_KEY, String(Date.now() - (RATE_LIMIT_MS - sec * 1000)));
+                    startCountdown(resendBtn);
+                } else {
+                    resendBtn.disabled = false;
+                    resendBtn.textContent = 'Отправить повторно';
+                }
             }
         } catch {
             errorDiv.textContent = 'Ошибка соединения с сервером';

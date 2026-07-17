@@ -61,4 +61,11 @@ async def websocket_endpoint(
             message = await websocket.receive_text()
             await _publish_chat_message(user.id, message)
     except WebSocketDisconnect:
+        pass
+    except Exception:
+        # Любое другое исключение (не штатный разрыв соединения) — не даём ему
+        # пройти мимо unregister() в finally: без этого мёртвая запись осталась бы
+        # в ConnectionManager до следующего broadcast(), который её случайно подчистит.
+        logger.exception("Unexpected error in websocket_endpoint for user_id=%s", user.id)
+    finally:
         connection_manager.unregister(user.id, websocket)

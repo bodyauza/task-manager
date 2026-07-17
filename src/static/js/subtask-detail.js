@@ -55,7 +55,8 @@ async function fetchWithAuth(url, options = {}) {
 
 function renderSpecification(relPath) {
     // relPath: "subtasks/7/specification/a1b2_tz.pdf" или null.
-    // URL: /uploads/{relPath} — StaticFiles mount отдаёт файл из src/static/uploads/.
+    // URL: /uploads/{relPath} — аутентифицированный роутер (src/routers/uploads.py),
+    // требует access_token; не StaticFiles mount.
     const block = document.getElementById('specCurrent');
     if (relPath) {
         const link = document.getElementById('specLink');
@@ -290,19 +291,25 @@ document.addEventListener('DOMContentLoaded', function() {
         for (const f of pendingOtherFiles) fd.append('files', f);
 
         otherUploadInProgress = true;
-        const resp = await fetchWithAuth(`/subtasks/${subtaskId}/files`, { method: 'POST', body: fd });
-        otherUploadInProgress = false;
-        if (!resp) return;
-        if (resp.ok) {
-            const data = await resp.json();
-            renderOtherFiles(data.other_file_paths);
-            const count = pendingOtherFiles.length;
-            pendingOtherFiles = [];
-            renderPendingOtherFiles();
-            showToast(`Загружено файлов: ${count}`, 'info');
-        } else {
-            const err = await resp.json();
-            showToast(err.detail || 'Ошибка загрузки файлов', 'warning');
+        try {
+            const resp = await fetchWithAuth(`/subtasks/${subtaskId}/files`, { method: 'POST', body: fd });
+            if (!resp) return;
+            if (resp.ok) {
+                const data = await resp.json();
+                renderOtherFiles(data.other_file_paths);
+                const count = pendingOtherFiles.length;
+                pendingOtherFiles = [];
+                renderPendingOtherFiles();
+                showToast(`Загружено файлов: ${count}`, 'info');
+            } else {
+                const err = await resp.json();
+                showToast(err.detail || 'Ошибка загрузки файлов', 'warning');
+            }
+        } finally {
+            // finally, а не только после успешного resp: без него сетевой сбой оставлял бы
+            // otherUploadInProgress=true навсегда — блокируя и повторную загрузку файлов,
+            // и удаление подзадачи через deleteSubtask() (тот же флаг проверяется и там).
+            otherUploadInProgress = false;
         }
     });
 });
@@ -407,8 +414,8 @@ async function saveSubtask() {
             if (s.crm_synced === false) showToast('Сохранено без синхронизации с CRM', 'warning');
             renderSubtask(s);
             closeEditForm();
-        // } else if (resp.status === 403) {
-        //     showToast('Нет доступа: вы не являетесь владельцем этой задачи', 'error');
+        // Namespace-проверка владельца намеренно не выполняется — Shared board.
+        // См. src/services/subtasks.py::update_subtask и docs/task-manager-documentation.md.
         } else if (resp.status === 422) {
             const err = await resp.json();
             const msg = Array.isArray(err.detail) ? err.detail.map(e => e.msg).join('; ') : err.detail;
@@ -432,8 +439,8 @@ async function deleteSubtask() {
             const s = await resp.json();
             if (s.crm_synced === false) showToast('Удалено без синхронизации с CRM', 'warning');
             window.location.href = `/subtask-board/${taskId}`;
-        // } else if (resp.status === 403) {
-        //     showToast('Нет доступа: вы не являетесь владельцем этой задачи', 'error');
+        // Namespace-проверка владельца намеренно не выполняется — Shared board.
+        // См. src/services/subtasks.py::delete_subtask и docs/task-manager-documentation.md.
         } else {
             const err = await resp.json();
             alert(`Ошибка: ${err.detail}`);

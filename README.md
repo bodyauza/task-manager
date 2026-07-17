@@ -160,7 +160,7 @@ sequenceDiagram
         C->>S: POST /auth/register/verify-code
         Note left of C: body: email, code
         S->>D: SELECT registration_pending WHERE email=?
-        Note right of S: expires_at прошёл → 400 CODE_EXPIRED<br/>attempts >= 3 → 400 TOO_MANY_ATTEMPTS<br/>bcrypt.verify fail → 400 INVALID_CODE
+        Note right of S: expires_at прошёл → DELETE + 400 CODE_EXPIRED<br/>attempts >= 3 → 400 TOO_MANY_ATTEMPTS (pending НЕ удаляется — держит created_at для rate-limit шага 1)<br/>bcrypt.verify fail → 400 INVALID_CODE
         S->>D: DELETE registration_pending
         Note right of S: jwt.encode(sub=email, purpose=registration,<br/>exp=now+20мин, secret=REG_TOKEN_SECRET)
         S-->>C: 200 OK
@@ -191,7 +191,7 @@ sequenceDiagram
 | `request-code` | 503 | `SMTP_ERROR` | SMTP-сервер недоступен |
 | `verify-code` | 400 | `NO_PENDING_REGISTRATION` | Нет записи в `registration_pending` |
 | `verify-code` | 400 | `CODE_EXPIRED` | `expires_at` истёк (15 мин) |
-| `verify-code` | 400 | `TOO_MANY_ATTEMPTS` | 3 неверные попытки исчерпаны |
+| `verify-code` | 400 | `TOO_MANY_ATTEMPTS` | 3 неверные попытки исчерпаны; запись `registration_pending` **не удаляется** (иначе следующий `request-code` обходил бы 60-секундный rate-limit — см. таблицу `registration_pending` ниже) |
 | `verify-code` | 400 | `INVALID_CODE:<rem>` | Неверный код, `rem` — оставшихся попыток |
 | `complete` | 401 | `MISSING_REG_TOKEN` | Кука `reg_token` отсутствует |
 | `complete` | 401 | `REG_TOKEN_INVALID` | JWT не прошёл проверку подписи/срока |
@@ -502,9 +502,9 @@ src/crm/
 
 ### HTTP-клиент
 
-`CRMClient` держит один `httpx.AsyncClient` на весь срок жизни процесса (`_http` — класс-переменная, lazy-инициализация при первом запросе). TCP-соединение к CRM переиспользуется между вызовами через HTTP/1.1 keep-alive.
+Один `httpx.AsyncClient` на весь срок жизни процесса, общий для всех CRM-классов (`TaskManager`, `SubtaskManager`, `CRMUserSelector`, `CRMUserRegistrar`) — module-level singleton (`_shared_http_client` в `src/crm/client.py`), а не атрибут класса `CRMClient`. Ранее это была class-переменная с ленивой инициализацией через `classmethod`, но `cls._http = ...` внутри `classmethod` пишет атрибут в `__dict__` того класса, что передан как `cls`, а не мутирует `CRMClient` — при инстанцировании только через подклассы (`CRMClient` напрямую нигде не создаётся) каждый из четырёх наследников заводил свой собственный `AsyncClient` вместо одного разделяемого. Module-level переменная вне иерархии классов этой проблеме не подвержена. TCP-соединение к CRM переиспользуется между вызовами через HTTP/1.1 keep-alive.
 
-`aclose()` не вызывается явно: при завершении процесса OS закрывает сокеты. Для production с k8s/systemd потребуется инициализация в `lifespan` с явным `await CRMClient._http.aclose()` — это обеспечит drain in-flight запросов до `SIGKILL`.
+`aclose_http_client()` вызывается явно в `lifespan()` (`src/main.py`) при shutdown — graceful-закрытие с drain in-flight запросов до `SIGKILL`, парная операция к ленивой инициализации при первом CRM-запросе.
 
 ### Формат запросов к API
 

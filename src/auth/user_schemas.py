@@ -55,7 +55,12 @@ class UserCreate(schemas.BaseUserCreate):
     # None если отчество не передано — Pydantic не подставляет пустую строку.
     patronymic: Optional[str] = None
     email: str
-    password: str
+    # max_length=72: bcrypt учитывает только первые 72 байта пароля и молча
+    # обрезает остальное (проверено эмпирически на bcrypt==4.1.2 — два разных
+    # пароля с общим 72-байтовым префиксом проходят проверку по хешу друг
+    # друга). Без верхней границы пользователь мог бы рассчитывать на энтропию
+    # длинного пароля, которой bcrypt на самом деле не учитывает.
+    password: str = Field(..., min_length=5, max_length=72)
     is_active: Optional[bool] = True
     is_verified: Optional[bool] = False
 

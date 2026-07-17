@@ -28,8 +28,11 @@ async def create_subtask(
     # scalar_one_or_none(): вернёт объект Task или None; SELECT FROM task WHERE id=?
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    # if task.owner_id != user.id:
-    #     raise HTTPException(status_code=403, detail="Forbidden")
+    # Namespace-проверка владельца намеренно не выполняется — Shared board: любой
+    # аутентифицированный пользователь может создавать подзадачи в любой задаче,
+    # это не забытая доработка. См. docs/task-manager-documentation.md и
+    # tests/test_subtasks.py::test_update_subtask_other_user_allowed, который
+    # фиксирует это поведение как ожидаемое.
 
     crm_subtask_id: Optional[int] = None
     # CRM-синхронизация возможна только если родительская задача зарегистрирована в CRM
@@ -86,7 +89,10 @@ async def create_subtask(
             status_code=409,
             detail=f"Subtask with title '{subtask.title}' already exists in this task",
         )
-    await db.refresh(db_subtask)                    # перечитать id и server_default из БД после commit
+    # db.refresh() не нужен: async_session_maker сконфигурирован с expire_on_commit=False
+    # (src/database.py) — атрибуты db_subtask не инвалидируются после commit(), а id уже
+    # заполнен через INSERT ... RETURNING id, который SQLAlchemy 2.0 + asyncpg используют
+    # автоматически при flush.
     await broadcast_task_event(
         "subtask_created", db_subtask.title,
         sender_email=user.email,  # email актора → data.sender для других пользователей
@@ -138,16 +144,24 @@ async def update_subtask(
     subtask_update: SubtaskUpdate,
     crm: SubtaskCRMSync,
 ) -> SubtaskResponse:
+    # FOR UPDATE: блокирует строку подзадачи на время обновления. Без этой блокировки
+    # конкурентный delete_task() для родительской задачи (services/tasks.py) мог бы
+    # прочитать и каскадно удалить эту же подзадачу уже после того, как SELECT ниже
+    # её прочитал, но до commit() этой функции — UPDATE применился бы к уже
+    # несуществующей строке (0 затронутых строк, без ошибки), а пользователь получил
+    # бы 200 OK на изменение уже удалённой подзадачи. FOR UPDATE заставляет
+    # delete_task() дождаться commit/rollback этой транзакции, прежде чем прочитать
+    # (и возможно удалить) эту же строку — см. симметричную блокировку subtask_rows
+    # в services/tasks.py::delete_task.
     db_subtask = (
-        await db.execute(select(Subtask).where(Subtask.id == subtask_id))
+        await db.execute(select(Subtask).where(Subtask.id == subtask_id).with_for_update())
     ).scalar_one_or_none()
     if db_subtask is None:
         raise HTTPException(status_code=404, detail="Subtask not found")
 
     task = await db.get(Task, db_subtask.task_id)   # SELECT FROM task WHERE id=?; гарантированно не None (FK)
-    # if task.owner_id != user.id:
-    #     raise HTTPException(status_code=403, detail="Forbidden")
-    # 403 Forbidden: пользователь не владеет родительской задачей → не может менять её подзадачи
+    # Namespace-проверка владельца намеренно не выполняется — см. create_subtask() выше
+    # и docs/task-manager-documentation.md про Shared board.
 
     task_title = task.title                          # захватить до commit (объект будет expired)
     update_data = subtask_update.model_dump(exclude_unset=True)
@@ -167,7 +181,7 @@ async def update_subtask(
             status_code=409,
             detail=f"Subtask with title '{title_for_err}' already exists in this task",
         )
-    await db.refresh(db_subtask)                    # перечитать актуальные данные из БД
+    # db.refresh() не нужен — см. пояснение в create_subtask() выше (expire_on_commit=False).
     await broadcast_task_event(
         "subtask_updated", db_subtask.title,
         sender_email=user.email,  # email актора → data.sender для других пользователей
@@ -207,15 +221,23 @@ async def update_subtask(
 async def delete_subtask(
     db: AsyncSession, user: User, subtask_id: int, crm: SubtaskCRMSync,
 ) -> SubtaskResponse:
+    # FOR UPDATE: та же защита, что и в update_subtask() выше. Без неё конкурентный
+    # delete_task() для родительской задачи мог бы прочитать crm_subtask_id этой же
+    # подзадачи в свой snapshot (subtask_rows) ДО того, как эта функция её удалит,
+    # и после каскадного удаления повторно вызвать crm.delete_subtask() для того же
+    # id — CRM получила бы два запроса на удаление одной записи. FOR UPDATE
+    # сериализует обе операции: только одна из них увидит существующую строку и
+    # реально удалит её в CRM, вторая получит 404 (строка уже не входит в результат
+    # блокирующего SELECT после commit конкурентной транзакции).
     subtask = (
-        await db.execute(select(Subtask).where(Subtask.id == subtask_id))
+        await db.execute(select(Subtask).where(Subtask.id == subtask_id).with_for_update())
     ).scalar_one_or_none()
     if subtask is None:
         raise HTTPException(status_code=404, detail="Subtask not found")
 
     task = await db.get(Task, subtask.task_id)      # SELECT FROM task WHERE id=?
-    # if task.owner_id != user.id:
-    #     raise HTTPException(status_code=403, detail="Forbidden")
+    # Namespace-проверка владельца намеренно не выполняется — см. create_subtask() выше
+    # и docs/task-manager-documentation.md про Shared board.
 
     task_title = task.title                          # захватить до commit (объект будет expired)
     parent_task_id = subtask.task_id                 # захватить до commit — для payload task_id
@@ -228,7 +250,7 @@ async def delete_subtask(
     await db.commit()                               # фиксируем; после этого запись в БД не существует
 
     # Удаляем файлы подзадачи с диска после commit.
-    attachments.cleanup(subtask_id, attachments.SUBTASK_ATTACHMENTS)
+    await attachments.cleanup(subtask_id, attachments.SUBTASK_ATTACHMENTS)
     await broadcast_task_event(
         "subtask_deleted", snapshot.title,
         sender_email=user.email,  # email актора → data.sender для других пользователей

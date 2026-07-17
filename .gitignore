@@ -18,7 +18,6 @@ env/
 # IDE
 .idea/
 .vscode/
-.claude/
 
 # Pytest / coverage
 .pytest_cache/

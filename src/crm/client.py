@@ -9,6 +9,51 @@ from src.crm.config import crm_settings
 
 logger = logging.getLogger(__name__)
 
+# Разделяемый клиент на уровне МОДУЛЯ, а не класса — Module-level Singleton:
+# Python кеширует модуль в sys.modules и выполняет его тело один раз при первом
+# импорте, поэтому переменная модуля неявно разделяется между всеми, кто его
+# импортирует, — без classmethod'ов и без hasattr-проверок. Новый TCP-пул и
+# TLS-хендшейк при каждом запросе (как в async with AsyncClient()) обходятся
+# в ~10–20 мс накладных расходов; один AsyncClient переиспользует HTTP/1.1
+# keep-alive соединения между вызовами.
+#
+# Раньше это был Classic Singleton на уровне класса (cls._http = ... внутри
+# classmethod на CRMClient — тот же принцип, что и типовой __new__ + hasattr/
+# is None). Такой синглтон надёжен, только если первым инстанцируется сам
+# базовый класс: тогда атрибут пишется в его __dict__, и подклассы находят его
+# обычным lookup по MRO. Но CRMClient никогда не инстанцируется напрямую —
+# используются только TaskManager, SubtaskManager, CRMUserSelector и
+# CRMUserRegistrar. Присваивание через cls внутри classmethod пишет атрибут
+# в __dict__ ТОГО класса, что передан как cls, а не мутирует атрибут родителя —
+# значит первый же вызов _get_client() у каждого из четырёх подклассов заводил
+# свой собственный httpx.AsyncClient, а CRMClient._http так и оставался None,
+# потому что ни один подкласс не писал в него напрямую. Итог — четыре
+# независимых TCP-пула вместо одного разделяемого (проверено эмпирически:
+# TaskManager()._get_client() is not SubtaskManager()._get_client() → True).
+#
+# Module-level singleton этой проблемы не имеет: здесь нет иерархии классов,
+# которая могла бы затенить переменную, — она одна на модуль независимо от
+# того, через какой класс к ней обращаются.
+_shared_http_client: httpx.AsyncClient | None = None
+
+
+def _get_shared_http_client() -> httpx.AsyncClient:
+    global _shared_http_client
+    if _shared_http_client is None:
+        _shared_http_client = httpx.AsyncClient(timeout=30.0)
+    return _shared_http_client
+
+
+async def aclose_http_client() -> None:
+    """Закрывает разделяемый CRM-клиент. Вызывается из lifespan() в main.py при shutdown.
+
+    Без этого TCP-соединения из пула AsyncClient остаются открытыми до завершения процесса.
+    """
+    global _shared_http_client
+    if _shared_http_client is not None:
+        await _shared_http_client.aclose()
+        _shared_http_client = None
+
 
 class CRMUnavailableError(Exception):
     """CRM-операция завершилась ошибкой (сеть, таймаут, невалидный ответ и т.д.).
@@ -212,17 +257,6 @@ class CRMClient:
             "content": base64.b64encode(abs_path.read_bytes()).decode(),
         }
 
-    # Разделяемый клиент на уровне класса: новый TCP-пул и TLS-хендшейк при каждом
-    # запросе (как в async with AsyncClient()) обходятся в ~10–20 мс накладных расходов.
-    # Один AsyncClient переиспользует HTTP/1.1 keep-alive соединения между вызовами.
-    _http: httpx.AsyncClient | None = None
-
-    @classmethod
-    def _get_client(cls) -> httpx.AsyncClient:
-        if cls._http is None:
-            cls._http = httpx.AsyncClient(timeout=30.0)
-        return cls._http
-
     def __init__(self):
         self.base_url: str = crm_settings.API_URL
         self.api_key: str = crm_settings.API_KEY
@@ -294,7 +328,7 @@ class CRMClient:
         safe_payload = {k: v for k, v in payload.items() if k not in ("key", "password")}
         logger.debug("CRM → %s | %s", full_url, safe_payload)
 
-        client = self._get_client()
+        client = _get_shared_http_client()
         try:
             response = await client.post(full_url, json=payload)
             response.raise_for_status()

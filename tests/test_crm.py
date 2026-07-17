@@ -11,7 +11,6 @@ import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.crm.client import CRMClient
 from src.crm.task_service import TaskManager
 from src.crm.user_service import CRMUserRegistrar, CRMUserSelector
 
@@ -46,10 +45,14 @@ def _err_resp(msg: str) -> MagicMock:
 
 
 def _patch_httpx(return_value=None, side_effect=None):
-    """Патчит CRMClient._http напрямую — _get_client() возвращает его без вызова конструктора.
+    """Патчит module-level singleton _shared_http_client напрямую — _get_shared_http_client()
+    возвращает его без вызова конструктора httpx.AsyncClient.
 
-    CRMClient кеширует AsyncClient в _http (класс-переменная). patch.object заменяет
-    значение на mock и восстанавливает None после patcher.stop().
+    Клиент — не атрибут класса CRMClient (см. src/crm/client.py: cls._http = ... в
+    classmethod создавал бы отдельный атрибут в каждом подклассе, а не мутировал
+    бы базовый — отсюда и перенос на module-level переменную), а module-level
+    переменная в src.crm.client. patch() подменяет её значение и восстанавливает
+    исходное (None) после patcher.stop().
     """
     mock_http = AsyncMock()
     if side_effect:
@@ -57,7 +60,7 @@ def _patch_httpx(return_value=None, side_effect=None):
     else:
         mock_http.post = AsyncMock(return_value=return_value)
 
-    patcher = patch.object(CRMClient, "_http", new=mock_http)
+    patcher = patch("src.crm.client._shared_http_client", new=mock_http)
     patcher.start()
     return patcher, mock_http
 

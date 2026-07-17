@@ -10,7 +10,7 @@ from src.auth.auth_config import (auth_backend, current_user,
                                   get_access_strategy, get_refresh_strategy,
                                   refresh_cookie_transport)
 from src.auth.manager import UserManager, get_user_manager
-from src.auth.user_schemas import is_valid_email_format, is_valid_password_format, PASSWORD_ERROR
+from src.auth.user_schemas import is_valid_email_format
 from src.crm.user_service import UserLookup, get_user_lookup
 
 logger = logging.getLogger(__name__)
@@ -32,16 +32,18 @@ async def login(
         user_manager: UserManager = Depends(get_user_manager),
         user_lookup: UserLookup = Depends(get_user_lookup),
 ):
-    # Предварительная валидация формата снижает нагрузку на БД при явно невалидных данных.
+    # Предварительная валидация формата email снижает нагрузку на БД при явно невалидных данных.
+    # Формат пароля здесь намеренно НЕ проверяется: /auth/login верифицирует уже существующий
+    # секрет (совпадает ли с сохранённым хешем), а не создаёт новый — валидация формы пароля
+    # уместна только там, где пароль задаётся (UserCreate, /auth/register/complete). Проверка
+    # формата на входе в систему означала бы вторую, независимую от хеша копию правил пароля:
+    # если PASSWORD_REGEX когда-нибудь изменится, пользователи с корректным, но не подходящим
+    # под новое правило паролем не смогут войти, хотя их хеш в БД никто не менял.
+    # Некорректный пароль и так корректно даст LOGIN_BAD_CREDENTIALS через authenticate() ниже.
     if not is_valid_email_format(credentials.username):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid email format",
-        )
-    if not is_valid_password_format(credentials.password):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=PASSWORD_ERROR,
         )
 
     user = await user_manager.authenticate(credentials)

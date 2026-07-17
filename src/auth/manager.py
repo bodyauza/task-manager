@@ -1,5 +1,6 @@
+import asyncio
 import logging
-from typing import Optional, Dict, Union
+from typing import Optional
 
 from fastapi import Depends, Request, Response
 from fastapi.security import OAuth2PasswordRequestForm
@@ -58,7 +59,17 @@ class UserManager(IntegerIDMixin, BaseUserManager[User, int]):
             else user_create.create_update_dict_superuser()
         )
         password = user_dict.pop("password")
-        user_dict["hashed_password"] = self.password_helper.hash(password)
+        # asyncio.to_thread: bcrypt (rounds=14, ~0.5с — см. комментарий у password_hash
+        # выше) — синхронный CPU-bound вызов. fastapi-users вызывает password_helper.hash()
+        # без await (не оборачивает сама), поэтому оставленный «как есть» синхронный вызов
+        # блокировал бы единственный event loop процесса на ~0.5с при каждой регистрации,
+        # замораживая вообще все остальные запросы приложения в этот момент — тот же приём,
+        # что уже применён для magic.from_buffer в src/utils/file_utils.py. Безопасно
+        # оборачивать именно здесь: create()/authenticate() — единственные во всём проекте
+        # места, где password_helper реально вызывается (BaseUserManager.forgot_password/
+        # reset_password/oauth_callback/_update недостижимы — их роутеры не подключены
+        # в src/main.py, а routers/users.py::update_user пароль не трогает).
+        user_dict["hashed_password"] = await asyncio.to_thread(self.password_helper.hash, password)
         user_dict["role_id"] = 1
         # username в Task Manager = часть email до '@'.
         # Та же логика применяется для username-поля при регистрации в CRM.
@@ -115,14 +126,21 @@ class UserManager(IntegerIDMixin, BaseUserManager[User, int]):
 
     async def authenticate(
             self,
-            credentials: Union[Dict[str, str], OAuth2PasswordRequestForm]
+            credentials: OAuth2PasswordRequestForm,
     ) -> Optional[models.UP]:
         """
         Аутентификация пользователя с защитой от timing-атак и автоматическим
         обновлением устаревших хешей паролей.
         """
-        email = credentials.get("email") if isinstance(credentials, dict) else credentials.username
-        password = credentials.get("password") if isinstance(credentials, dict) else credentials.password
+        # Сигнатура сужена до OAuth2PasswordRequestForm — как у родителя
+        # (BaseUserManager.authenticate), без нарушения LSP: override не может
+        # принимать МЕНЬШЕ типов, чем родитель формально гарантирует вызывающему
+        # коду, а не больше. Union[Dict[str, str], OAuth2PasswordRequestForm]
+        # был кодом на неиспользуемый сценарий — единственный вызов authenticate()
+        # во всём проекте (auth/endpoints.py::login) всегда передаёт
+        # OAuth2PasswordRequestForm, как и встроенный логин-роутер fastapi-users.
+        email = credentials.username
+        password = credentials.password
 
         try:
             user = await self.get_by_email(email)
@@ -130,11 +148,15 @@ class UserManager(IntegerIDMixin, BaseUserManager[User, int]):
             # Хешируем пароль даже при отсутствии пользователя: время ответа
             # сопоставимо с verify_and_update(), иначе по разнице в задержке
             # атакующий может определить, зарегистрирован ли данный email.
-            self.password_helper.hash(password)
+            # asyncio.to_thread — см. пояснение в create() выше.
+            await asyncio.to_thread(self.password_helper.hash, password)
             return None
 
-        verified, updated_password_hash = self.password_helper.verify_and_update(
-            password, user.hashed_password
+        # asyncio.to_thread — см. пояснение в create() выше: verify_and_update()
+        # внутри тоже запускает bcrypt (~0.5с), без выноса в поток блокирует event loop
+        # на каждый login.
+        verified, updated_password_hash = await asyncio.to_thread(
+            self.password_helper.verify_and_update, password, user.hashed_password
         )
         if not verified:
             return None

@@ -120,13 +120,37 @@ async def test_verify_code_max_attempts_blocks(client: AsyncClient, mock_smtp: d
             "/auth/register/verify-code",
             json={"email": VALID_EMAIL, "code": "000000"},
         )
-    # 4-й вызов: запись уже удалена после 3-й попытки — TOO_MANY_ATTEMPTS
+    # 4-й вызов: attempts>=3 уже зафиксированы — TOO_MANY_ATTEMPTS.
+    # Запись НЕ удаляется (см. test_max_attempts_does_not_bypass_rate_limit ниже) —
+    # именно created_at этой записи держит 60-секундный кулдаун следующего request-code.
     r = await client.post(
         "/auth/register/verify-code",
         json={"email": VALID_EMAIL, "code": "000000"},
     )
     assert r.status_code == 400
     assert r.json()["detail"] == "TOO_MANY_ATTEMPTS"
+
+
+async def test_max_attempts_does_not_bypass_rate_limit(client: AsyncClient, mock_smtp: dict):
+    """Регрессия: исчерпание попыток кода не должно обнулять 60-секундный
+    кулдаун request-code для того же email.
+
+    Раньше TOO_MANY_ATTEMPTS удалял pending-запись, и следующий request-code
+    не находил её и пропускал проверку кулдауна целиком — мгновенный новый
+    код без ожидания, цикл "request-code → 4×неверный код → request-code" можно
+    было повторять без пауз, теряя единственный дроссель против брутфорса кода.
+    """
+    await _request_code(client)
+
+    for _ in range(4):
+        await client.post(
+            "/auth/register/verify-code",
+            json={"email": VALID_EMAIL, "code": "000000"},
+        )
+
+    r = await _request_code(client)
+    assert r.status_code == 429
+    assert r.json()["detail"].startswith("RATE_LIMIT:")
 
 
 async def test_verify_code_invalid_format(client: AsyncClient, mock_smtp: dict):

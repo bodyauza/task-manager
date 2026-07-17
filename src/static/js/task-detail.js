@@ -62,11 +62,12 @@ function subtaskLabel(n) {
 
 function renderSpecification(relPath) {
     // relPath: "tasks/3/specification/a1b2_tz.pdf" или null.
-    // URL: /uploads/{relPath} — отдаётся StaticFiles mount на /uploads.
+    // URL: /uploads/{relPath} — аутентифицированный роутер (src/routers/uploads.py),
+    // требует access_token; не StaticFiles mount.
     const block = document.getElementById('specCurrent');
     if (relPath) {
         const link = document.getElementById('specLink');
-        link.href        = `/uploads/${relPath}`;           // StaticFiles mount /uploads
+        link.href        = `/uploads/${relPath}`;           // routers/uploads.py, требует access_token
         link.textContent = relPath.split('/').pop();        // только имя файла для отображения
         block.style.display = 'flex';                       // показываем блок с файлом
     } else {
@@ -300,19 +301,26 @@ document.addEventListener('DOMContentLoaded', function() {
         for (const f of pendingOtherFiles) fd.append('files', f);
 
         otherUploadInProgress = true;
-        const resp = await fetchWithAuth(`/tasks/${taskId}/files`, { method: 'POST', body: fd });
-        otherUploadInProgress = false;
-        if (!resp) return;
-        if (resp.ok) {
-            const data = await resp.json();
-            renderOtherFiles(data.other_file_paths);
-            const count = pendingOtherFiles.length;
-            pendingOtherFiles = [];
-            renderPendingOtherFiles();
-            showToast(`Загружено файлов: ${count}`, 'info');
-        } else {
-            const err = await resp.json();
-            showToast(err.detail || 'Ошибка загрузки файлов', 'warning');
+        try {
+            const resp = await fetchWithAuth(`/tasks/${taskId}/files`, { method: 'POST', body: fd });
+            if (!resp) return;
+            if (resp.ok) {
+                const data = await resp.json();
+                renderOtherFiles(data.other_file_paths);
+                const count = pendingOtherFiles.length;
+                pendingOtherFiles = [];
+                renderPendingOtherFiles();
+                showToast(`Загружено файлов: ${count}`, 'info');
+            } else {
+                const err = await resp.json();
+                showToast(err.detail || 'Ошибка загрузки файлов', 'warning');
+            }
+        } finally {
+            // finally, а не только после успешного resp: без него сетевой сбой
+            // (fetchWithAuth бросает исключение) оставлял бы otherUploadInProgress=true
+            // навсегда — не только блокируя повторную загрузку файлов, но и не давая
+            // удалить задачу через deleteTask() (тот же флаг проверяется и там).
+            otherUploadInProgress = false;
         }
     });
 });

@@ -90,7 +90,10 @@ async def create_task(
             except Exception as crm_exc:
                 logger.error("CRM compensating delete failed for crm_id=%s: %s", crm_task_id, crm_exc)
         raise HTTPException(status_code=409, detail=f"Task with title '{task.title}' already exists")
-    await db.refresh(db_task)
+    # db.refresh() здесь не нужен: async_session_maker сконфигурирован с
+    # expire_on_commit=False (src/database.py) — атрибуты db_task не инвалидируются
+    # после commit(), а id уже заполнен через INSERT ... RETURNING id, который
+    # SQLAlchemy 2.0 + asyncpg используют автоматически при flush.
     await broadcast_task_event("task_created", db_task.title, exclude_user_id=user.id, sender_email=user.email)
     result = TaskResponse.model_validate(db_task)
     result.crm_synced = crm_task_id is not None
@@ -99,17 +102,33 @@ async def create_task(
 
 async def list_tasks(db: AsyncSession, skip: int, limit: int) -> tuple[List[TaskResponse], int]:
     count_sq = _subtask_count_subquery()
+    # func.count().over(): оконная функция — считает общее число строк, прошедших
+    # WHERE (здесь — все задачи, фильтра нет), и прикрепляет его к каждой возвращённой
+    # строке. В отличие от отдельного SELECT COUNT(*), не требует второго round-trip
+    # к БД — единственное ограничение: если OFFSET увёл за пределы результата (страница
+    # пустая), окно не вернёт ни одной строки вместе с данными — см. фолбэк ниже.
     rows = (
         await db.execute(
-            select(Task, func.coalesce(count_sq.c.cnt, 0))
+            select(
+                Task,
+                func.coalesce(count_sq.c.cnt, 0),
+                func.count().over().label("total"),
+            )
             .outerjoin(count_sq, Task.id == count_sq.c.task_id)
             .offset(skip)
             .limit(limit)
         )
     ).all()
-    total = (await db.execute(select(func.count()).select_from(Task))).scalar_one()
+    if rows:
+        total = rows[0][2]
+    else:
+        # Пустая страница (skip >= фактического количества строк) — count() over()
+        # ничего не вернул вместе с ней; единственный способ узнать total в этом
+        # редком случае — отдельный запрос (тот самый round-trip, которого мы
+        # избегаем в общем случае).
+        total = (await db.execute(select(func.count()).select_from(Task))).scalar_one()
     results = []
-    for task, cnt in rows:
+    for task, cnt, _total in rows:
         r = TaskResponse.model_validate(task)
         r.subtask_count = cnt
         results.append(r)
@@ -126,12 +145,24 @@ async def search_tasks(
     # Без экранирования поиск по строке «100%» найдёт все записи, а не только содержащие «100%».
     escaped = title.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     pattern = f"%{escaped}%"
-    tasks = (await db.execute(
-        select(Task).where(Task.title.ilike(pattern, escape="\\")).offset(skip).limit(limit)
-    )).scalars().all()
-    total = (await db.execute(
-        select(func.count()).select_from(Task).where(Task.title.ilike(pattern, escape="\\"))
-    )).scalar_one()
+    # func.count().over() — см. пояснение в list_tasks() выше: total в том же запросе,
+    # без отдельного round-trip, кроме редкого случая пустой страницы (фолбэк ниже).
+    rows = (
+        await db.execute(
+            select(Task, func.count().over().label("total"))
+            .where(Task.title.ilike(pattern, escape="\\"))
+            .offset(skip)
+            .limit(limit)
+        )
+    ).all()
+    if rows:
+        total = rows[0][1]
+        tasks = [row[0] for row in rows]
+    else:
+        total = (await db.execute(
+            select(func.count()).select_from(Task).where(Task.title.ilike(pattern, escape="\\"))
+        )).scalar_one()
+        tasks = []
     return tasks, total
 
 
@@ -180,7 +211,7 @@ async def update_task(
     except IntegrityError:
         await db.rollback()
         raise HTTPException(status_code=409, detail=f"Task with title '{title_to_report}' already exists")
-    await db.refresh(db_task)
+    # db.refresh() не нужен — см. пояснение в create_task() выше (expire_on_commit=False).
 
     crm_synced: Optional[bool] = None
     if crm_task_id is not None:
@@ -243,9 +274,23 @@ async def delete_task(
 
     # Один запрос до CASCADE-удаления: id нужен для очистки файлов на диске,
     # crm_subtask_id — для удаления подзадач в CRM. После commit оба недоступны.
+    #
+    # FOR UPDATE: блокирует все строки подзадач этой задачи перед снятием snapshot.
+    # Симметрично блокировкам в update_subtask()/delete_subtask() (services/subtasks.py):
+    # без неё эта функция могла бы прочитать crm_subtask_id подзадачи, которую
+    # конкурентно удаляет/обновляет прямой запрос DELETE /subtasks/{id} или
+    # PATCH /subtasks/{id}, и либо вызвать crm.delete_subtask() повторно для уже
+    # удалённого id, либо каскадно удалить подзадачу, которую параллельно
+    # редактирует другой пользователь, потеряв его обновление. FOR UPDATE заставляет
+    # эту транзакцию дождаться commit/rollback конкурентной операции над той же
+    # строкой; если та удалила подзадачу первой — эта SELECT просто не вернёт её
+    # (Postgres не включает в результат FOR UPDATE строку, которая была удалена и
+    # закоммичена транзакцией, державшей на неё блокировку).
     subtask_rows = (
         await db.execute(
-            select(Subtask.id, Subtask.crm_subtask_id).where(Subtask.task_id == task_id)
+            select(Subtask.id, Subtask.crm_subtask_id)
+            .where(Subtask.task_id == task_id)
+            .with_for_update()
         )
     ).all()
     subtask_ids: list[int] = [row[0] for row in subtask_rows]
@@ -254,13 +299,13 @@ async def delete_task(
     await db.delete(task)
     await db.commit()
 
-    attachments.cleanup(task_id, attachments.TASK_ATTACHMENTS)
+    await attachments.cleanup(task_id, attachments.TASK_ATTACHMENTS)
 
     # Файлы подзадач хранятся отдельно (uploads/subtasks/{id}/),
     # cleanup выше их не затрагивает — удаляем явно.
     if subtask_ids:
         for sub_id in subtask_ids:
-            attachments.cleanup(sub_id, attachments.SUBTASK_ATTACHMENTS)
+            await attachments.cleanup(sub_id, attachments.SUBTASK_ATTACHMENTS)
 
     # Удаляем подзадачи из CRM: CASCADE удалил их в локальной БД,
     # но CRM не знает об этом — подзадачи (entity_id=30) остались бы orphan-записями.

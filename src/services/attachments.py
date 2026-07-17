@@ -164,8 +164,9 @@ async def upload_specification(
 
     # Удаляем старый файл только после успешного commit: если commit упал бы раньше,
     # старый файл остался бы на диске и путь в БД не изменился бы → нет потери данных.
+    # asyncio.to_thread: unlink — синхронный блокирующий I/O, как и save_file/mkdir выше.
     if old_path:
-        old_path.unlink(missing_ok=True)
+        await asyncio.to_thread(old_path.unlink, missing_ok=True)
 
     # exclude_user_id не передаётся: broadcast идёт всем, включая актора — актор должен увидеть
     # собственное сообщение в чате (см. task-board.js). action="uploaded" различает
@@ -191,13 +192,20 @@ async def delete_specification(
         # 404: удалять нечего — файл не загружен
         raise HTTPException(status_code=404, detail="Specification file not found")
 
-    (UPLOAD_ROOT / entity.specification_path).unlink(missing_ok=True)
+    # Путь на диске захватываем до commit; удалим файл только после успешного commit —
+    # симметрично upload_specification: если commit упадёт, путь в БД не изменится,
+    # а файл на диске останется на месте (нет расхождения БД↔диск).
+    old_path = UPLOAD_ROOT / entity.specification_path
 
     crm_id = config.get_crm_id(entity)
     extra = await config.event_extra(db, entity)  # захватить до commit — иначе MissingGreenlet после expire
     title = extra.pop("title")
     entity.specification_path = None
     await db.commit()
+
+    # asyncio.to_thread: unlink — синхронный блокирующий I/O; без выноса в поток
+    # он держит event loop занятым на время удаления, как и запись файла в upload_specification.
+    await asyncio.to_thread(old_path.unlink, missing_ok=True)
 
     if crm_id is not None:
         try:
@@ -341,7 +349,10 @@ async def delete_other_file(
     if target is None:
         raise HTTPException(status_code=404, detail=f"Файл '{filename}' не найден")
 
-    (UPLOAD_ROOT / target).unlink(missing_ok=True)
+    # Путь на диске захватываем до commit; удалим файл только после успешного commit —
+    # та же инвариантность, что и в upload_specification/delete_specification: если
+    # commit упадёт, JSONB-запись не изменится, а файл на диске останется на месте.
+    target_path = UPLOAD_ROOT / target
 
     updated = [p for p in existing if p != target]
     crm_id = config.get_crm_id(entity)
@@ -350,6 +361,9 @@ async def delete_other_file(
     # NULL вместо [] при пустом списке: соответствует начальному состоянию колонки.
     entity.other_file_paths = updated if updated else None
     await db.commit()
+
+    # asyncio.to_thread: unlink — синхронный блокирующий I/O, тот же принцип, что и в save_file.
+    await asyncio.to_thread(target_path.unlink, missing_ok=True)
 
     if crm_id is not None:
         try:
@@ -371,13 +385,18 @@ async def delete_other_file(
 # Каскадное удаление файлов при удалении задачи/подзадачи
 # ════════════════════════════════════════════════════════════
 
-def cleanup(entity_id: int, config: AttachmentConfig) -> None:
+async def cleanup(entity_id: int, config: AttachmentConfig) -> None:
     """Удаляет директорию uploads/{dir_segment}/{entity_id}/ со всем содержимым.
 
     Вызывается ПОСЛЕ db.commit(), когда сущность уже удалена из БД (и для задачи —
     PostgreSQL CASCADE уже удалил подзадачи). shutil.rmtree: рекурсивное удаление;
     ignore_errors=True — не падает, если директория не существует (сущность без файлов).
+
+    asyncio.to_thread: shutil.rmtree — синхронный блокирующий I/O по дереву каталогов;
+    без выноса в поток удаление задачи с большим деревом подзадач/файлов держало бы
+    event loop занятым на всё время обхода файловой системы, замораживая остальные
+    запросы приложения — тот же принцип, что и у save_file/unlink в этом модуле.
     """
     entity_dir = UPLOAD_ROOT / config.dir_segment / str(entity_id)
-    shutil.rmtree(entity_dir, ignore_errors=True)
+    await asyncio.to_thread(shutil.rmtree, entity_dir, ignore_errors=True)
     logger.info("Cleaned up files for %s %s", config.singular_name, entity_id)

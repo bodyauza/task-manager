@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
+from starlette.middleware.gzip import GZipMiddleware
 
 from src.auth.auth_config import fastapi_users
 from src.auth.endpoints import auth_router
@@ -15,6 +16,7 @@ from src.auth.models import Role
 from src.auth.registration_endpoints import registration_router
 from src.auth.user_schemas import UserCreate, UserRead
 from src.config import settings
+from src.crm.client import aclose_http_client
 from src.database import async_session_maker
 from src.realtime import websocket_router
 from src.routers.pages import router as pages_router
@@ -80,12 +82,13 @@ async def lifespan(app: FastAPI):
     # Директория uploads/ отдельно здесь не создаётся: src.routers.uploads (импортирован
     # выше, до определения lifespan) уже гарантирует её существование на уровне модуля —
     # через UPLOAD_ROOT.mkdir(...), путь к которому вычисляется от __file__, а не от cwd
-    # процесса. Прежняя версия использовала здесь Path("src/static/uploads") — путь,
-    # относительный к рабочей директории запуска, а не к расположению файла: при запуске
-    # с cwd, отличным от корня репозитория (например, из src/), он создавал каталог по
-    # ошибочному адресу (src/src/static/uploads/) вместо src/static/uploads/.
+    # процесса.
     await create_initial_roles()
     yield
+    # Закрываем разделяемый httpx.AsyncClient CRM-модуля, иначе TCP-соединения
+    # из его пула остаются открытыми до завершения процесса. Парная операция к
+    # ленивому созданию клиента в src/crm/client.py::_get_shared_http_client().
+    await aclose_http_client()
 
 """
 uvicorn запускает приложение
@@ -143,6 +146,26 @@ app.add_middleware(
         "Authorization",
     ],
 )
+
+# minimum_size=1000: не сжимать совсем маленькие ответы — сам overhead gzip-заголовков
+# и CPU на сжатие/разжатие для них не окупается. JS/CSS/JSON-ответы обычно заметно
+# больше этого порога и от сжатия реально выигрывают.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+@app.middleware("http")
+async def add_static_cache_header(request: Request, call_next):
+    response = await call_next(request)
+    # Cache-Control только для /static/*: имена файлов НЕ версионируются (нет хеша
+    # в пути вроде task-board.abcd1234.js), поэтому immutable/год кеша здесь были бы
+    # ловушкой — после деплоя новой версии JS браузер продолжал бы отдавать старый
+    # файл из кеша до истечения срока. max-age=3600 — разумный компромисс: ощутимо
+    # снижает число повторных запросов статики внутри одной сессии пользователя, но
+    # не рискует держать устаревший JS сутками после деплоя.
+    if request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
+
 
 @app.middleware("http")
 async def add_csp_header(request: Request, call_next):
