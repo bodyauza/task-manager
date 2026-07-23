@@ -129,7 +129,9 @@ _static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 # Все запросы вида GET /static/js/task-board.js перехватываются StaticFiles
 # и не доходят до обычных FastAPI-роутеров.
 # name="static" — псевдоним для url_path_for("static", path="...") в шаблонах Jinja2.
-app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+app.mount("/static",
+          StaticFiles(directory=_static_dir),
+          name="static")
 
 # cors_origins задан для dev-окружения. В production список нужно сузить
 # до реального домена приложения и убрать все localhost-адреса.
