@@ -5,13 +5,13 @@
 этого не знает и знать не должен (см. manager.py).
 """
 
-from src.realtime.manager import Broadcaster, connection_manager
+from src.realtime.connection_manager import Broadcaster, connection_manager
 
 
 async def broadcast_task_event(
     event_type: str,                    # тип события: "task_created", "subtask_updated" и т.д.
     title: str,                         # основное поле payload: title задачи или подзадачи
-    exclude_user_id: int | None = None, # серверный фильтр: broadcaster пропустит этот uid
+    exclude_user_id: int | None = None,  # серверный фильтр: broadcaster пропустит этот uid
     sender_email: str = "",             # email инициатора → data.sender в payload клиента
     broadcaster: Broadcaster = connection_manager,
     # DIP: зависимость от абстракции Broadcaster, а не от конкретного

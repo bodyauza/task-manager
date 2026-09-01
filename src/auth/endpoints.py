@@ -4,10 +4,9 @@ from typing import Optional
 from fastapi import Cookie, Depends, APIRouter, Response, status, HTTPException
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi_users import models
 
-from src.auth.auth_config import (auth_backend, current_user,
-                                  get_access_strategy, get_refresh_strategy,
+from src.auth.auth_config import (auth_backend, get_access_strategy,
+                                  get_refresh_strategy,
                                   refresh_cookie_transport)
 from src.auth.manager import UserManager, get_user_manager
 from src.auth.user_schemas import is_valid_email_format
@@ -134,7 +133,20 @@ async def get_access_token(
 
 
 @auth_router.post("/do-logout")
-async def do_logout(user: models.UP = Depends(current_user)):
+async def do_logout():
+    # Без Depends(current_user): логаут обязан очищать куки независимо от того,
+    # валиден ли ещё access_token. access_token живёт всего 30 минут (settings.ACCESS_EXP);
+    # если бы здесь стоял Depends(current_user), просроченный access_token давал бы 401
+    # ДО тела функции — ни одна из строк ниже не выполнялась бы, ни одна кука не
+    # очищалась бы. Дальше 401 перехватывает global exception_handler в main.py
+    # (Accept: text/html у обычной формы) и превращает его в редирект на "/" —
+    # пользователь видит обычный переход на страницу входа и считает, что вышел,
+    # а его refresh_token (живёт 7 дней) остаётся в браузере полностью рабочим.
+    # Проверено эмпирически: POST с просроченным access_token давал 302 на "/" и
+    # ни одного заголовка Set-Cookie в ответе. Логаут не должен требовать валидную
+    # сессию для собственного выполнения — это его единственная задача, и она обязана
+    # быть идемпотентной: очистка уже отсутствующих кук — не ошибка, а no-op.
+    #
     # Форм-based вариант выхода: браузер POST-ом отправляет форму (не fetch),
     # поэтому ответ — 303 See Other, а не JSON 200.
     # 303 заставляет браузер перейти на GET "/" — это исключает повторную отправку
@@ -151,9 +163,16 @@ async def do_logout(user: models.UP = Depends(current_user)):
 
 
 @auth_router.post("/logout")
-async def logout(
-        user: models.UP = Depends(current_user),
-):
+async def logout():
+    # Без Depends(current_user) — та же причина, что и в do_logout() выше: логаут
+    # обязан очищать куки независимо от того, валиден ли ещё access_token, иначе
+    # именно в наиболее вероятном сценарии (пользователь бездействовал дольше 30 минут,
+    # затем нажал «Выйти») refresh_token остаётся в браузере рабочим при видимом
+    # «успешном» выходе. profile.js подстраховывался от этого клиентской логикой
+    # (retry после 401 через /auth/access-token) — но полагаться только на неё
+    # неверно: прямой POST /auth/logout без этой JS-обвязки (curl, другой клиент)
+    # страдал бы от той же дыры. Чинить нужно на сервере.
+    #
     # JS-вариант выхода: fetch-запрос из profile.js ждёт JSON 200,
     # после чего JS выполняет window.location.replace('/').
     json_response = JSONResponse(

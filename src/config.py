@@ -9,7 +9,7 @@ BASE_DIR = os.path.dirname(__file__)
 # override=False: переменные, уже установленные в os.environ (например, через shell),
 # имеют приоритет над значениями из файлов .env.
 # Порядок важен: .dev.env загружается первым и «захватывает» переменные, не заданные
-# в os.environ. Это нужно для crm/config.py, который читает CRM_* через os.getenv()
+# в os.environ. Это нужно для crm/crm_config.py, который читает CRM_* через os.getenv()
 # напрямую, минуя pydantic-settings.
 load_dotenv(os.path.join(BASE_DIR, ".dev.env"),   override=False)
 load_dotenv(os.path.join(BASE_DIR, ".tests.env"), override=False)
@@ -49,7 +49,14 @@ class Settings(BaseSettings):
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 10
 
-    SMTP_HOST: str = "smtp.yandex.ru"
+    # Нет значения по умолчанию: дефолт вида "smtp.yandex.ru" молча привязал бы проект
+    # к конкретному почтовому провайдеру — при разворачивании на другом инстансе без
+    # явного SMTP_HOST письма подтверждения email тихо шли бы через чужой SMTP-сервер
+    # (или падали бы с ошибкой аутентификации, которую трудно связать с причиной).
+    # Та же логика, что и у REG_TOKEN_SECRET выше — конфигурация внешнего сервиса не
+    # должна иметь скрытого дефолта. SMTP_PORT=465 оставлен с дефолтом: это стандартный
+    # порт SMTPS (implicit TLS), не привязанный к конкретному провайдеру.
+    SMTP_HOST: str
     SMTP_PORT: int = 465
     SMTP_USER: str = ""
     SMTP_PASSWORD: str = ""
@@ -61,13 +68,23 @@ class Settings(BaseSettings):
     REG_TOKEN_SECRET: str
     REG_TOKEN_EXP: int = 1200  # 20 минут
 
-    cors_origins: list[str] = [
-        "http://localhost",
-        "http://localhost:8080",
-        "http://127.0.0.1:8000",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ]
+    # Раньше был захардкожен как список Python-литералов прямо в классе, без связи с
+    # переменными окружения — ProductionSettings его не переопределял, и смена origin'ов
+    # для прода требовала правки этого файла, а не .env (см. историческую пометку об
+    # этом в main.py у CORSMiddleware). CORS_ORIGINS_CSV — строка через запятую, а не
+    # list[str]: pydantic-settings по умолчанию ожидает JSON-массив для env-значения
+    # list[...], что неудобно писать в .env-файле; CSV проще. Дефолт ниже — только
+    # localhost/127.0.0.1 для dev/test; для прода ОБЯЗАТЕЛЬНО переопределить через .env
+    # реальным доменом приложения — иначе браузер будет блокировать запросы с фронтенда,
+    # т.к. его Origin не попадёт в список.
+    CORS_ORIGINS_CSV: str = (
+        "http://localhost,http://localhost:8080,http://127.0.0.1:8000,"
+        "http://localhost:3000,http://127.0.0.1:3000"
+    )
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.CORS_ORIGINS_CSV.split(",") if origin.strip()]
 
     @property
     def ASYNC_DATABASE_URL(self):
@@ -121,7 +138,7 @@ settings = get_settings()
       если KEY уже есть в os.environ    → пропускает (override=False)
     Результат в локальной разработке:
       os.environ["API_MODE"]    = "dev"
-      os.environ["CRM_API_URL"] = "https://..."   ← нужен crm/config.py через os.getenv()
+      os.environ["CRM_API_URL"] = "https://..."   ← нужен crm/crm_config.py через os.getenv()
       os.environ["DB_HOST"]     = "localhost"
       os.environ["DB_NAME"]     = "clients"
       ...все остальные переменные из .dev.env
@@ -149,7 +166,7 @@ settings = get_settings()
     Источники значений в порядке убывания приоритета:
       1. os.environ           (заполнен load_dotenv на шаге [2])
       2. env_file=".dev.env"  (повторно читается как резервный источник)
-      3. default в классе     (SMTP_HOST="smtp.yandex.ru", SMTP_PORT=465, ...)
+      3. default в классе     (SMTP_PORT=465, CORS_ORIGINS_CSV="http://localhost,...", ...)
 
     Для каждого объявленного поля:
       api_mode: str      → os.environ["API_MODE"]    = "dev"           → "dev"
@@ -160,7 +177,7 @@ settings = get_settings()
 
     extra="ignore": переменные из .dev.env, не объявленные в Settings
     (CRM_API_URL, CRM_API_KEY, ...), молча отбрасываются — они нужны
-    только crm/config.py через os.getenv(), не через pydantic.
+    только crm/crm_config.py через os.getenv(), не через pydantic.
 
 [7] settings = <DevelopmentSettings object>
     Объект создан и привязан к имени settings на уровне модуля.

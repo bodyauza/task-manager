@@ -4,7 +4,7 @@ from httpx import AsyncClient, ASGITransport
 from sqlalchemy import select
 from unittest.mock import AsyncMock, patch
 
-from src.auth.models import Role, User
+from src.auth.user_models import Role, User
 from src.crm.subtask_service import get_subtask_crm_sync
 from src.crm.task_service import get_task_crm_sync
 from src.crm.user_service import get_user_lookup, get_user_registrar

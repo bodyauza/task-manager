@@ -1,12 +1,25 @@
 import logging
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 
 import aiosmtplib
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from src.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Отдельный от src/routers/pages.py Environment: тот заточен под Starlette
+# TemplateResponse(request, ...) и требует объект Request, которого здесь нет
+# (письмо отправляется из сервисного слоя, не из HTTP-обработчика). Плюс auth/
+# не должен зависеть от routers/ — стрелка зависимостей в проекте идёт только
+# в обратную сторону (routers → services/auth, не наоборот).
+_TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates" / "email"
+_env = Environment(
+    loader=FileSystemLoader(_TEMPLATES_DIR),
+    autoescape=select_autoescape(["html"]),
+)
 
 
 async def send_confirmation_code(to_email: str, code: str) -> None:
@@ -24,20 +37,11 @@ async def send_confirmation_code(to_email: str, code: str) -> None:
         "Код действителен 15 минут.\n"
         "Если вы не запрашивали регистрацию — проигнорируйте это письмо."
     )
-    html = (
-        "<html><body style=\"font-family:'Segoe UI',Arial,sans-serif;"
-        "color:#212529;max-width:480px;margin:0 auto;padding:24px\">"
-        "<p style=\"font-size:13px;font-weight:700;color:#003f6b;"
-        "letter-spacing:1.2px;text-transform:uppercase\">Task Manager</p>"
-        "<hr style=\"border:none;border-top:2px solid #003f6b;margin:0 0 20px\">"
-        "<p style=\"font-size:14px\">Ваш код подтверждения регистрации:</p>"
-        f"<div style=\"font-family:monospace;font-size:32px;font-weight:700;"
-        f"letter-spacing:12px;color:#003f6b;padding:16px 0\">{code}</div>"
-        "<p style=\"font-size:13px;color:#6c757d\">Код действителен <b>15 минут</b>.</p>"
-        "<p style=\"font-size:12px;color:#9e9e9e\">"
-        "Если вы не запрашивали регистрацию — проигнорируйте это письмо.</p>"
-        "</body></html>"
-    )
+    # HTML — в src/templates/email/confirmation-code.html, а не строкой в Python:
+    # редактировать вёрстку письма теперь можно как обычный .html-файл, не трогая
+    # логику отправки и не экранируя кавычки внутри f-string.
+    html = _env.get_template("confirmation-code.html").render(code=code)
+
     msg.attach(MIMEText(plain, "plain", "utf-8"))
     msg.attach(MIMEText(html, "html", "utf-8"))
 

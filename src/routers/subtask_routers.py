@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.auth_config import current_user       # DI: возвращает текущего аутентифицированного User
-from src.auth.models import User
+from src.auth.user_models import User
 from src.crm.subtask_service import SubtaskCRMSync, get_subtask_crm_sync
 from src.database import get_async_session          # DI: выдаёт AsyncSession из пула
 from src.services import subtasks as subtask_service

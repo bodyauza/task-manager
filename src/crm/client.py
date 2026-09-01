@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import logging
 from pathlib import Path
@@ -5,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from src.crm.config import crm_settings
+from src.crm.crm_config import crm_settings
 
 logger = logging.getLogger(__name__)
 
@@ -247,14 +248,26 @@ class CRMClient:
         return "true" if value else "false"
 
     @staticmethod
-    def _file_to_crm(abs_path: Path) -> dict:
+    async def _file_to_crm(abs_path: Path) -> dict:
         """Читает файл с диска и возвращает CRM-совместимый словарь.
 
         CRM ожидает файлы в виде {'name': 'filename.pdf', 'content': '<base64>'}.
+
+        asyncio.to_thread: read_bytes() — синхронный блокирующий I/O; файлы здесь
+        могут достигать MAX_FILE_SIZE (100 МБ, см. src/utils/file_utils.py), и без
+        выноса в поток чтение (плюс base64-кодирование результата) держало бы event
+        loop занятым на заметное время, замораживая все остальные запросы —
+        тот же принцип, что и у save_file/unlink/rmtree в src/services/attachments.py.
+        Метод асинхронный (а не обёрнут снаружи), чтобы для списка файлов
+        (other_file_abs_paths в task_service.py/subtask_service.py) вызовы можно
+        было передать в asyncio.gather не дожидаясь друг друга — тогда каждый
+        вызов почти сразу доходит до своего to_thread и реальное чтение с диска
+        идёт одновременно на нескольких потоках пула, а не по одному файлу за раз.
         """
+        content = await asyncio.to_thread(abs_path.read_bytes)
         return {
             "name":    abs_path.name,
-            "content": base64.b64encode(abs_path.read_bytes()).decode(),
+            "content": base64.b64encode(content).decode(),
         }
 
     def __init__(self):
@@ -272,6 +285,7 @@ class CRMClient:
         items: Optional[List[Dict[str, Any]]] = None,
         notify: bool = False,
         login_url: Optional[str] = None,
+        expect_id: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
         """Выполняет HTTP POST к REST API CRM и возвращает распакованный JSON.
@@ -281,13 +295,19 @@ class CRMClient:
         :param items:      Массив записей для action='insert' (список словарей)
         :param notify:     True → CRM отправляет email-уведомление новому пользователю
         :param login_url:  URL входа в CRM, вставляемый в тело письма-уведомления
+        :param expect_id:  True → дополнительно проверить, что "data" содержит непустой "id"
+                           (см. пояснение у проверки ниже). Используется для 'update'/'delete'
+                           над уже существующей CRM-записью — не для 'insert' (см. task_service.py/
+                           subtask_service.py, где expect_id=True стоит только на update_task/
+                           delete_task/update_subtask/delete_subtask).
         :param kwargs:     Дополнительные поля payload:
                            - filters          (dict)  — для action='select'
                            - select_fields    (str)   — для action='select', через запятую
                            - data             (dict)  — для action='update'
                            - update_by_field  (dict)  — для action='update', критерий поиска
                            - delete_by_field  (dict)  — для action='delete', критерий поиска
-        :raises Exception: При HTTP-ошибке, таймауте, невалидном JSON или ответе CRM с ошибкой
+        :raises Exception: При HTTP-ошибке, таймауте, невалидном JSON, ответе CRM с ошибкой
+                           или (при expect_id=True) отсутствии непустого id в успешном ответе
         """
         # demo_id — GET-параметр, идентифицирующий конкретный demo-инстанс CRM.
         full_url = self.base_url
@@ -361,5 +381,22 @@ class CRMClient:
                 result.get("msg") or result.get("error_message") or "Unknown CRM error"
             )
             raise Exception(f"CRM API error: {error_msg}")
+
+        # expect_id=True: CRM «Руководитель» на update/delete записи, которой на её
+        # стороне уже нет (например, удалена вручную через веб-интерфейс CRM после
+        # того, как задача/подзадача была создана из этого приложения), отвечает
+        # {"status": "success", "data": {"id": ""}} — is_success выше не ловит это:
+        # ключ "status" == "success" есть, ключей "error"/"error_message" нет. Без
+        # этой проверки такой ответ считался бы успешной синхронизацией
+        # (crm_synced=True в TaskResponse/SubtaskResponse), хотя CRM на самом деле
+        # не нашла и не изменила запись — проверено эмпирически на demo-инстансе
+        # CRM (см. docs/crm_issue.md). Проверяется только когда вызывающий код явно
+        # об этом просит (update/delete над существующей записью) — на insert
+        # "data.id" пустым не бывает, поэтому там expect_id не используется.
+        if expect_id:
+            data = result.get("data")
+            if not isinstance(data, dict) or not data.get("id"):
+                logger.warning("CRM: expected non-empty id in response data, got: %r", data)
+                raise Exception("CRM returned success but no valid id in data")
 
         return result

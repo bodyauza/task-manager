@@ -23,9 +23,12 @@ MAX_OTHER_FILES = 10
 
 # Единая точка определения корня файлового хранилища.
 # Вычисляется относительно этого файла (src/utils/file_utils.py):
-#   parent → src/utils/, parent → src/, / "static" / "uploads" → src/static/uploads/
+#   parent → src/utils/, parent → src/, / "uploads" → src/uploads/
+# Специально НЕ внутри src/static/: тот каталог целиком отдаётся публично через
+# app.mount("/static", StaticFiles(...)) в main.py, а доступ к uploads/ должен
+# идти только через аутентифицированный роутер src/routers/uploads.py.
 # Импортируется роутерами task_files.py и subtask_files.py — константа не дублируется.
-UPLOAD_ROOT = Path(__file__).resolve().parent.parent / "static" / "uploads"
+UPLOAD_ROOT = Path(__file__).resolve().parent.parent / "uploads"
 
 # Белый список допустимых расширений и соответствующих им MIME-типов.
 # Ключ — расширение в нижнем регистре (с точкой).
@@ -146,7 +149,7 @@ def safe_filename(original: str) -> str:
 def save_file(dest_dir: Path, filename: str, content: bytes) -> str:
     """Создаёт директорию (если нужно), записывает файл и возвращает относительный путь.
 
-    Возвращаемый путь — относительно src/static/uploads/, например:
+    Возвращаемый путь — относительно src/uploads/, например:
     "tasks/3/specification/a1b2c3d4_tz.pdf"
     Используется для хранения в БД и формирования URL: /uploads/<rel_path>.
 
@@ -156,7 +159,7 @@ def save_file(dest_dir: Path, filename: str, content: bytes) -> str:
     (dest_dir / filename).write_bytes(content)   # записать байты в файл
 
     # Строим относительный путь: всё, что идёт после директории "uploads/" в abs-пути.
-    # Пример: .../src/static/uploads/tasks/3/specification → "tasks/3/specification/file.pdf"
+    # Пример: .../src/uploads/tasks/3/specification → "tasks/3/specification/file.pdf"
     parts = dest_dir.parts
     uploads_idx = next((i for i, p in enumerate(parts) if p == "uploads"), None)
     if uploads_idx is None:

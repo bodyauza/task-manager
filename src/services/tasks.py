@@ -14,8 +14,9 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.exc import StaleDataError
 
-from src.auth.models import User
+from src.auth.user_models import User
 from src.crm.subtask_service import SubtaskCRMSync
 from src.crm.task_service import TaskCRMSync
 from src.realtime import broadcast_task_event
@@ -190,11 +191,28 @@ async def update_task(
     task_update: TaskUpdate,
     crm: TaskCRMSync,
 ) -> TaskResponse:
-    db_task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
+    # FOR NO KEY UPDATE (key_share=True, не FOR UPDATE): блокирует строку задачи на
+    # время обновления, но не конфликтует с FOR KEY SHARE, которую PostgreSQL берёт на
+    # родителя при параллельном create_subtask() (subtasks.py) — обновление
+    # title/description/completed не должно мешать созданию подзадач в этой же задаче.
+    # Конфликтует с FOR UPDATE конкурентного delete_task() (ниже в этом файле) — тот
+    # либо дождётся commit/rollback этой транзакции перед удалением, либо, если успел
+    # первым, эта SELECT просто не найдёт строку (db_task is None → 404 ниже).
+    #
+    # Без этой блокировки окно между SELECT и commit() ниже давало гонку: конкурентный
+    # delete_task() успевал удалить задачу между ними, и commit() падал не тихим
+    # no-op'ом (0 затронутых строк без ошибки), а sqlalchemy.orm.exc.StaleDataError —
+    # ORM при флаше UPDATE-а сверяет число реально задетых строк с числом
+    # обновляемых объектов и бросает исключение при несовпадении. StaleDataError не
+    # перехватывался веткой except IntegrityError ниже и улетал бы наверх голым 500
+    # вместо ожидаемого 404 — проверено эмпирически на реальной БД.
+    db_task = (
+        await db.execute(select(Task).where(Task.id == task_id).with_for_update(key_share=True))
+    ).scalar_one_or_none()
     if db_task is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # model_dump(exclude_unset=True): Pydantic хранит множество __fields_set__ —
+    # model_dump(exclude_unset=True): Pydantic хранит множество model_fields_set —
     # имена полей, явно переданных клиентом в теле запроса (не полученных из default).
     # Тело {"completed": true} даёт update_data = {"completed": True} без "title".
     # Без exclude_unset PATCH вёл бы себя как PUT: все поля попали бы в словарь
@@ -211,6 +229,14 @@ async def update_task(
     except IntegrityError:
         await db.rollback()
         raise HTTPException(status_code=409, detail=f"Task with title '{title_to_report}' already exists")
+    except StaleDataError:
+        # Защита на случай, если гонка с delete_task() всё же произойдёт несмотря на
+        # блокировку выше (например, при будущих изменениях кода) — вместо
+        # необработанного 500 клиент получает тот же 404, что и при обычном
+        # "задача не найдена". С блокировкой FOR NO KEY UPDATE выше этот путь не
+        # должен достигаться через delete_task() — см. комментарий у SELECT.
+        await db.rollback()
+        raise HTTPException(status_code=404, detail="Task not found")
     # db.refresh() не нужен — см. пояснение в create_task() выше (expire_on_commit=False).
 
     crm_synced: Optional[bool] = None
@@ -309,7 +335,10 @@ async def delete_task(
 
     # Удаляем подзадачи из CRM: CASCADE удалил их в локальной БД,
     # но CRM не знает об этом — подзадачи (entity_id=30) остались бы orphan-записями.
-    # asyncio.gather: параллельные запросы к CRM вместо последовательных (N×RTT → 1×RTT).
+    # asyncio.gather: конкурентные запросы к CRM вместо последовательных (N×RTT → 1×RTT).
+    # Не параллелизм — subtask_crm.delete_subtask() это httpx.AsyncClient.post(), чистый
+    # async-I/O без asyncio.to_thread; один поток ОС, конкурентное ожидание сетевых
+    # ответов через event loop, а не выполнение на нескольких потоках/ядрах.
     if crm_subtask_ids:
         results = await asyncio.gather(
             *[subtask_crm.delete_subtask(cid) for cid in crm_subtask_ids],

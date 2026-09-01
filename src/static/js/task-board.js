@@ -19,13 +19,12 @@ const statusDiv   = document.getElementById('status');
 let currentPage   = 1;
 
 // Размер страницы: сколько задач запрашивать за один вызов GET /tasks/.
-// Передаётся в URL как limit=5; бэкенд транслирует его в SQL LIMIT.
-// Константа намеренно объявлена здесь — изменение одного значения применяется
-// к skip-формуле, totalPages-расчёту и updatePagination() автоматически.
-const tasksPerPage = 5;
+// Передаётся в URL как limit=; бэкенд транслирует его в SQL LIMIT.
+// TASKS_PAGE_SIZE — общая константа из common.js (изменение применяется
+// к skip-формуле, totalPages-расчёту и updatePagination() автоматически).
 
 // Общее число страниц. Пересчитывается после каждого GET /tasks/ по формуле:
-//   Math.max(1, Math.ceil(X-Total-Count / tasksPerPage))
+//   Math.max(1, Math.ceil(X-Total-Count / TASKS_PAGE_SIZE))
 // Math.max(1, ...) исключает totalPages = 0 при пустом списке задач.
 let totalPages    = 1;
 
@@ -33,53 +32,8 @@ let totalPages    = 1;
 // но опечатку в имени переменной — поймает.
 const CHAT_HISTORY_KEY = 'websocket_chat_history';
 
-function escapeHtml(value) {
-    // Экранирует HTML-спецсимволы: < → &lt;  > → &gt;  & → &amp;  " → &quot;
-    // Метод: браузер сам выполняет экранирование при установке textContent.
-    // innerHTML возвращает уже безопасную строку для вставки в другой innerHTML.
-    const div = document.createElement('div');
-    div.textContent = String(value);
-    return div.innerHTML;
-}
-
-function _updateCharCounter(inputEl, counterEl, limit) {
-    const len = inputEl.value.length;
-    counterEl.textContent = len;
-    const wrapper = counterEl.closest('.char-counter');
-    // 90% порог даёт визуальное предупреждение за ~10 символов до лимита в 100.
-    wrapper.classList.toggle('limit-near', len >= limit * 0.9 && len < limit);
-    wrapper.classList.toggle('limit-reached', len >= limit);
-}
-
-function _getToastContainer() {
-    // Контейнер уведомлений создаётся лениво: его нет в статичном HTML,
-    // он добавляется в body при первом вызове showToast().
-    let c = document.getElementById('notifContainer');
-    if (!c) {
-        c = document.createElement('div');
-        c.id = 'notifContainer';
-        c.className = 'notif-container';
-        document.body.appendChild(c);
-    }
-    return c;
-}
-
-function showToast(message, type = 'info') {
-    const container = _getToastContainer();
-    const notif = document.createElement('div');
-    notif.className = `notif notif-${type}`;
-    notif.textContent = message;
-    container.appendChild(notif);
-    // requestAnimationFrame откладывает добавление класса до следующего кадра рендера.
-    // Если добавить класс сразу после appendChild, браузер не успевает зафиксировать
-    // начальное состояние transition (opacity: 0) и анимации появления не будет.
-    requestAnimationFrame(() => { notif.classList.add('notif-show'); });
-    setTimeout(() => {
-        notif.classList.remove('notif-show');
-        // Второй setTimeout ждёт завершения CSS-перехода (300 мс) перед удалением узла из DOM.
-        setTimeout(() => notif.remove(), 300);
-    }, 4000);
-}
+// escapeHtml, _updateCharCounter, showToast, fetchWithAuth, subtaskLabel — общие функции,
+// вынесены в common.js (подключён в task-board.html до этого скрипта).
 
 // Срез задач текущей страницы. Обновляется в displayTasks() при каждом GET /tasks/.
 // Используется в:
@@ -88,18 +42,6 @@ function showToast(message, type = 'info') {
 //   displaySearchResults() — дедупликация: результаты поиска добавляются к кэшу,
 //     чтобы openEditModal() находил задачи из поиска, а не только из текущей страницы списка.
 let currentTasks = [];
-
-// subtaskLabel — русское склонение числительных для счётчика подзадач.
-// Алгоритм работает по последней цифре (mod10), с отдельной обработкой чисел 11–14 (mod100):
-//   11, 12, 13, 14 — всегда «подзадач» (исключение из правила «1 → подзадача»).
-//   mod100 !== 11 в первом условии именно для этого: 11 % 10 === 1, но склонение иное.
-function subtaskLabel(n) {
-    const mod10 = n % 10;
-    const mod100 = n % 100;
-    if (mod10 === 1 && mod100 !== 11) return `${n} подзадача`;
-    if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return `${n} подзадачи`;
-    return `${n} подзадач`;
-}
 
 // ── Делегированный обработчик для кнопок, генерируемых динамически ──────────
 // Кнопки «Изменить» и «Удалить» создаются в displayTasks/displaySearchResults через innerHTML.
@@ -159,6 +101,76 @@ function addMessage(message) {
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
 
+// selfOrOther: общий паттерн для событий, где текст сообщения зависит от того,
+// кто их инициировал — сам текущий пользователь (actor) или кто-то другой.
+// Раньше был отдельный if/else с этой же проверкой в каждой из 5 веток обработчика.
+function selfOrOther(data, selfMsg, otherMsg) {
+    addMessage(String(data.actor_id) === userId ? selfMsg : otherMsg);
+}
+
+// Диспетчер по data.type — замена цепочки if/else if. Объект-поиск по ключу
+// вместо последовательных сравнений: не требует ни if/else if, ни switch,
+// и делает добавление нового типа события локальным изменением (один новый ключ),
+// а не правкой середины длинной цепочки условий.
+const MESSAGE_HANDLERS = {
+    chat: (data) => addMessage(`${data.sender}: ${data.text}`),
+
+    task_created: (data) => {
+        addMessage(`${data.sender}: Создана задача: ${data.title}`);
+        // При событиях от других пользователей перезагружаем текущую страницу,
+        // а не страницу 1: пользователь не теряет своё местоположение в списке.
+        loadTasks(currentPage);
+    },
+    task_updated: (data) => {
+        addMessage(`${data.sender}: Обновлена задача: ${data.title}`);
+        loadTasks(currentPage);
+    },
+    task_deleted: (data) => {
+        addMessage(`${data.sender}: Удалена задача: ${data.title}`);
+        loadTasks(currentPage);
+    },
+
+    subtask_created: (data) => {
+        selfOrOther(data,
+            `Subtask for task '${data.task_title}' created: '${data.title}'`,
+            `${data.sender}: Создана подзадача «${data.title}» [${data.task_title}]`);
+        loadTasks(currentPage);
+    },
+    subtask_updated: (data) => {
+        selfOrOther(data,
+            `Subtask for task '${data.task_title}' updated: '${data.title}'`,
+            `${data.sender}: Обновлена подзадача «${data.title}» [${data.task_title}]`);
+        loadTasks(currentPage);
+    },
+    subtask_deleted: (data) => {
+        selfOrOther(data,
+            `Subtask for task '${data.task_title}' deleted: '${data.title}'`,
+            `${data.sender}: Удалена подзадача «${data.title}» [${data.task_title}]`);
+        loadTasks(currentPage);
+    },
+
+    // Список задач не показывает файлы — loadTasks() здесь не нужен ни в одном из двух
+    // обработчиков ниже, событие влияет только на открытую страницу деталей (task-detail.js).
+    task_files_updated: (data) => {
+        selfOrOther(data,
+            data.action === 'deleted'
+                ? `Files removed from task "${data.title}"`
+                : `Files added to task "${data.title}"`,
+            data.action === 'deleted'
+                ? `${data.sender}: Удалены файлы у задачи «${data.title}»`
+                : `${data.sender}: Добавлены файлы к задаче «${data.title}»`);
+    },
+    subtask_files_updated: (data) => {
+        selfOrOther(data,
+            data.action === 'deleted'
+                ? `Files removed from subtask "${data.title}" [${data.task_title}]`
+                : `Files added to subtask "${data.title}" [${data.task_title}]`,
+            data.action === 'deleted'
+                ? `${data.sender}: Удалены файлы у подзадачи «${data.title}» [${data.task_title}]`
+                : `${data.sender}: Добавлены файлы к подзадаче «${data.title}» [${data.task_title}]`);
+    },
+};
+
 function connectWebSocket() {
     try {
         // wss: при HTTPS, ws: при HTTP — зеркалит протокол страницы.
@@ -183,65 +195,8 @@ function connectWebSocket() {
         socket.onmessage = function(event) {
             try {
                 const data = JSON.parse(event.data);
-                if (data.type === 'chat') {
-                    addMessage(`${data.sender}: ${data.text}`);
-                } else if (data.type === 'task_created') {
-                    addMessage(`${data.sender}: Создана задача: ${data.title}`);
-                    // При событиях от других пользователей перезагружаем текущую страницу,
-                    // а не страницу 1: пользователь не теряет своё местоположение в списке.
-                    loadTasks(currentPage);
-                } else if (data.type === 'task_updated') {
-                    addMessage(`${data.sender}: Обновлена задача: ${data.title}`);
-                    loadTasks(currentPage);
-                } else if (data.type === 'task_deleted') {
-                    addMessage(`${data.sender}: Удалена задача: ${data.title}`);
-                    loadTasks(currentPage);
-                } else if (data.type === 'subtask_created') {
-                    if (String(data.actor_id) === userId) {
-                        addMessage(`Subtask for task '${data.task_title}' created: '${data.title}'`);
-                    } else {
-                        addMessage(`${data.sender}: Создана подзадача «${data.title}» [${data.task_title}]`);
-                    }
-                    loadTasks(currentPage);
-                } else if (data.type === 'subtask_updated') {
-                    if (String(data.actor_id) === userId) {
-                        addMessage(`Subtask for task '${data.task_title}' updated: '${data.title}'`);
-                    } else {
-                        addMessage(`${data.sender}: Обновлена подзадача «${data.title}» [${data.task_title}]`);
-                    }
-                    loadTasks(currentPage);
-                } else if (data.type === 'subtask_deleted') {
-                    if (String(data.actor_id) === userId) {
-                        addMessage(`Subtask for task '${data.task_title}' deleted: '${data.title}'`);
-                    } else {
-                        addMessage(`${data.sender}: Удалена подзадача «${data.title}» [${data.task_title}]`);
-                    }
-                    loadTasks(currentPage);
-                } else if (data.type === 'task_files_updated') {
-                    // Список задач не показывает файлы — loadTasks() здесь не нужен,
-                    // событие влияет только на открытую страницу деталей задачи (task-detail.js).
-                    if (String(data.actor_id) === userId) {
-                        addMessage(data.action === 'deleted'
-                            ? `Files removed from task "${data.title}"`
-                            : `Files added to task "${data.title}"`);
-                    } else {
-                        addMessage(data.action === 'deleted'
-                            ? `${data.sender}: Удалены файлы у задачи «${data.title}»`
-                            : `${data.sender}: Добавлены файлы к задаче «${data.title}»`);
-                    }
-                } else if (data.type === 'subtask_files_updated') {
-                    if (String(data.actor_id) === userId) {
-                        addMessage(data.action === 'deleted'
-                            ? `Files removed from subtask "${data.title}" [${data.task_title}]`
-                            : `Files added to subtask "${data.title}" [${data.task_title}]`);
-                    } else {
-                        addMessage(data.action === 'deleted'
-                            ? `${data.sender}: Удалены файлы у подзадачи «${data.title}» [${data.task_title}]`
-                            : `${data.sender}: Добавлены файлы к подзадаче «${data.title}» [${data.task_title}]`);
-                    }
-                } else {
-                    addMessage(event.data);
-                }
+                const handler = MESSAGE_HANDLERS[data.type];
+                if (handler) handler(data); else addMessage(event.data);
             } catch (e) {
                 addMessage(event.data);
             }
@@ -258,7 +213,7 @@ function connectWebSocket() {
                 return;
             }
             // Нормальный разрыв (сеть, таймаут сервера) — переподключаемся через 3 секунды.
-            setTimeout(connectWebSocket, 3000);
+            setTimeout(connectWebSocket, WS_RECONNECT_DELAY_MS);
         };
 
         socket.onerror = function() {
@@ -268,7 +223,7 @@ function connectWebSocket() {
         };
     } catch (error) {
         addMessage('System: Failed to connect - ' + error);
-        setTimeout(connectWebSocket, 3000);
+        setTimeout(connectWebSocket, WS_RECONNECT_DELAY_MS);
     }
 }
 
@@ -286,47 +241,7 @@ function sendMessage() {
     }
 }
 
-// ── Auth helpers ──────────────────────────────────────────────────────────────
-
-// Singleton-промис для обновления access-токена.
-// Сценарий без синглтона: loadTasks() и updateTask() параллельно получают 401,
-// каждый вызывает POST /auth/access-token — без синглтона это лишний дублирующий
-// round-trip к серверу за одним и тем же новым access_token.
-// Синглтон: первый 401 стартует refresh, остальные await-ят тот же промис — один round-trip.
-let _refreshPromise = null;
-
-async function fetchWithAuth(url, options = {}) {
-    // credentials: 'include' — браузер прикрепляет httpOnly-куки (access_token, refresh_token)
-    // и сохраняет Set-Cookie из ответа. Без этого CORS-запрос не передаёт куки.
-    const opts = { credentials: 'include', ...options };
-    let resp = await fetch(url, opts);
-
-    if (resp.status === 401) {
-        if (!_refreshPromise) {
-            _refreshPromise = fetch('/auth/access-token', {
-                method: 'POST',
-                credentials: 'include',
-            }).finally(() => { _refreshPromise = null; });
-        }
-        const refreshResp = await _refreshPromise;
-        if (!refreshResp.ok) {
-            // refresh-токен истёк или отозван — сессия невосстановима.
-            window.location.href = '/';
-            return null;
-        }
-        // Повторяем исходный запрос; к этому моменту браузер уже сохранил новый access_token.
-        resp = await fetch(url, opts);
-    }
-
-    if (resp.status === 503) {
-        const body = await resp.clone().json().catch(() => ({}));
-        if (body.detail === 'CRM_UNAVAILABLE') {
-            alert('CRM недоступна, обратитесь в техподдержку Предприятия');
-        }
-    }
-
-    return resp;
-}
+// fetchWithAuth (и singleton _refreshPromise) — общая функция, вынесена в common.js.
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
 
@@ -339,7 +254,7 @@ function openEditModal(id) {
     editTitleEl.value = task.title;
     document.getElementById('editDescription').value = task.description;
     document.getElementById('editCompleted').checked = task.completed;
-    _updateCharCounter(editTitleEl, document.getElementById('editTitleCounter'), 100);
+    _updateCharCounter(editTitleEl, document.getElementById('editTitleCounter'), TITLE_MAX_LENGTH);
     document.getElementById('editModal').style.display = 'flex';
 }
 
@@ -486,14 +401,14 @@ function displaySearchResults(tasks) {
 async function loadTasks(page = 1) {
     currentPage = page;
     // skip — SQL OFFSET: сколько строк пропустить с начала таблицы.
-    // Формула (page - 1) * tasksPerPage переводит номер страницы (с 1) в смещение (с 0):
+    // Формула (page - 1) * TASKS_PAGE_SIZE переводит номер страницы (с 1) в смещение (с 0):
     //   page=1 → skip=0  → OFFSET 0  LIMIT 5 (строки 1–5)
     //   page=2 → skip=5  → OFFSET 5  LIMIT 5 (строки 6–10)
     //   page=3 → skip=10 → OFFSET 10 LIMIT 5 (строки 11–15)
-    const skip = (page - 1) * tasksPerPage;
+    const skip = (page - 1) * TASKS_PAGE_SIZE;
 
     try {
-        const response = await fetchWithAuth(`/tasks/?skip=${skip}&limit=${tasksPerPage}`);
+        const response = await fetchWithAuth(`/tasks/?skip=${skip}&limit=${TASKS_PAGE_SIZE}`);
         if (!response) return;
 
         if (response.ok) {
@@ -501,12 +416,12 @@ async function loadTasks(page = 1) {
             // X-Total-Count — нестандартный заголовок; бэкенд пишет в него результат
             // отдельного SELECT COUNT(*) без LIMIT/OFFSET. Клиент использует его для
             // вычисления количества страниц: нельзя определить totalPages только по длине
-            // тела ответа, потому что последняя страница может содержать меньше tasksPerPage записей.
+            // тела ответа, потому что последняя страница может содержать меньше TASKS_PAGE_SIZE записей.
             // Fallback tasks.length применяется если заголовок отсутствует (например, в тестах):
             // totalPages будет равен 1, что технически неверно, но не приведёт к ошибке.
             const totalHeader = response.headers.get('X-Total-Count');
             const total = totalHeader !== null ? parseInt(totalHeader, 10) : tasks.length;
-            totalPages = Math.max(1, Math.ceil(total / tasksPerPage));
+            totalPages = Math.max(1, Math.ceil(total / TASKS_PAGE_SIZE));
             displayTasks(tasks);
             updatePagination();
         } else {
@@ -682,8 +597,8 @@ window.addEventListener('load', function() {
     const editTitleInput = document.getElementById('editTitle');
     const editCounter    = document.getElementById('editTitleCounter');
 
-    titleInput.addEventListener('input', () => _updateCharCounter(titleInput, titleCounter, 100));
-    editTitleInput.addEventListener('input', () => _updateCharCounter(editTitleInput, editCounter, 100));
+    titleInput.addEventListener('input', () => _updateCharCounter(titleInput, titleCounter, TITLE_MAX_LENGTH));
+    editTitleInput.addEventListener('input', () => _updateCharCounter(editTitleInput, editCounter, TITLE_MAX_LENGTH));
 
     document.getElementById('messageInput').addEventListener('keypress', function(event) {
         if (event.key === 'Enter') sendMessage();

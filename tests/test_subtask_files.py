@@ -15,7 +15,7 @@ import json
 import pytest
 from httpx import AsyncClient
 
-from src.realtime.manager import connection_manager
+from src.realtime.connection_manager import connection_manager
 from tests.conftest import register_user
 
 EMAIL = "file_subtask@example.com"
@@ -44,6 +44,7 @@ class _ObserverWebSocket:
 def _pdf() -> bytes:
     return b'%PDF-1.4 fake pdf content for subtask tests'
 
+
 def _png() -> bytes:
     return b'\x89PNG\r\n\x1a\n fake png for subtask tests'
 
@@ -56,10 +57,12 @@ async def _auth(client: AsyncClient, mock_smtp: dict) -> None:
     # Логин принимает form-data с полем "username" (OAuth2PasswordRequestForm), а не JSON.
     await client.post("/auth/login", data={"username": EMAIL, "password": "Password1!"})
 
+
 async def _make_task(client: AsyncClient) -> dict:
     r = await client.post("/create-task/", json={"title": "SubFileTask", "description": "d"})
     assert r.status_code == 201
     return r.json()
+
 
 async def _make_subtask(client: AsyncClient, task_id: int) -> dict:
     r = await client.post(
@@ -69,8 +72,10 @@ async def _make_subtask(client: AsyncClient, task_id: int) -> dict:
     assert r.status_code == 201
     return r.json()
 
+
 def _spec_upload(content: bytes, filename: str = "tz.pdf") -> dict:
     return {"file": (filename, content, "application/octet-stream")}
+
 
 def _other_uploads(*pairs: tuple[bytes, str]) -> list[tuple]:
     return [("files", (name, data, "application/octet-stream")) for data, name in pairs]

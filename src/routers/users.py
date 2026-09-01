@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.auth_config import require_permission
-from src.auth.models import Role, User
+from src.auth.user_models import Role, User
 from src.auth.user_schemas import UserRead
 from src.database import get_async_session
 
@@ -81,7 +81,7 @@ async def update_user(
         setattr(user, field, value)
 
     # commit() запускает unit of work: SQLAlchemy формирует UPDATE person SET ... WHERE id=$1
-    # только для изменённых столбцов. username здесь не UNIQUE (см. auth/models.py) — IntegrityError
+    # только для изменённых столбцов. username здесь не UNIQUE (см. auth/user_models.py) — IntegrityError
     # маловероятен, но возможен (например, role_id указывает на роль, удалённую конкурентным
     # запросом ровно между валидацией выше и этим commit — FK-нарушение). try/except не даёт
     # такому конфликту улететь наверх голым 500.

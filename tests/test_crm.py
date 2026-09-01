@@ -239,7 +239,7 @@ async def test_create_task_crm_api_error():
 @pytest.mark.asyncio
 async def test_update_task_success():
     """update_task передаёт только заполненные поля."""
-    patcher, mock_http = _patch_httpx(_resp({}))
+    patcher, mock_http = _patch_httpx(_resp({"id": "17"}))
     try:
         result = await TaskManager().update_task(task_id=17, title="New Title", completed=True)
         assert result["status"] == "success"
@@ -249,6 +249,19 @@ async def test_update_task_success():
         assert payload["data"][_FIELD_DONE] == "true"
         assert _FIELD_DESCR not in payload["data"]
         assert payload["update_by_field"] == {"id": 17}
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_update_task_empty_id_raises():
+    """Регрессия (docs/crm_issue.md): если задачу удалили в CRM напрямую, CRM отвечает
+    "success" с пустым data.id вместо ошибки — expect_id должен превратить это в Exception,
+    чтобы update_task() в services/tasks.py выставил crm_synced=False, а не True."""
+    patcher, _ = _patch_httpx(_resp({"id": ""}))
+    try:
+        with pytest.raises(Exception, match="no valid id"):
+            await TaskManager().update_task(task_id=17, title="New Title")
     finally:
         patcher.stop()
 
@@ -280,7 +293,7 @@ async def test_update_task_connection_error():
 @pytest.mark.asyncio
 async def test_delete_task_success():
     """delete_task передаёт delete_by_field с CRM-ID."""
-    patcher, mock_http = _patch_httpx(_resp({}))
+    patcher, mock_http = _patch_httpx(_resp({"id": "17"}))
     try:
         result = await TaskManager().delete_task(task_id=17)
         assert result["status"] == "success"
@@ -288,6 +301,18 @@ async def test_delete_task_success():
         assert payload["action"] == "delete"
         assert payload["entity_id"] == TaskManager.ENTITY_ID
         assert payload["delete_by_field"] == {"id": 17}
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_delete_task_empty_id_raises():
+    """Регрессия (docs/crm_issue.md): та же дыра, что и в test_update_task_empty_id_raises,
+    но для delete_task() — повторное/запоздалое удаление уже отсутствующей в CRM записи."""
+    patcher, _ = _patch_httpx(_resp({"id": ""}))
+    try:
+        with pytest.raises(Exception, match="no valid id"):
+            await TaskManager().delete_task(task_id=17)
     finally:
         patcher.stop()
 

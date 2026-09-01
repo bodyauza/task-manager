@@ -13,7 +13,7 @@ from pwdlib.hashers.bcrypt import BcryptHasher
 from src.crm.client import CRMUnavailableError
 from src.crm.user_service import UserRegistrar, get_user_registrar
 
-from .models import User
+from .user_models import User
 from .user_repository import get_user_db
 
 logger = logging.getLogger(__name__)
@@ -81,7 +81,7 @@ class UserManager(IntegerIDMixin, BaseUserManager[User, int]):
         # что заблокирует ему вход (login-эндпоинт проверяет наличие в CRM).
         # Если PostgreSQL упадёт после успешного CRM — в CRM останется «висячая» запись;
         # сценарий маловероятен и требует ручной очистки через CRM-интерфейс.
-        from src.crm.config import crm_settings
+        from src.crm.crm_config import crm_settings
 
         try:
             await self.crm_registrar.register_user(

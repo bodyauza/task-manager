@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, File, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.auth_config import current_user
-from src.auth.models import User
+from src.auth.user_models import User
 from src.crm.subtask_service import SubtaskCRMSync, get_subtask_crm_sync
 from src.database import get_async_session
 from src.services import attachments

@@ -307,7 +307,7 @@ sequenceDiagram
 
 ### Файлы задач (требуют действующий `access_token`)
 
-Файлы хранятся на диске в `src/static/uploads/tasks/{task_id}/...`; в БД — только относительные пути (`specification_path`, `other_file_paths`). Раздача — не `StaticFiles`-mount, а отдельный маршрут `GET /uploads/{path}` с `Depends(current_user)`: файлы недоступны без авторизации. Допустимые форматы: `.pdf`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.jpg`, `.jpeg`, `.png`, `.txt` (расширение и MIME-сигнатура по magic bytes проверяются отдельно). Лимит размера — 100 МБ на файл. Загрузка/удаление синхронизируется с CRM best-effort и рассылает WebSocket-событие `task_files_updated`.
+Файлы хранятся на диске в `src/uploads/tasks/{task_id}/...`; в БД — только относительные пути (`specification_path`, `other_file_paths`). Раздача — не `StaticFiles`-mount, а отдельный маршрут `GET /uploads/{path}` с `Depends(current_user)`: файлы недоступны без авторизации. Допустимые форматы: `.pdf`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.jpg`, `.jpeg`, `.png`, `.txt` (расширение и MIME-сигнатура по magic bytes проверяются отдельно). Лимит размера — 100 МБ на файл. Загрузка/удаление синхронизируется с CRM best-effort и рассылает WebSocket-событие `task_files_updated`.
 
 - `POST /tasks/{task_id}/specification` — загрузить (или заменить) файл технического задания. `multipart/form-data`, поле `file`. `404` если задача не найдена, `413` при превышении размера, `422` при недопустимом расширении/MIME.
 - `DELETE /tasks/{task_id}/specification` — удалить файл ТЗ. `404` если файл не загружен.
@@ -316,7 +316,7 @@ sequenceDiagram
 
 ### Файлы подзадач (требуют действующий `access_token`)
 
-Аналогичные маршруты для подзадач, файлы — в `src/static/uploads/subtasks/{subtask_id}/...`, событие — `subtask_files_updated`:
+Аналогичные маршруты для подзадач, файлы — в `src/uploads/subtasks/{subtask_id}/...`, событие — `subtask_files_updated`:
 
 - `POST /subtasks/{subtask_id}/specification`, `DELETE /subtasks/{subtask_id}/specification`
 - `POST /subtasks/{subtask_id}/files`, `DELETE /subtasks/{subtask_id}/files/{filename}`
@@ -333,7 +333,7 @@ sequenceDiagram
 
 `ws://<host>/ws/tasks/{client_id}` — подключение требует куку `access_token`. Без неё сервер закрывает соединение с кодом `1008 Policy Violation`. Один и тот же маршрут используют `task-board.html` (полный клиент с чатом), `subtask-board.html` и страницы деталей `task-detail.html`/`subtask-detail.html` (реакция на события своей задачи/подзадачи — без чата).
 
-Реестр соединений (`src/realtime/manager.py`) хранит **набор** WebSocket-соединений на каждого пользователя (`dict[user_id, set[WebSocket]]`), а не одно — несколько одновременно открытых вкладок/устройств получают события независимо, новое подключение не вытесняет предыдущие.
+Реестр соединений (`src/realtime/connection_manager.py`) хранит **набор** WebSocket-соединений на каждого пользователя (`dict[user_id, set[WebSocket]]`), а не одно — несколько одновременно открытых вкладок/устройств получают события независимо, новое подключение не вытесняет предыдущие.
 
 Типы событий:
 
@@ -747,7 +747,7 @@ alembic revision --autogenerate -m "describe change"
 alembic upgrade head
 ```
 
-`alembic/env.py` загружает все ORM-модели через `import src.models`. `src/models/__init__.py` — единый реестр: импортирует `src.auth.models` (`User`, `Role`, `RegistrationPending`) и `src.task_logic.models` (`Task`). При добавлении новой модели достаточно добавить импорт в `src/models/__init__.py` — `alembic/env.py` менять не нужно.
+`alembic/env.py` загружает все ORM-модели через `import src.models`. `src/models/__init__.py` — единый реестр: импортирует `src.auth.user_models` (`User`, `Role`, `RegistrationPending`) и `src.task_logic.models` (`Task`). При добавлении новой модели достаточно добавить импорт в `src/models/__init__.py` — `alembic/env.py` менять не нужно.
 
 ### 7. Запустить сервер
 

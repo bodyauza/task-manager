@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.auth_config import current_user
-from src.auth.models import Role, User
+from src.auth.user_models import Role, User
 from src.database import get_async_session
 from src.task_logic.models import Subtask, Task
 

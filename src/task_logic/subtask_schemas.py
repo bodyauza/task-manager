@@ -57,7 +57,7 @@ class SubtaskResponse(BaseModel):
     # crm_synced отсутствует в ORM-модели; Pydantic подставит None по умолчанию;
     # роутер устанавливает вручную: result.crm_synced = crm_subtask_id is not None
 
-    # Путь к файлу ТЗ подзадачи относительно src/static/uploads/.
+    # Путь к файлу ТЗ подзадачи относительно src/uploads/.
     # Пример: "subtasks/7/specification/e5f6_spec.pdf". None — файл не загружен.
     specification_path: Optional[str] = None
 

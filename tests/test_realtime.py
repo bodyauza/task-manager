@@ -12,7 +12,7 @@
 import json
 
 from src.realtime.events import broadcast_task_event
-from src.realtime.manager import ConnectionManager
+from src.realtime.connection_manager import ConnectionManager
 
 
 class FakeWebSocket:
@@ -244,7 +244,7 @@ async def test_broadcast_task_event_defaults_are_empty():
 async def test_broadcast_task_event_uses_connection_manager_by_default():
     """Без явного broadcaster= функция реально доставляет сообщение через
     process-wide connection_manager — проверяем интеграцию с дефолтным DI."""
-    from src.realtime.manager import connection_manager
+    from src.realtime.connection_manager import connection_manager
 
     ws = FakeWebSocket()
     connection_manager.register(42, ws, "carol@example.com")

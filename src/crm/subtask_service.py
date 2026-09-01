@@ -1,8 +1,10 @@
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional, Protocol
 
 from src.crm.client import CRMClient              # базовый клиент: _call(), _http, аутентификация
+from src.crm.crm_config import crm_settings
 
 logger = logging.getLogger(__name__)              # логгер этого модуля для INFO/ERROR записей
 
@@ -29,23 +31,27 @@ class SubtaskCRMSync(Protocol):
 
 
 class SubtaskManager(CRMClient):
-    """CRUD-операции с подсущностью «Подзадачи» (entity_id=30).
+    """CRUD-операции с подсущностью «Подзадачи» (entity_id из crm_settings.SUBTASK_ENTITY_ID).
 
-    parent_item_id — CRM-ID задачи из сущности «Задачи» (entity_id=29),
+    parent_item_id — CRM-ID задачи из сущности «Задачи» (crm_settings.TASK_ENTITY_ID),
     то есть crm_task_id из локальной БД.
 
     Поля:
-        field_322 — Название (строка)
-        field_323 — Описание (текст)
-        field_324 — Статус   (чекбокс: "true" / "false")
+        FIELD_TITLE — Название (строка)
+        FIELD_DESCR — Описание (текст)
+        FIELD_DONE  — Статус   (чекбокс: "true" / "false")
+
+    Номера entity_id/field_* генерируются внутри конкретной инсталляции CRM и
+    отличаются между инстансами — не хардкодятся, читаются из crm_settings
+    (src/crm/crm_config.py), настраиваются через CRM_SUBTASK_* переменные окружения.
     """
 
-    ENTITY_ID   = 30    # ID сущности «Подзадачи» в CRM; «Задачи» — 29, «Пользователи» — 1
-    FIELD_TITLE = 322   # числовой ID поля «Название»; в payload: f"field_{322}" = "field_322"
-    FIELD_DESCR = 323   # числовой ID поля «Описание»
-    FIELD_DONE  = 324   # числовой ID поля «Статус» (чекбокс CRM принимает строки "true"/"false")
-    FIELD_SPEC  = 325   # ID поля «Техническое задание» (file upload, одиночный файл)
-    FIELD_OTHER = 326   # ID поля «Иные документы» (вложения, множественные файлы)
+    ENTITY_ID   = crm_settings.SUBTASK_ENTITY_ID           # ID подсущности «Подзадачи» в CRM
+    FIELD_TITLE = crm_settings.SUBTASK_FIELD_TITLE         # ID поля «Название»; в payload: f"field_{ID}"
+    FIELD_DESCR = crm_settings.SUBTASK_FIELD_DESCRIPTION   # ID поля «Описание»
+    FIELD_DONE  = crm_settings.SUBTASK_FIELD_COMPLETED     # ID поля «Статус» (чекбокс "true"/"false")
+    FIELD_SPEC  = crm_settings.SUBTASK_FIELD_SPECIFICATION  # ID поля «Техническое задание» (одиночный файл)
+    FIELD_OTHER = crm_settings.SUBTASK_FIELD_OTHER_FILES   # ID поля «Иные документы» (множественные файлы)
 
     async def create_subtask(
         self,
@@ -104,10 +110,16 @@ class SubtaskManager(CRMClient):
             data[f"field_{self.FIELD_SPEC}"] = []
         elif specification_abs_path is not None:
             # field_325: одиночный файл ТЗ подзадачи; CRM принимает список из одного элемента.
-            data[f"field_{self.FIELD_SPEC}"] = [self._file_to_crm(specification_abs_path)]
+            data[f"field_{self.FIELD_SPEC}"] = [await self._file_to_crm(specification_abs_path)]
         if other_file_abs_paths is not None:
             # None → поле не трогать; [] → очистить; [p1,…] → заменить всё содержимое.
-            data[f"field_{self.FIELD_OTHER}"] = [self._file_to_crm(p) for p in other_file_abs_paths]
+            # asyncio.gather запускает все _file_to_crm(...) не дожидаясь друг друга;
+            # каждый вызов сам выносит read_bytes() в отдельный поток через asyncio.to_thread
+            # (см. client.py) — поэтому сами чтения с диска идут одновременно в пуле потоков,
+            # а не по очереди. gather() уже возвращает list — оборачивать в list() не нужно.
+            data[f"field_{self.FIELD_OTHER}"] = await asyncio.gather(
+                *[self._file_to_crm(p) for p in other_file_abs_paths]
+            )
         if not data:
             return {"status": "skipped", "message": "No fields to update"}
 
@@ -116,7 +128,12 @@ class SubtaskManager(CRMClient):
             action="update",
             entity_id=self.ENTITY_ID,
             data=data,                          # только переданные поля, остальные не тронуты
-            update_by_field={"id": subtask_id}, # критерий: обновить запись с этим CRM-ID
+            update_by_field={"id": subtask_id},  # критерий: обновить запись с этим CRM-ID
+            # expect_id: если подзадачу удалили в CRM напрямую, CRM отвечает "success"
+            # с пустым data.id вместо ошибки — expect_id превращает это в Exception, чтобы
+            # вызывающий код (services/subtasks.py::update_subtask) выставил crm_synced=False.
+            # См. task_service.py::update_task и docs/crm_issue.md.
+            expect_id=True,
         )
 
     async def delete_subtask(self, subtask_id: int) -> Dict[str, Any]:
@@ -124,7 +141,8 @@ class SubtaskManager(CRMClient):
         return await self._call(
             action="delete",
             entity_id=self.ENTITY_ID,
-            delete_by_field={"id": subtask_id}, # CRM удалит запись по CRM-ID подзадачи
+            delete_by_field={"id": subtask_id},  # CRM удалит запись по CRM-ID подзадачи
+            expect_id=True,  # см. update_subtask выше
         )
 
 
