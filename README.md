@@ -357,6 +357,20 @@ sequenceDiagram
 
 ---
 
+## Архитектура приложения
+
+`src/main.py` собран по паттерну Application Factory: `create_app()` создаёт `FastAPI`-инстанс
+(docs-роуты, обработчики ошибок, `/static`-mount, middleware, все роутеры) и возвращает его;
+`app = create_app()` на уровне модуля — единственная точка входа для `uvicorn src.main:app`
+(см. `src/Dockerfile`) и для `from src.main import app` в `tests/conftest.py`. Само наполнение
+вынесено из `main.py` в отдельные модули:
+
+- **`src/middlewares.py`** (`register_middlewares(app)`) — CORS (`CORS_ORIGINS_CSV`), GZip, кеш-заголовок `Cache-Control` для `/static/*`, Content-Security-Policy.
+- **`src/errors_handlers.py`** (`register_errors_handlers(app)`) — 401 с `Accept: text/html` (браузерная навигация) редиректит на `/`; иначе — JSON-ответ для `fetch`.
+- **`src/static/js/common.js`** — общие frontend-константы (лимиты размера/числа файлов, размер страницы пагинации, задержка переподключения WebSocket), подключается тегом `<script>` до основного скрипта страницы на всех досках и страницах деталей — устраняет дублирование этих значений, которое раньше было в каждом из четырёх page-скриптов по отдельности.
+
+---
+
 ## Database Schema
 
 ```
@@ -381,10 +395,10 @@ person
 
 task
 ├── id                 INTEGER PK
-├── title              VARCHAR(100)
+├── title              VARCHAR(100)      (B-tree index + GIN pg_trgm index для ILIKE-поиска)
 ├── description        VARCHAR(2000)
 ├── completed          BOOLEAN
-├── owner_id           INTEGER FK → person.id
+├── owner_id           INTEGER FK → person.id (ondelete CASCADE)
 ├── crm_task_id        INTEGER NULL      (NULL = не синхронизировано с CRM)
 ├── specification_path VARCHAR NULL      (rel-путь к файлу ТЗ в uploads/)
 ├── other_file_paths   JSONB NULL        (список rel-путей «иных документов», до 10)
@@ -426,6 +440,8 @@ registration_pending
 | `0010` | Добавление `specification_path` (VARCHAR) и `other_file_paths` (Text) в `task` и `subtask` |
 | `0011` | Конвертация `other_file_paths` из `Text` в `JSONB` (`ALTER COLUMN ... TYPE JSONB USING ...::jsonb`) |
 | `0012` | Добавление недостающего `uq_person_email` (обнаружено `alembic check` — 0002 задумывался, но constraint не был применён); объединение `registration_pending.email` в один unique index вместо `constraint + дублирующий обычный индекс` |
+| `0013` | GIN-индекс `pg_trgm` (`ix_task_title_trgm`) на `task.title` — обычный B-tree не ускоряет `ILIKE("%...%")` с ведущим `%`, поиск по названию задачи (`search_tasks()`) до этой миграции всегда делал Seq Scan |
+| `0014` | `ON DELETE CASCADE` на `task.owner_id → person.id` — раньше каскад работал только через ORM (`session.delete(user)`), прямой SQL `DELETE FROM person` падал `IntegrityError`, если у пользователя оставались задачи |
 
 ---
 
@@ -460,6 +476,8 @@ Task Manager интегрирован с CRM-системой [«Руковод�
 
 ### Сущности CRM
 
+`entity_id` и номера полей ниже — это **дефолты** переменных окружения (`src/crm/crm_config.py`), а не константы в коде: генерируются внутри конкретной инсталляции CRM и могут отличаться на другом инстансе (production, другой клиент) — тогда меняется только `.dev.env`/`.env`, без правок кода. Значения ниже совпадают с demo-инстансом, на котором разрабатывался проект.
+
 | Сущность | entity_id | Поля |
 |---|---|---|
 | Пользователи | 1 | `group_id`, `firstname`, `lastname`, `username` (= email до `@`), `email`, `password` |
@@ -480,17 +498,43 @@ CRM_API_PASSWORD=api_password
 CRM_LOGIN_URL=https://your-crm-host/index.php?module=users/login
 CRM_DEMO_ID=          # оставить пустым для production, заполнить для demo-инстанса
 CRM_USER_GROUP_ID=6   # ID группы «Сотрудник» в CRM
+
+# entity_id сущностей/подсущностей и ID их полей (field_<ID> в payload) —
+# генерируются внутри конкретной инсталляции CRM, при смене инстанса меняются
+# только эти значения, без правок кода. Дефолты (см. src/crm/crm_config.py)
+# совпадают со значениями ниже — переменные можно не задавать, если инстанс тот же.
+CRM_TASK_ENTITY_ID=29
+CRM_SUBTASK_ENTITY_ID=30
+CRM_USER_ENTITY_ID=1
+
+CRM_TASK_FIELD_TITLE=317
+CRM_TASK_FIELD_DESCRIPTION=318
+CRM_TASK_FIELD_COMPLETED=319
+CRM_TASK_FIELD_SPECIFICATION=320
+CRM_TASK_FIELD_OTHER_FILES=321
+
+CRM_SUBTASK_FIELD_TITLE=322
+CRM_SUBTASK_FIELD_DESCRIPTION=323
+CRM_SUBTASK_FIELD_COMPLETED=324
+CRM_SUBTASK_FIELD_SPECIFICATION=325
+CRM_SUBTASK_FIELD_OTHER_FILES=326
+
+CRM_USER_FIELD_FIRSTNAME=7
+CRM_USER_FIELD_LASTNAME=8
+CRM_USER_FIELD_EMAIL=9
+CRM_USER_FIELD_USERNAME=12
+CRM_USER_FIELD_GROUP=6
 ```
 
 ### Структура модуля
 
 ```
 src/crm/
-├── config.py           # чтение CRM_* переменных окружения через os.getenv()
+├── crm_config.py       # чтение CRM_* переменных окружения через os.getenv(), включая entity_id/field_<ID>
 ├── client.py           # базовый HTTP-клиент (httpx async), метод _call(); CRMUnavailableError
 ├── user_service.py     # CRMUserSelector — поиск по email (логин); CRMUserRegistrar — регистрация (register_user)
-├── task_service.py     # CRUD-операции с задачами (entity_id=29)
-└── subtask_service.py  # CRUD-операции с подзадачами (entity_id=30)
+├── task_service.py     # CRUD-операции с задачами (entity_id по умолчанию 29)
+└── subtask_service.py  # CRUD-операции с подзадачами (entity_id по умолчанию 30)
 ```
 
 Каждый из четырёх сервисных файлов (`user_service.py` дважды — по одному Protocol на каждый класс)
@@ -699,11 +743,30 @@ REG_TOKEN_EXP=1200    # TTL reg_token, сек (20 мин)
 ```
 
 **SMTP (подтверждение email при регистрации)**
+
+Нет значения по умолчанию у `SMTP_HOST` — переменная обязательна: скрытый дефолт вида
+`smtp.yandex.ru` молча привязал бы любое развёртывание к конкретному провайдеру.
+
 ```ini
 SMTP_HOST=smtp.yandex.ru
 SMTP_PORT=465
 SMTP_USER=your@yandex.ru
 SMTP_PASSWORD=app_password   # пароль приложения, не пароль от аккаунта
+```
+
+HTML-тело письма с кодом подтверждения рендерится через Jinja2 из
+`src/templates/email/confirmation-code.html` (`src/auth/email_service.py`), не хранится
+как inline-строка в коде.
+
+**CORS**
+
+`CORS_ORIGINS_CSV` — список разрешённых origin через запятую (не JSON-массив: так удобнее
+писать в `.env`). Дефолт покрывает только `localhost`/`127.0.0.1` для dev/test — для
+production **обязательно** переопределить реальным доменом фронтенда, иначе браузер
+будет блокировать запросы.
+
+```ini
+CORS_ORIGINS_CSV=http://localhost,http://localhost:8080,http://127.0.0.1:8000,http://localhost:3000,http://127.0.0.1:3000
 ```
 
 **CRM «Руководитель»**
@@ -721,6 +784,10 @@ CRM_LOGIN_URL=https://your-crm-host/index.php?module=users/login
 CRM_DEMO_ID=               # пусто для production; номер demo-инстанса для тестовой среды
 CRM_USER_GROUP_ID=6        # ID группы «Сотрудник» в CRM (entity_id=1, поле group_id)
 ```
+
+`entity_id` сущностей/подсущностей CRM и ID их полей тоже настраиваются через `.env`
+(`CRM_TASK_ENTITY_ID`, `CRM_TASK_FIELD_TITLE`, `CRM_SUBTASK_*`, `CRM_USER_FIELD_*`) —
+полный список см. в разделе [«CRM «Руководитель» → Конфигурация»](#конфигурация) выше.
 
 `API_MODE=dev` отключает флаг `Secure` на куках — браузер отправляет их по `http://localhost`.
 В production `API_MODE=prod` допустим только при работе через HTTPS.
