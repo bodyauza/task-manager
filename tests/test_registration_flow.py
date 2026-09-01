@@ -2,7 +2,6 @@
 #   POST /auth/register/request-code  — отправка кода на email
 #   POST /auth/register/verify-code   — проверка кода, выдача reg_token cookie
 #   POST /auth/register/complete      — создание записи в person
-import pytest
 from httpx import AsyncClient
 
 from tests.conftest import promote_to_admin

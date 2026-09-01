@@ -1,4 +1,4 @@
-import src.auth.models  # noqa: F401
+import src.auth.user_models  # noqa: F401
 import src.task_logic.models  # noqa: F401
 
 """

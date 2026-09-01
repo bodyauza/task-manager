@@ -164,7 +164,7 @@ async def test_create_subtask_invalid_json():
 @pytest.mark.asyncio
 async def test_update_subtask_success():
     """update_subtask передаёт только заполненные поля в data."""
-    patcher, mock_http = _patch_httpx(_resp({}))
+    patcher, mock_http = _patch_httpx(_resp({"id": "55"}))
     try:
         result = await SubtaskManager().update_subtask(
             subtask_id=55, title="New Title", completed=True
@@ -177,6 +177,19 @@ async def test_update_subtask_success():
         assert payload["data"][_FIELD_DONE] == "true"
         assert _FIELD_DESCR not in payload["data"]   # description не передан → не попал в data
         assert payload["update_by_field"] == {"id": 55}
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_update_subtask_empty_id_raises():
+    """Регрессия (docs/crm_issue.md): если подзадачу удалили в CRM напрямую, CRM отвечает
+    "success" с пустым data.id — expect_id должен превратить это в Exception, чтобы
+    update_subtask() в services/subtasks.py выставил crm_synced=False, а не True."""
+    patcher, _ = _patch_httpx(_resp({"id": ""}))
+    try:
+        with pytest.raises(Exception, match="no valid id"):
+            await SubtaskManager().update_subtask(subtask_id=55, title="New Title")
     finally:
         patcher.stop()
 
@@ -218,7 +231,7 @@ async def test_update_subtask_crm_api_error():
 @pytest.mark.asyncio
 async def test_delete_subtask_success():
     """delete_subtask передаёт delete_by_field с CRM-ID."""
-    patcher, mock_http = _patch_httpx(_resp({}))
+    patcher, mock_http = _patch_httpx(_resp({"id": "55"}))
     try:
         result = await SubtaskManager().delete_subtask(subtask_id=55)
         assert result["status"] == "success"
@@ -226,6 +239,18 @@ async def test_delete_subtask_success():
         assert payload["action"] == "delete"
         assert payload["entity_id"] == SubtaskManager.ENTITY_ID
         assert payload["delete_by_field"] == {"id": 55}
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_delete_subtask_empty_id_raises():
+    """Регрессия (docs/crm_issue.md): та же дыра, что и в test_update_subtask_empty_id_raises,
+    но для delete_subtask()."""
+    patcher, _ = _patch_httpx(_resp({"id": ""}))
+    try:
+        with pytest.raises(Exception, match="no valid id"):
+            await SubtaskManager().delete_subtask(subtask_id=55)
     finally:
         patcher.stop()
 

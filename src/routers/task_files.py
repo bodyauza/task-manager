@@ -11,7 +11,7 @@ FastAPI и передаёт их дальше.
     POST   /tasks/{task_id}/files                  — добавить «Иные документы» (до 10 файлов)
     DELETE /tasks/{task_id}/files/{filename}       — удалить один файл из «Иных документов»
 
-Файлы хранятся в src/static/uploads/tasks/{task_id}/.
+Файлы хранятся в src/uploads/tasks/{task_id}/.
 В БД хранятся только пути относительно uploads/ — байты файлов в БД не попадают.
 """
 
@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, File, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.auth_config import current_user        # DI: текущий аутентифицированный пользователь
-from src.auth.models import User
+from src.auth.user_models import User
 from src.crm.task_service import TaskCRMSync, get_task_crm_sync
 from src.database import get_async_session            # DI: асинхронная сессия SQLAlchemy
 from src.services import attachments

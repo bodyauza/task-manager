@@ -2,6 +2,7 @@ import logging
 from typing import Any, Dict, Optional, Protocol
 
 from src.crm.client import CRMClient
+from src.crm.crm_config import crm_settings
 
 logger = logging.getLogger(__name__)
 
@@ -36,24 +37,36 @@ class UserRegistrar(Protocol):
 
 
 class CRMUserSelector(CRMClient):
-    """Поиск пользователей в сущности «Пользователи» (entity_id=1).
+    """Поиск пользователей в сущности «Пользователи» (entity_id из crm_settings.USER_ENTITY_ID).
 
-    Поля: 7=Имя, 8=Фамилия, 9=Email, 12=Логин, 6=Группа.
+    Поля (номера — из crm_settings, читаются из CRM_USER_FIELD_* переменных окружения,
+    т.к. генерируются внутри конкретной инсталляции CRM и отличаются между инстансами):
+    FIELD_FIRSTNAME=Имя, FIELD_LASTNAME=Фамилия, FIELD_EMAIL=Email,
+    FIELD_USERNAME=Логин, FIELD_GROUP=Группа.
     """
 
-    USER_ENTITY_ID = 1
+    USER_ENTITY_ID  = crm_settings.USER_ENTITY_ID
+    FIELD_FIRSTNAME = crm_settings.USER_FIELD_FIRSTNAME
+    FIELD_LASTNAME  = crm_settings.USER_FIELD_LASTNAME
+    FIELD_EMAIL     = crm_settings.USER_FIELD_EMAIL
+    FIELD_USERNAME  = crm_settings.USER_FIELD_USERNAME
+    FIELD_GROUP     = crm_settings.USER_FIELD_GROUP
 
     async def find_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
-        """Ищет пользователя по точному совпадению email (поле 9).
+        """Ищет пользователя по точному совпадению email.
 
         :return: Словарь с данными первой найденной записи или None.
         """
+        select_fields = ",".join(str(f) for f in (
+            self.FIELD_EMAIL, self.FIELD_FIRSTNAME, self.FIELD_LASTNAME,
+            self.FIELD_USERNAME, self.FIELD_GROUP,
+        ))
         result = await self._call(
             action="select",
             entity_id=self.USER_ENTITY_ID,
-            select_fields="9,7,8,12,6",
+            select_fields=select_fields,
             # condition='include' — точное совпадение, не LIKE
-            filters={"9": {"value": email, "condition": "include"}},
+            filters={str(self.FIELD_EMAIL): {"value": email, "condition": "include"}},
         )
         data = result.get("data", [])
         if not data:
@@ -63,7 +76,7 @@ class CRMUserSelector(CRMClient):
 
 
 class CRMUserRegistrar(CRMClient):
-    """Регистрация пользователя в сущности «Пользователи» (entity_id=1).
+    """Регистрация пользователя в сущности «Пользователи» (entity_id из crm_settings.USER_ENTITY_ID).
 
     Отдельный класс, а не метод на CRMClient (ISP): register_user — доменное
     действие «регистрация пользователя», не общий HTTP-транспорт. Раньше он
@@ -71,6 +84,8 @@ class CRMUserRegistrar(CRMClient):
     никогда не нужен, — тот же _call()/_http() транспорт остаётся общим
     (наследование от CRMClient), а регистрация пользователей — только здесь.
     """
+
+    USER_ENTITY_ID = crm_settings.USER_ENTITY_ID
 
     async def register_user(
         self,
@@ -83,7 +98,7 @@ class CRMUserRegistrar(CRMClient):
         notify: bool = True,
         login_url: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Регистрирует пользователя в сущности «Пользователи» (entity_id=1).
+        """Регистрирует пользователя в сущности «Пользователи».
 
         :param username: Логин в CRM = часть email до '@'
         """
@@ -101,7 +116,7 @@ class CRMUserRegistrar(CRMClient):
 
         return await self._call(
             action="insert",
-            entity_id=1,
+            entity_id=self.USER_ENTITY_ID,
             items=[record],
             notify=notify,
             login_url=login_url,

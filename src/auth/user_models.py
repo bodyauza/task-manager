@@ -57,7 +57,7 @@ class User(SQLAlchemyBaseUserTable[int], Base):
     role: Mapped[Role] = relationship("Role")
     hashed_password: Mapped[str] = mapped_column(String(length=1024), nullable=False)
     tasks: Mapped[List["Task"]] = relationship(
-        "Task", back_populates="owner", cascade="all, delete-orphan"
+        "Task", back_populates="owner", cascade="all, delete-orphan", passive_deletes=True
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # is_superuser не переопределяется: в проекте права задаются через role_id.

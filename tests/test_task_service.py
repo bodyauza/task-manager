@@ -12,7 +12,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from src.auth.models import User
+from src.auth.user_models import User
 from src.database import async_session_maker
 from src.services import tasks as task_service
 from src.task_logic.models import Task

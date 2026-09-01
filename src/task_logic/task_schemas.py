@@ -59,7 +59,7 @@ class TaskResponse(BaseModel):
     # subtask_count вычисляется через подзапрос в read_tasks; None в остальных эндпоинтах.
     subtask_count: Optional[int] = None
 
-    # Путь к файлу ТЗ относительно src/static/uploads/.
+    # Путь к файлу ТЗ относительно src/uploads/.
     # None — файл не загружен. Пример: "tasks/3/specification/a1b2_tz.pdf".
     # URL доступа: /uploads/tasks/3/specification/a1b2_tz.pdf (через routers/uploads.py,
     # аутентифицированный роутер, а не StaticFiles mount — см. src/routers/uploads.py).

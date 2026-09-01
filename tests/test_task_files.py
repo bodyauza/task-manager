@@ -15,7 +15,7 @@ import json
 import pytest
 from httpx import AsyncClient
 
-from src.realtime.manager import connection_manager
+from src.realtime.connection_manager import connection_manager
 from tests.conftest import register_user
 
 EMAIL = "file_task@example.com"
@@ -48,9 +48,11 @@ def _pdf() -> bytes:
     # %PDF-1.4: magic bytes, по которым mock_magic вернёт "application/pdf"
     return b'%PDF-1.4 fake pdf content for tests'
 
+
 def _png() -> bytes:
     # \x89PNG\r\n\x1a\n: сигнатура PNG; mock_magic вернёт "image/png"
     return b'\x89PNG\r\n\x1a\n fake png content for tests'
+
 
 def _garbage() -> bytes:
     # Нет стандартной сигнатуры; mock_magic вернёт "application/octet-stream"
@@ -65,14 +67,17 @@ async def _auth(client: AsyncClient, mock_smtp: dict) -> None:
     # Логин принимает form-data с полем "username" (OAuth2PasswordRequestForm), а не JSON.
     await client.post("/auth/login", data={"username": EMAIL, "password": "Password1!"})
 
+
 async def _make_task(client: AsyncClient) -> dict:
     r = await client.post("/create-task/", json={"title": "FileTask", "description": "d"})
     assert r.status_code == 201
     return r.json()
 
+
 def _spec_upload(content: bytes, filename: str = "tz.pdf") -> dict:
     # httpx принимает {"field": (name, data, content_type)} для multipart
     return {"file": (filename, content, "application/octet-stream")}
+
 
 def _other_uploads(*pairs: tuple[bytes, str]) -> list[tuple]:
     # Несколько файлов в одном поле "files": list of ("field", (name, data, ct))

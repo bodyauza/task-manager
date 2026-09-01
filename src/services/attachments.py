@@ -22,14 +22,14 @@ from fastapi import HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.auth.models import User
+from src.auth.user_models import User
 from src.crm.subtask_service import SubtaskCRMSync
 from src.crm.task_service import TaskCRMSync
 from src.realtime import broadcast_task_event
 from src.task_logic.models import Subtask, Task
 from src.utils.file_utils import (
     MAX_OTHER_FILES,     # лимит файлов в «Иных документах» (10 штук)
-    UPLOAD_ROOT,         # абсолютный путь к src/static/uploads/ (единая точка определения)
+    UPLOAD_ROOT,         # абсолютный путь к src/uploads/ (единая точка определения)
     parse_other_paths,   # JSONB (list[str] | None) → list[str]; [] при NULL
     read_and_validate,   # чтение + проверка размера/расширения/MIME
     safe_filename,       # добавление UUID-префикса к имени
@@ -273,7 +273,11 @@ async def upload_other_files(
 
     dest_dir = UPLOAD_ROOT / config.dir_segment / str(entity_id) / "other"
 
-    # Проход 1: валидируем все файлы до записи на диск — параллельно через asyncio.gather.
+    # Проход 1: валидируем все файлы до записи на диск. asyncio.gather не выполняет их
+    # параллельно сам по себе — он просто не ждёт завершения одной корутины перед
+    # запуском следующей. Реальный параллелизм даёт magic.from_buffer внутри
+    # read_and_validate(), обёрнутый в asyncio.to_thread, — это настоящие отдельные
+    # потоки ОС (см. file_utils.py).
     # return_exceptions=True вместо того чтобы дать gather самому оборвать ожидание на первой
     # ошибке: поток ОС, уже занятый magic.from_buffer() для другого файла, всё равно не
     # остановить снаружи — он доработает сам по себе, просто впустую. Дожидаемся всех
@@ -295,9 +299,10 @@ async def upload_other_files(
     # Проход 2: все файлы валидны — сохраняем на диск параллельно. В отличие от MIME-проверки
     # выше (сериализована общим локом внутри python-magic), запись на диск такого ограничения
     # не имеет — у каждого файла свой UUID-префикс от safe_filename(), коллизий имён нет.
-    new_paths: list[str] = list(await asyncio.gather(
+    # gather() уже возвращает list — оборачивать в list() не нужно.
+    new_paths: list[str] = await asyncio.gather(
         *[asyncio.to_thread(save_file, dest_dir, filename, content) for content, filename in validated]
-    ))
+    )
 
     updated = existing + new_paths
     crm_id = config.get_crm_id(entity)                        # захватить до commit

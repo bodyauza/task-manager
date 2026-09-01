@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.email_service import send_confirmation_code
 from src.auth.manager import UserManager, get_user_manager, password_helper_bc
-from src.auth.models import RegistrationPending, User
+from src.auth.user_models import RegistrationPending, User
 from src.auth.user_schemas import (
     PASSWORD_ERROR,
     UserCreate,

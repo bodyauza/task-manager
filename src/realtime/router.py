@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, status
 
 from src.auth.auth_config import get_access_strategy
 from src.auth.manager import UserManager, get_user_manager
-from src.realtime.manager import connection_manager
+from src.realtime.connection_manager import connection_manager
 
 logger = logging.getLogger(__name__)
 

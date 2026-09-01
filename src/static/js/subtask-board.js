@@ -22,78 +22,18 @@ let currentSubtasks = [];
 let currentPage = 1;
 
 // Размер страницы: сколько подзадач запрашивать за один вызов GET /subtasks/.
-// Передаётся в URL как limit=5; бэкенд применяет его как SQL LIMIT.
-// Определяет шаг skip: страница N → skip = (N-1) * perPage.
-const perPage = 5;
+// Передаётся в URL как limit=; бэкенд применяет его как SQL LIMIT.
+// SUBTASKS_PAGE_SIZE — общая константа из common.js. Определяет шаг skip:
+// страница N → skip = (N-1) * SUBTASKS_PAGE_SIZE.
 
 // Общее число страниц. Пересчитывается после каждого GET по формуле:
-//   totalPages = Math.max(1, Math.ceil(total / perPage))
+//   totalPages = Math.max(1, Math.ceil(total / SUBTASKS_PAGE_SIZE))
 // где total берётся из заголовка X-Total-Count ответа (SELECT COUNT(*) на бэкенде).
 // Math.max(1, ...) гарантирует, что пустой список не даст totalPages = 0.
 let totalPages = 1;
 
-function escapeHtml(v) {
-    // Экранирует HTML-спецсимволы через DOM: браузер сам заменяет < → &lt; и т.д.
-    // Используется перед вставкой пользовательских строк в innerHTML.
-    const d = document.createElement('div');
-    d.textContent = String(v);
-    return d.innerHTML;
-}
-
-function _updateCharCounter(inputEl, counterEl, limit) {
-    const len = inputEl.value.length;
-    counterEl.textContent = len;
-    const w = counterEl.closest('.char-counter');
-    // CSS-классы limit-near и limit-reached меняют цвет счётчика: жёлтый → красный.
-    // 90% порог (limit * 0.9) даёт пользователю визуальное предупреждение за 10 символов до лимита.
-    w.classList.toggle('limit-near', len >= limit * 0.9 && len < limit);
-    w.classList.toggle('limit-reached', len >= limit);
-}
-
-function showToast(message, type = 'info') {
-    // Контейнер создаётся лениво: при первом вызове его нет в HTML, добавляем в body.
-    let c = document.getElementById('notifContainer');
-    if (!c) {
-        c = document.createElement('div');
-        c.id = 'notifContainer';
-        c.className = 'notif-container';
-        document.body.appendChild(c);
-    }
-    const n = document.createElement('div');
-    n.className = `notif notif-${type}`;
-    n.textContent = message;
-    c.appendChild(n);
-    // requestAnimationFrame откладывает добавление класса до следующего кадра рендера:
-    // без него браузер применил бы transition к уже финальному состоянию и анимации не было бы.
-    requestAnimationFrame(() => n.classList.add('notif-show'));
-    setTimeout(() => { n.classList.remove('notif-show'); setTimeout(() => n.remove(), 300); }, 4000);
-}
-
-// Глобальный промис обновления access-токена. Singleton-паттерн: если несколько
-// параллельных запросов одновременно получат 401, POST /auth/access-token выполнится
-// один раз; остальные ожидают тот же промис через await _refreshPromise.
-let _refreshPromise = null;
-
-async function fetchWithAuth(url, options = {}) {
-    // credentials: 'include' — браузер прикрепляет куки к запросу и принимает Set-Cookie
-    // из ответа. Без этого access_token и refresh_token не передаются кросс-доменно.
-    const opts = { credentials: 'include', ...options };
-    let resp = await fetch(url, opts);
-    if (resp.status === 401) {
-        if (!_refreshPromise) {
-            // POST /auth/access-token использует refresh_token (кука httpOnly) и выдаёт
-            // новый access_token. finally сбрасывает промис после завершения — следующий 401
-            // запустит новый refresh, не дублируя текущий.
-            _refreshPromise = fetch('/auth/access-token', { method: 'POST', credentials: 'include' })
-                .finally(() => { _refreshPromise = null; });
-        }
-        const r = await _refreshPromise;
-        if (!r.ok) { window.location.href = '/'; return null; }
-        // Повторяем исходный запрос уже с обновлённым токеном в куке.
-        resp = await fetch(url, opts);
-    }
-    return resp;
-}
+// escapeHtml, _updateCharCounter, showToast, fetchWithAuth — общие функции,
+// вынесены в common.js (подключён в subtask-board.html до этого скрипта).
 
 // Делегированный обработчик кликов. Кнопки «Изменить» и «Удалить» генерируются
 // динамически в displaySubtasks() — на момент выполнения этого кода их ещё нет в DOM.
@@ -118,7 +58,7 @@ function openEditModal(id) {
     titleEl.value = s.title;
     document.getElementById('editDescription').value = s.description;
     document.getElementById('editCompleted').checked = s.completed;
-    _updateCharCounter(titleEl, document.getElementById('editTitleCounter'), 100);
+    _updateCharCounter(titleEl, document.getElementById('editTitleCounter'), TITLE_MAX_LENGTH);
     document.getElementById('editModal').style.display = 'flex';
 }
 
@@ -145,14 +85,14 @@ document.getElementById('editModal').addEventListener('click', function(e) {
 async function loadSubtasks(page = 1) {
     currentPage = page;
     // skip — SQL OFFSET; переводим номер страницы (с 1) в смещение строк (с 0).
-    // page=1 → skip=0  (первые 6 строк таблицы: OFFSET 0 LIMIT 6)
-    // page=2 → skip=6  (следующие 6: OFFSET 6 LIMIT 6)
-    // page=3 → skip=12 (OFFSET 12 LIMIT 6) и т.д.
-    const skip = (page - 1) * perPage;
+    // page=1 → skip=0  (первые 5 строк таблицы: OFFSET 0 LIMIT 5)
+    // page=2 → skip=5  (следующие 5: OFFSET 5 LIMIT 5)
+    // page=3 → skip=10 (OFFSET 10 LIMIT 5) и т.д.
+    const skip = (page - 1) * SUBTASKS_PAGE_SIZE;
     try {
         // task_id фильтрует строки конкретной задачи на бэкенде (WHERE subtask.task_id = taskId).
         // skip и limit транслируются бэкендом в OFFSET/LIMIT в SQL-запросе.
-        const resp = await fetchWithAuth(`/subtasks/?task_id=${taskId}&skip=${skip}&limit=${perPage}`);
+        const resp = await fetchWithAuth(`/subtasks/?task_id=${taskId}&skip=${skip}&limit=${SUBTASKS_PAGE_SIZE}`);
         if (!resp) return;
         if (resp.ok) {
             const subtasks = await resp.json();
@@ -162,7 +102,7 @@ async function loadSubtasks(page = 1) {
             // Fallback subtasks.length применяется если заголовок отсутствует; тогда totalPages
             // вычислится только из длины текущей страницы, что занизит счётчик — но не выбросит NaN.
             const total = parseInt(resp.headers.get('X-Total-Count') || subtasks.length, 10);
-            totalPages = Math.max(1, Math.ceil(total / perPage));
+            totalPages = Math.max(1, Math.ceil(total / SUBTASKS_PAGE_SIZE));
             displaySubtasks(subtasks);
             updatePagination();
         } else {
@@ -356,10 +296,10 @@ function connectWebSocket() {
 
         socket.onclose = function(event) {
             if (event.code === 1008) { window.location.href = '/'; return; }
-            setTimeout(connectWebSocket, 3000);   // переподключение при разрыве
+            setTimeout(connectWebSocket, WS_RECONNECT_DELAY_MS);   // переподключение при разрыве
         };
     } catch (error) {
-        setTimeout(connectWebSocket, 3000);
+        setTimeout(connectWebSocket, WS_RECONNECT_DELAY_MS);
     }
 }
 
@@ -374,9 +314,9 @@ window.addEventListener('load', function() {
 
     const titleInput   = document.getElementById('title');
     const titleCounter = document.getElementById('titleCounter');
-    titleInput.addEventListener('input', () => _updateCharCounter(titleInput, titleCounter, 100));
+    titleInput.addEventListener('input', () => _updateCharCounter(titleInput, titleCounter, TITLE_MAX_LENGTH));
 
     const editTitleInput   = document.getElementById('editTitle');
     const editTitleCounter = document.getElementById('editTitleCounter');
-    editTitleInput.addEventListener('input', () => _updateCharCounter(editTitleInput, editTitleCounter, 100));
+    editTitleInput.addEventListener('input', () => _updateCharCounter(editTitleInput, editTitleCounter, TITLE_MAX_LENGTH));
 });

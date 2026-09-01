@@ -36,4 +36,4 @@ htmlcov
 src/screenshots
 
 # Загруженные пользователями файлы — рантайм-данные, не артефакт сборки.
-src/static/uploads
+src/uploads

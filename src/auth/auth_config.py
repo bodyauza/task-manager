@@ -61,7 +61,7 @@ auth_backend = AuthenticationBackend(
 
 
 from src.auth.manager import get_user_manager
-from src.auth.models import Role, User
+from src.auth.user_models import Role, User
 
 fastapi_users = FastAPIUsers[User, int](
     get_user_manager,

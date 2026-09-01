@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.auth.models import User
+from src.auth.user_models import User
 from src.crm.subtask_service import SubtaskCRMSync
 from src.realtime import broadcast_task_event
 from src.services import attachments
@@ -148,11 +148,14 @@ async def update_subtask(
     # конкурентный delete_task() для родительской задачи (services/tasks.py) мог бы
     # прочитать и каскадно удалить эту же подзадачу уже после того, как SELECT ниже
     # её прочитал, но до commit() этой функции — UPDATE применился бы к уже
-    # несуществующей строке (0 затронутых строк, без ошибки), а пользователь получил
-    # бы 200 OK на изменение уже удалённой подзадачи. FOR UPDATE заставляет
-    # delete_task() дождаться commit/rollback этой транзакции, прежде чем прочитать
-    # (и возможно удалить) эту же строку — см. симметричную блокировку subtask_rows
-    # в services/tasks.py::delete_task.
+    # несуществующей строке. Не тихий no-op: ORM при флаше сверяет число реально
+    # задетых UPDATE строк с числом обновляемых объектов и в этом случае бросает
+    # sqlalchemy.orm.exc.StaleDataError (проверено эмпирически) — без блокировки это
+    # исключение улетело бы наверх необработанным (голый 500), а не 200 OK, как можно
+    # было бы подумать. FOR UPDATE заставляет delete_task() дождаться commit/rollback
+    # этой транзакции, прежде чем прочитать (и возможно удалить) эту же строку —
+    # см. симметричную блокировку subtask_rows в services/tasks.py::delete_task и
+    # FOR NO KEY UPDATE в services/tasks.py::update_task для того же класса гонки.
     db_subtask = (
         await db.execute(select(Subtask).where(Subtask.id == subtask_id).with_for_update())
     ).scalar_one_or_none()

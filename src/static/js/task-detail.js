@@ -3,60 +3,8 @@ const userId = document.getElementById('userId').value;
 let currentTask = null;
 let socket;
 
-function escapeHtml(v) {
-    const d = document.createElement('div');
-    d.textContent = String(v);
-    return d.innerHTML;
-}
-
-function _updateCharCounter(inputEl, counterEl, limit) {
-    const len = inputEl.value.length;
-    counterEl.textContent = len;
-    const w = counterEl.closest('.char-counter');
-    w.classList.toggle('limit-near', len >= limit * 0.9 && len < limit);
-    w.classList.toggle('limit-reached', len >= limit);
-}
-
-function showToast(message, type = 'info') {
-    let c = document.getElementById('notifContainer');
-    if (!c) {
-        c = document.createElement('div');
-        c.id = 'notifContainer';
-        c.className = 'notif-container';
-        document.body.appendChild(c);
-    }
-    const n = document.createElement('div');
-    n.className = `notif notif-${type}`;
-    n.textContent = message;
-    c.appendChild(n);
-    requestAnimationFrame(() => n.classList.add('notif-show'));
-    setTimeout(() => { n.classList.remove('notif-show'); setTimeout(() => n.remove(), 300); }, 4000);
-}
-
-let _refreshPromise = null;
-
-async function fetchWithAuth(url, options = {}) {
-    const opts = { credentials: 'include', ...options };
-    let resp = await fetch(url, opts);
-    if (resp.status === 401) {
-        if (!_refreshPromise) {
-            _refreshPromise = fetch('/auth/access-token', { method: 'POST', credentials: 'include' })
-                .finally(() => { _refreshPromise = null; });
-        }
-        const r = await _refreshPromise;
-        if (!r.ok) { window.location.href = '/'; return null; }
-        resp = await fetch(url, opts);
-    }
-    return resp;
-}
-
-function subtaskLabel(n) {
-    const mod10 = n % 10;
-    const mod100 = n % 100;
-    if (mod10 === 1 && mod100 !== 11) return `${n} подзадача`;
-    if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return `${n} подзадачи`;
-    return `${n} подзадач`;
-}
+// escapeHtml, _updateCharCounter, showToast, fetchWithAuth, subtaskLabel — общие функции,
+// вынесены в common.js (подключён в task-detail.html до этого скрипта).
 
 // ── Файлы: рендер и загрузка ─────────────────────────────────────────────────
 
@@ -108,7 +56,7 @@ let uploadedOtherCount = 0;
 // Те же ограничения, что и на сервере (src/utils/file_utils.py: MAX_FILE_SIZE, ALLOWED) —
 // продублированы здесь только для мгновенной обратной связи на клиенте. Сервер остаётся
 // источником истины и всё равно перепроверит и размер, и MIME-тип по сигнатуре байтов.
-const OTHER_FILES_MAX_SIZE = 100 * 1024 * 1024;  // 100 МБ
+// OTHER_FILES_MAX_SIZE — общая константа из common.js.
 const OTHER_FILES_ALLOWED_EXT = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.jpg', '.jpeg', '.png', '.txt'];
 
 function validateOtherFileClientSide(file) {
@@ -288,9 +236,9 @@ document.addEventListener('DOMContentLoaded', function() {
         if (!pendingOtherFiles.length) { showToast('Выберите файлы', 'warning'); return; }
 
         const currentCount = (currentTask && currentTask.other_file_paths || []).length;
-        if (currentCount + pendingOtherFiles.length > 10) {
+        if (currentCount + pendingOtherFiles.length > MAX_OTHER_FILES) {
             showToast(
-                `Лимит файлов: 10. Сейчас: ${currentCount}, выбрано: ${pendingOtherFiles.length}`,
+                `Лимит файлов: ${MAX_OTHER_FILES}. Сейчас: ${currentCount}, выбрано: ${pendingOtherFiles.length}`,
                 'warning',
             );
             return;
@@ -405,7 +353,7 @@ function openEditForm() {
     titleEl.value = currentTask.title;
     document.getElementById('editDescription').value = currentTask.description;
     document.getElementById('editCompleted').checked = currentTask.completed;
-    _updateCharCounter(titleEl, document.getElementById('editTitleCounter'), 100);
+    _updateCharCounter(titleEl, document.getElementById('editTitleCounter'), TITLE_MAX_LENGTH);
     document.getElementById('editForm').classList.add('visible');
     document.getElementById('editToggleBtn').style.display = 'none';
 }
@@ -506,10 +454,10 @@ function connectWebSocket() {
 
         socket.onclose = function(event) {
             if (event.code === 1008) { window.location.href = '/'; return; }
-            setTimeout(connectWebSocket, 3000);   // переподключение при разрыве
+            setTimeout(connectWebSocket, WS_RECONNECT_DELAY_MS);   // переподключение при разрыве
         };
     } catch (error) {
-        setTimeout(connectWebSocket, 3000);
+        setTimeout(connectWebSocket, WS_RECONNECT_DELAY_MS);
     }
 }
 
@@ -524,5 +472,5 @@ window.addEventListener('load', function() {
 
     const editTitleInput   = document.getElementById('editTitle');
     const editTitleCounter = document.getElementById('editTitleCounter');
-    editTitleInput.addEventListener('input', () => _updateCharCounter(editTitleInput, editTitleCounter, 100));
+    editTitleInput.addEventListener('input', () => _updateCharCounter(editTitleInput, editTitleCounter, TITLE_MAX_LENGTH));
 });

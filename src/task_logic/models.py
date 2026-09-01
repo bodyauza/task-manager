@@ -19,16 +19,16 @@ class Task(Base):
     title: Mapped[str] = mapped_column(String(100), index=True)
     description: Mapped[str] = mapped_column(String(2000))
     completed: Mapped[bool] = mapped_column(Boolean, default=False)
-    owner_id: Mapped[int] = mapped_column(Integer, ForeignKey("person.id"))
+    owner_id: Mapped[int] = mapped_column(Integer, ForeignKey("person.id", ondelete="CASCADE"))
     owner: Mapped["User"] = relationship("User", back_populates="tasks")
     subtasks: Mapped[List["Subtask"]] = relationship(
-        "Subtask", back_populates="task", cascade="all, delete-orphan"
+        "Subtask", back_populates="task", cascade="all, delete-orphan", passive_deletes=True
     )
     # NULL = задача не синхронизирована с CRM (CRM был недоступен при создании
     # или задача создана до интеграции). Тип int, а не UUID: CRM присваивает числовые ID.
     crm_task_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=None)
 
-    # Путь к файлу ТЗ относительно src/static/uploads/, например "tasks/3/specification/a1b2_tz.pdf".
+    # Путь к файлу ТЗ относительно src/uploads/, например "tasks/3/specification/a1b2_tz.pdf".
     # NULL — файл не загружен. Хранится строка, не байты: файл лежит на диске.
     specification_path: Mapped[Optional[str]] = mapped_column(String, nullable=True, default=None)
 
@@ -56,7 +56,7 @@ class Subtask(Base):
     task: Mapped["Task"] = relationship("Task", back_populates="subtasks")
     crm_subtask_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=None)
 
-    # Путь к файлу ТЗ подзадачи относительно src/static/uploads/.
+    # Путь к файлу ТЗ подзадачи относительно src/uploads/.
     # Пример: "subtasks/7/specification/e5f6_spec.pdf". NULL — файл не загружен.
     specification_path: Mapped[Optional[str]] = mapped_column(String, nullable=True, default=None)
 
