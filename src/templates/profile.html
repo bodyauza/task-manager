@@ -77,6 +77,11 @@
             font-size: 13px;
             font-weight: 600;
             letter-spacing: 0.3px;
+            margin-right: 6px;
+        }
+
+        .role-badge:last-child {
+            margin-right: 0;
         }
 
         .status-active   { color: #198754; font-weight: 600; }
@@ -146,7 +151,9 @@
                 <div class="info-cell">
                     <div class="info-label">Роль в системе</div>
                     <div class="info-value">
-                        <span class="role-badge">{{ role_name }}</span>
+                        {% for role_name in role_names %}
+                            <span class="role-badge">{{ role_name }}</span>
+                        {% endfor %}
                     </div>
                 </div>
                 <div class="info-cell">

@@ -10,10 +10,12 @@ from fastapi_users.password import PasswordHelper
 from pwdlib import PasswordHash
 from pwdlib.hashers.bcrypt import BcryptHasher
 
+from sqlalchemy import select
+
 from src.crm.client import CRMUnavailableError
 from src.crm.user_service import UserRegistrar, get_user_registrar
 
-from .user_models import User
+from .user_models import Role, User
 from .user_repository import get_user_db
 
 logger = logging.getLogger(__name__)
@@ -70,7 +72,23 @@ class UserManager(IntegerIDMixin, BaseUserManager[User, int]):
         # reset_password/oauth_callback/_update недостижимы — их роутеры не подключены
         # в src/main.py, а routers/users.py::update_user пароль не трогает).
         user_dict["hashed_password"] = await asyncio.to_thread(self.password_helper.hash, password)
-        user_dict["role_id"] = 1
+        # Роли — many-to-many (user_role): нельзя положить role_id=1 в user_dict, как
+        # раньше — нужен реальный объект Role, присвоенный relationship-полю "roles".
+        # self.user_db.session — та же AsyncSession, что use_db.create() использует ниже
+        # (внедрена через тот же Depends(get_async_session), что и весь остальной код
+        # запроса) — объект Role, полученный из неё, session-bound и корректно
+        # ассоциируется при последующем session.add()/commit() внутри create().
+        # По имени "user", а не по id=1: единственный источник истины о том, что такое
+        # "роль по умолчанию" — имя, как и everywhere else после перехода на require_role().
+        default_role = (await self.user_db.session.execute(
+            select(Role).where(Role.name == "user")
+        )).scalar_one_or_none()
+        if default_role is None:
+            raise RuntimeError(
+                "Роль 'user' не найдена — create_initial_roles() должна была создать "
+                "её при старте приложения (см. src/main.py)."
+            )
+        user_dict["roles"] = [default_role]
         # username в Task Manager = часть email до '@'.
         # Та же логика применяется для username-поля при регистрации в CRM.
         user_dict["username"] = user_create.email.split("@")[0]
