@@ -323,10 +323,10 @@ sequenceDiagram
 
 ### Управление пользователями (требуют роль `admin`)
 
-> Доступ проверяется через `require_permission("delete")`. Пользователь с ролью `user` (permissions: `["read", "write"]`) получает `403 Forbidden`. Роль `admin` имеет permissions: `["read", "write", "delete"]`.
+> Доступ проверяется через `require_role("admin")`: пользователь, среди ролей которого нет `admin`, получает `403 Forbidden`. Роли — many-to-many (`user_role`): пользователь может одновременно иметь несколько ролей, доступ разрешён, если хотя бы одна из них называется `admin`.
 
 - `GET /users/` — список всех пользователей.
-- `PATCH /users/{user_id}` — изменить данные пользователя (`username`, `firstname`, `lastname`, `patronymic`, `role_id`, `is_active`). `404` если пользователь не найден.
+- `PATCH /users/{user_id}` — изменить данные пользователя (`username`, `firstname`, `lastname`, `patronymic`, `role_ids`, `is_active`). `role_ids` заменяет весь набор ролей пользователя целиком (не добавляет к существующим). `400` при несуществующем id в `role_ids`. `404` если пользователь не найден.
 - `DELETE /users/{user_id}` — удалить пользователя. `400` при попытке удалить собственную учётную запись.
 
 ### WebSocket
@@ -375,9 +375,12 @@ sequenceDiagram
 
 ```
 role
-├── id          INTEGER PK
-├── name        VARCHAR      ("user" | "admin")
-└── permissions JSON         (["read","write"] | ["read","write","delete"])
+├── id   INTEGER PK
+└── name VARCHAR      ("user" | "admin")
+
+user_role                                  (таблица-связка many-to-many person ↔ role)
+├── person_id INTEGER FK → person.id (ondelete CASCADE)  ┐
+└── role_id   INTEGER FK → role.id   (ondelete CASCADE)  ┴─ составной PK (person_id, role_id)
 
 person
 ├── id              INTEGER PK
@@ -388,7 +391,6 @@ person
 ├── patronymic      VARCHAR(255) NULL
 ├── hashed_password VARCHAR(1024)       (bcrypt, rounds=14)
 ├── registered_at   TIMESTAMP WITH TIME ZONE
-├── role_id         INTEGER FK → role.id
 ├── is_active       BOOLEAN
 ├── is_superuser    BOOLEAN
 └── is_verified     BOOLEAN
@@ -442,6 +444,7 @@ registration_pending
 | `0012` | Добавление недостающего `uq_person_email` (обнаружено `alembic check` — 0002 задумывался, но constraint не был применён); объединение `registration_pending.email` в один unique index вместо `constraint + дублирующий обычный индекс` |
 | `0013` | GIN-индекс `pg_trgm` (`ix_task_title_trgm`) на `task.title` — обычный B-tree не ускоряет `ILIKE("%...%")` с ведущим `%`, поиск по названию задачи (`search_tasks()`) до этой миграции всегда делал Seq Scan |
 | `0014` | `ON DELETE CASCADE` на `task.owner_id → person.id` — раньше каскад работал только через ORM (`session.delete(user)`), прямой SQL `DELETE FROM person` падал `IntegrityError`, если у пользователя оставались задачи |
+| `0015` | `person.role_id` (one-to-many) → таблица-связка `user_role` (many-to-many, составной PK `(person_id, role_id)`) с backfill существующих назначений; `role.permissions` удалена (не используется — `require_permission()` заменён на `require_role()`, проверяющий `role.name`) |
 
 ---
 
@@ -732,7 +735,7 @@ DB_HOST=localhost
 DB_PORT=5432
 DB_USER=...
 DB_PASS=...
-DB_NAME=clients
+DB_NAME=task_manager
 
 ACCESS_SECRET=...     # случайная строка ≥ 32 символов
 ACCESS_EXP=1800       # TTL access_token, сек (30 мин)
@@ -795,7 +798,7 @@ CRM_USER_GROUP_ID=6        # ID группы «Сотрудник» в CRM (enti
 ### 5. Создать базу данных
 
 ```sql
-CREATE DATABASE clients;
+CREATE DATABASE task_manager;
 ```
 
 ### 6. Применить миграции
@@ -846,7 +849,7 @@ task-manager/
 ```ini
 DB_USER=your_db_user
 DB_PASS=your_db_password
-DB_NAME=clients
+DB_NAME=task_manager
 ACCESS_SECRET=your_random_secret_32_chars_min
 REFRESH_SECRET=another_random_secret_32_chars_min
 ```
@@ -905,14 +908,14 @@ docker compose --env-file src/.dev.env -f src/docker-compose.yml exec web alembi
 
 ## Testing
 
-Тесты используют отдельную базу данных `clients_test`, чтобы не затрагивать данные разработки.
+Тесты используют отдельную базу данных `task_manager_test`, чтобы не затрагивать данные разработки.
 
 ### Локальный запуск
 
 **1. Создать тестовую базу данных**
 
 ```sql
-CREATE DATABASE clients_test;
+CREATE DATABASE task_manager_test;
 ```
 
 Запускать миграции не нужно — фикстура `setup_and_reset` выполняет `drop_all + create_all`
@@ -929,12 +932,14 @@ pip install -r requirements-dev.txt
 
 **3. Проверить `src/.tests.env`**
 
-Файл содержит тестовые учётные данные (`DB_NAME=clients_test`).
+Файл содержит тестовые учётные данные (`DB_NAME=task_manager_test`).
 Если PostgreSQL запущен с другими `DB_USER` / `DB_PASS` — отредактируйте файл.
 
-Переключение на тестовую БД происходит автоматически: корневой `conftest.py` загружает
-`.tests.env` с `override=True` до первого импорта `src.*`. CRM и SMTP не нужны —
-фикстуры `mock_crm` и `mock_smtp` перехватывают все обращения к ним.
+Переключение на тестовую БД происходит автоматически: корневой `conftest.py` выставляет
+`os.environ["API_MODE"] = "test"` до первого импорта `src.*`, а `src/config.py` сам
+загружает файл текущего режима (`.tests.env`) первым — независимо от того, что лежит
+в `.dev.env`. CRM и SMTP не нужны — фикстуры `mock_crm` и `mock_smtp` перехватывают
+все обращения к ним.
 
 **4. Запустить тесты**
 
@@ -944,12 +949,13 @@ pytest tests/ -v
 
 ### Запуск тестов внутри Docker-контейнера
 
-`conftest.py` сохраняет `DB_HOST` из окружения контейнера перед вызовом `load_dotenv`,
-поэтому `DB_HOST=db` (выставленный docker-compose) не перезаписывается значением из `.tests.env`.
+`src/config.py` грузит `.env`-файлы с `override=False`, поэтому `DB_HOST=db` (выставленный
+docker-compose в окружении контейнера ещё до старта Python) не перезаписывается значением
+`DB_HOST=localhost` из `.tests.env`.
 
 ```bash
 # 1. Создать тестовую базу (один раз)
-docker exec src-db-1 psql -U root -d clients -c "CREATE DATABASE clients_test WITH OWNER = root;"
+docker exec src-db-1 psql -U root -d task_manager -c "CREATE DATABASE task_manager_test WITH OWNER = root;"
 
 # 2. Установить dev-зависимости в контейнер (один раз)
 docker exec src-web-1 pip install -r requirements-dev.txt -q
@@ -970,7 +976,7 @@ docker exec src-web-1 python -m pytest tests/ -v
 | `upload_root` | function | Временная директория (`tmp_path/uploads`) для `UPLOAD_ROOT` в `src/services/attachments.py` — файловые тесты не трогают реальный диск |
 | `registered_user` | function | Полный трёхшаговый flow регистрации через HTTP; возвращает `{"email": ..., "password": ...}` |
 | `register_user` | — (async helper) | Вспомогательная функция: прогоняет три шага регистрации; используется в тестах напрямую |
-| `promote_to_admin` | — (async helper) | Повышает пользователя до `role_id=2` в БД. Требует повторного логина для обновления JWT |
+| `promote_to_admin` | — (async helper) | Заменяет набор ролей пользователя на `[admin]` в БД (replace, не добавление). Требует повторного логина для обновления JWT |
 
 > `httpx.ASGITransport` не запускает ASGI lifespan (`startup`/`shutdown`).
 > Инициализация схемы и ролей выполняется напрямую в `setup_and_reset`, а не через lifespan.

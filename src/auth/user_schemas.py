@@ -36,10 +36,13 @@ class UserRead(schemas.BaseUser[int]):
     lastname: str
     # None если пользователь не указал отчество при регистрации или оно не хранится в БД.
     patronymic: Optional[str] = None
-    role_id: int
+    # Источник — User.role_ids (property в auth/user_models.py, читает user.roles).
+    # from_attributes=True вызывает getattr(user, "role_ids") как обычный атрибут —
+    # роли пользователя many-to-many (user_role), поэтому список, а не одно значение.
+    role_ids: list[int]
     is_active: bool = True
     # exclude=True: поле скрыто из JSON-ответов API, но сохраняется в БД.
-    # fastapi-users требует is_superuser в модели; права в проекте задаются через role_id.
+    # fastapi-users требует is_superuser в модели; права в проекте задаются через roles/require_role().
     is_superuser: bool = Field(default=False, exclude=True)
     is_verified: bool = False
 

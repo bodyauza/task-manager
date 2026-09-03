@@ -2,6 +2,7 @@ import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from unittest.mock import AsyncMock, patch
 
 from src.auth.user_models import Role, User
@@ -29,8 +30,8 @@ async def setup_and_reset():
         # Роли не создаются через миграции (Alembic управляет схемой, не данными).
         # После drop_all таблица role пуста — вставляем без проверки на существующие записи.
         session.add_all([
-            Role(id=1, name="user",  permissions=["read", "write"]),
-            Role(id=2, name="admin", permissions=["read", "write", "delete"]),
+            Role(id=1, name="user"),
+            Role(id=2, name="admin"),
         ])
         await session.commit()
 
@@ -46,15 +47,30 @@ async def client():
 
 
 async def promote_to_admin(email: str) -> None:
-    """Повышает зарегистрированного пользователя до роли admin (role_id=2) напрямую в БД.
+    """Повышает зарегистрированного пользователя до роли admin напрямую в БД.
+
+    Replace-семантика (как и PATCH /users/{id}/role_ids): набор ролей пользователя
+    заменяется на [admin] целиком, а не дополняется — после вызова у пользователя
+    ровно одна роль, admin. Тесту, которому нужен пользователь одновременно с
+    ролями user И admin, следует не использовать этот хелпер, а присвоить
+    user.roles явным списком самому.
 
     Используется в тестах, которым нужен admin без прохождения полного flow
     управления ролями через API.
     """
     async with async_session_maker() as session:
-        result = await session.execute(select(User).where(User.email == email))
+        result = await session.execute(
+            select(User).options(selectinload(User.roles)).where(User.email == email)
+        )
         user = result.scalar_one()
-        user.role_id = 2
+        admin_role = (
+            await session.execute(select(Role).where(Role.name == "admin"))
+        ).scalar_one()
+        # user.roles уже загружен через selectinload выше — bulk-replace на
+        # незагруженной async-relationship падает MissingGreenlet (SQLAlchemy
+        # не может лениво прочитать текущий список синхронно, чтобы вычислить
+        # diff на удаление/добавление строк в user_role).
+        user.roles = [admin_role]
         await session.commit()
 
 

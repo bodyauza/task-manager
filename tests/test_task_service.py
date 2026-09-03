@@ -12,7 +12,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from src.auth.user_models import User
+from src.auth.user_models import Role, User
 from src.database import async_session_maker
 from src.services import tasks as task_service
 from src.task_logic.models import Task
@@ -59,9 +59,14 @@ class FakeSubtaskCRMSync:
 
 
 async def _make_user(session, email: str = "alice@example.com") -> User:
+    # roles=[role] при конструировании нового User — не bulk-replace на уже
+    # загруженной связи (это был бы отдельный риск MissingGreenlet, см.
+    # auth/manager.py::UserManager.create()), а обычный kwarg конструктора
+    # transient-объекта, безопасен в async без предварительной eager-загрузки.
+    role = (await session.execute(select(Role).where(Role.id == 1))).scalar_one()
     user = User(
         email=email, username=email.split("@")[0], firstname="A", lastname="B",
-        hashed_password="x", role_id=1, is_active=True, is_verified=True,
+        hashed_password="x", roles=[role], is_active=True, is_verified=True,
     )
     session.add(user)
     await session.commit()

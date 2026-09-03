@@ -2,6 +2,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi_users import FastAPIUsers
 from fastapi_users.authentication import (AuthenticationBackend,
                                           CookieTransport, JWTStrategy)
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
@@ -61,7 +62,7 @@ auth_backend = AuthenticationBackend(
 
 
 from src.auth.manager import get_user_manager
-from src.auth.user_models import Role, User
+from src.auth.user_models import Role, User, user_role
 
 fastapi_users = FastAPIUsers[User, int](
     get_user_manager,
@@ -73,20 +74,28 @@ fastapi_users = FastAPIUsers[User, int](
 current_user = fastapi_users.current_user(active=True)
 
 
-def require_permission(permission: str):
+def require_role(required_role: str):
     # Фабрика dependency: каждый вызов возвращает новую async-функцию.
-    # Вызывается один раз на уровне модуля: _guard = require_permission("delete"),
+    # Вызывается один раз на уровне модуля: _guard = require_role("admin"),
     # затем используется как Depends(_guard) в маршрутах.
-    # Бросает 403 если role.permissions пользователя не содержит запрошенного права.
+    #
+    # roles — many-to-many (user_role): у пользователя может быть несколько ролей
+    # одновременно, поэтому доступ разрешён, если ХОТЯ БЫ ОДНА из его ролей называется
+    # required_role (union, а не единственное сравнение). Явный select().join() вместо
+    # user.roles — та же конвенция, что и везде в проекте (см. pages.py::profile_page):
+    # обращение к незагруженной lazy-relationship в async-коде роняет запрос
+    # MissingGreenlet, явный запрос этой проблеме не подвержен.
     async def _dependency(
         user: User = Depends(current_user),
         db: AsyncSession = Depends(get_async_session),
     ) -> User:
-        role = await db.get(Role, user.role_id)
-        if role is None or permission not in (role.permissions or []):
+        roles = (await db.execute(
+            select(Role).join(user_role).where(user_role.c.person_id == user.id)
+        )).scalars().all()
+        if not any(role.name == required_role for role in roles):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Insufficient permissions",
+                detail="Недостаточно прав для выполнения операции",
             )
         return user
     return _dependency

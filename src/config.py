@@ -6,11 +6,32 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = os.path.dirname(__file__)
 
-# override=False: переменные, уже установленные в os.environ (например, через shell),
-# имеют приоритет над значениями из файлов .env.
-# Порядок важен: .dev.env загружается первым и «захватывает» переменные, не заданные
-# в os.environ. Это нужно для crm/crm_config.py, который читает CRM_* через os.getenv()
-# напрямую, минуя pydantic-settings.
+# Файл, соответствующий текущему API_MODE — единственный источник значений для
+# ключей, которые ОДНОВРЕМЕННО объявлены в нескольких .env-файлах (DB_NAME,
+# SMTP_HOST, ACCESS_SECRET и т.п.). Грузится ПЕРВЫМ и с override=False:
+# значения, уже стоящие в os.environ (shell, docker-compose, CI — например,
+# DB_HOST=db, который docker-compose подставляет для контейнера db), всё
+# равно сохраняют приоритет над любым .env-файлом.
+#
+# Раньше все три файла грузились в фиксированном порядке .dev.env → .tests.env →
+# .env независимо от API_MODE: тот файл, что успевал загрузиться первым,
+# «застолбливал» совпадающие ключи в os.environ, а override=False не давал
+# остальным файлам их переопределить — из-за этого API_MODE=test в обход
+# pytest (который подстраховывался в conftest.py) резолвил DB_NAME=task_manager
+# (из .dev.env), а не task_manager_test (из .tests.env).
+_ENV_FILE_BY_MODE = {
+    "test": ".tests.env", "testing": ".tests.env",
+    "dev": ".dev.env", "development": ".dev.env",
+    "prod": ".env", "production": ".env",
+}
+_mode_env_file = _ENV_FILE_BY_MODE.get(os.getenv("API_MODE"))
+if _mode_env_file is not None:
+    load_dotenv(os.path.join(BASE_DIR, _mode_env_file), override=False)
+
+# Остальные файлы — как и раньше, но теперь только источник значений для ключей,
+# которых нет в уже загруженном файле режима: например CRM_* (crm/crm_config.py
+# читает их через os.getenv() напрямую, минуя pydantic-settings) объявлены
+# только в .dev.env и ни в одном режиме не «конкурируют» за них с другим файлом.
 load_dotenv(os.path.join(BASE_DIR, ".dev.env"),   override=False)
 load_dotenv(os.path.join(BASE_DIR, ".tests.env"), override=False)
 load_dotenv(os.path.join(BASE_DIR, ".env"),        override=False)
@@ -128,33 +149,40 @@ settings = get_settings()
 ──────────────────────────────────────────────────────────────
 
 [1] Старт процесса
-    os.environ содержит только то, что передал родительский shell или docker-compose.
-    В локальной разработке: пусто (API_MODE не установлен заранее).
-    В Docker: os.environ["API_MODE"] = "prod"  (из docker-compose environment:).
+    os.environ содержит только то, что передал родительский shell/docker-compose/CI.
+    Пример ниже — тестовый прогон: conftest.py (корневой) выставляет
+    os.environ["API_MODE"] = "test" до первого импорта src.*, до этого os.environ пуст.
 
-[2] load_dotenv(".dev.env", override=False)
+[2] _ENV_FILE_BY_MODE.get(os.getenv("API_MODE"))  →  ".tests.env"
+    Файл текущего режима определяется ДО загрузки чего-либо.
+
+[3] load_dotenv(".tests.env", override=False)   ← файл режима, грузится первым
     Читает файл построчно, для каждой строки KEY=VALUE:
       если KEY отсутствует в os.environ → os.environ[KEY] = VALUE
-      если KEY уже есть в os.environ    → пропускает (override=False)
-    Результат в локальной разработке:
-      os.environ["API_MODE"]    = "dev"
-      os.environ["CRM_API_URL"] = "https://..."   ← нужен crm/crm_config.py через os.getenv()
-      os.environ["DB_HOST"]     = "localhost"
-      os.environ["DB_NAME"]     = "clients"
-      ...все остальные переменные из .dev.env
+      если KEY уже есть в os.environ    → пропускает (override=False, значения
+                                           из shell/docker-compose/CI не трогаются)
+    Результат:
+      os.environ["DB_NAME"]     = "task_manager_test"   ← застолблено файлом режима
+      os.environ["SMTP_HOST"]   = "smtp.test.invalid"
+      ...остальные переменные .tests.env
 
-[3] load_dotenv(".tests.env", override=False)
-    Все переменные (API_MODE, DB_HOST, ...) уже есть в os.environ после шага [2].
-    override=False: пропускает все совпадающие ключи.
-    Эффект: шаг ничего не меняет при локальной разработке.
+    Раньше на этом месте грузился .dev.env первым независимо от режима — тогда
+    DB_NAME=task_manager застолбливался ИМ, и .tests.env ниже уже не мог его переопределить
+    (override=False). Явный выбор файла режима на шаге [2] убирает эту зависимость
+    от фиксированного порядка: для DB_NAME/SMTP_HOST/ACCESS_SECRET и т.п. побеждает
+    файл активного API_MODE, а не тот, что физически стоит в коде первым.
 
-[4] load_dotenv(".env", override=False)
-    В локальной разработке файл .env обычно отсутствует — вызов игнорируется.
-    В production (если .env есть): все переменные уже в os.environ от shell/docker → пропускает.
+[4] load_dotenv(".dev.env", override=False) → load_dotenv(".tests.env", override=False)
+    → load_dotenv(".env", override=False)
+    Прежний fallback-проход по всем трём файлам — без изменений. Ключи, уже занятые
+    на шаге [3] (DB_NAME и другие поля .tests.env), пропускаются. Ключи, которых
+    в .tests.env нет — например CRM_API_URL, объявленный только в .dev.env, — берутся
+    отсюда: os.environ["CRM_API_URL"] = "https://..." (нужен crm/crm_config.py через
+    os.getenv() напрямую, минуя pydantic-settings).
 
 [5] get_settings()  →  выбор подкласса Settings
-    mode = os.getenv("API_MODE")  →  "dev"
-    mode in ("dev", "development")  →  return DevelopmentSettings()
+    mode = os.getenv("API_MODE")  →  "test"
+    mode in ("test", "testing")  →  return TestingSettings()
 
     Ветви выбора:
       "test" / "testing"       → TestingSettings   (env_file=".tests.env")
@@ -162,31 +190,31 @@ settings = get_settings()
       "prod" / "production"    → ProductionSettings  (env_file=".env")
       любое другое / None      → ProductionSettings  (безопасный fallback)
 
-[6] DevelopmentSettings()  →  инициализация pydantic-settings
+[6] TestingSettings()  →  инициализация pydantic-settings
     Источники значений в порядке убывания приоритета:
-      1. os.environ           (заполнен load_dotenv на шаге [2])
-      2. env_file=".dev.env"  (повторно читается как резервный источник)
-      3. default в классе     (SMTP_PORT=465, CORS_ORIGINS_CSV="http://localhost,...", ...)
+      1. os.environ           (заполнен load_dotenv на шагах [3]-[4])
+      2. env_file=".tests.env" (повторно читается как резервный источник)
+      3. default в классе      (SMTP_PORT=465, CORS_ORIGINS_CSV="http://localhost,...", ...)
 
     Для каждого объявленного поля:
-      api_mode: str      → os.environ["API_MODE"]    = "dev"           → "dev"
-      smtp_port: int     → os.environ["SMTP_PORT"]   = "465" (строка)
-                           lax-валидатор: int("465") → 465
-      REG_TOKEN_SECRET   → не найдено ни в os.environ, ни в .dev.env
-                           → ValidationError: приложение не запускается
+      db_name: str        → os.environ["DB_NAME"]    = "task_manager_test"    → "task_manager_test"
+      smtp_port: int       → os.environ["SMTP_PORT"]  = "465" (строка)
+                             lax-валидатор: int("465") → 465
+      REG_TOKEN_SECRET     → не найдено ни в os.environ, ни в .tests.env
+                             → ValidationError: приложение не запускается
 
-    extra="ignore": переменные из .dev.env, не объявленные в Settings
+    extra="ignore": переменные из .dev.env/.tests.env, не объявленные в Settings
     (CRM_API_URL, CRM_API_KEY, ...), молча отбрасываются — они нужны
     только crm/crm_config.py через os.getenv(), не через pydantic.
 
-[7] settings = <DevelopmentSettings object>
+[7] settings = <TestingSettings object>
     Объект создан и привязан к имени settings на уровне модуля.
     @lru_cache сохраняет его внутри get_settings.
 
 [8] Кэш lru_cache — необратимость после первого вызова
     Все последующие вызовы get_settings() возвращают тот же объект.
     Смена API_MODE после этой точки не имеет эффекта:
-      os.environ["API_MODE"] = "prod"   →  get_settings()  →  тот же DevelopmentSettings
+      os.environ["API_MODE"] = "prod"   →  get_settings()  →  тот же TestingSettings
     Сбросить кэш можно только явно: get_settings.cache_clear()
 
 [9] from src.config import settings  (в любом другом модуле)

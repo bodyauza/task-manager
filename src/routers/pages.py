@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.auth_config import current_user
-from src.auth.user_models import Role, User
+from src.auth.user_models import Role, User, user_role
 from src.database import get_async_session
 from src.task_logic.models import Subtask, Task
 
@@ -120,13 +120,20 @@ async def profile_page(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    role = await db.get(Role, user.role_id)
+    # Явный select().join() вместо user.roles: пользователь теперь может иметь
+    # несколько ролей (many-to-many, user_role) — тот же приём, что в require_role()
+    # (src/auth/auth_config.py), и та же причина, по которой это не user.roles
+    # напрямую — обращение к незагруженной lazy-relationship в async-коде роняет
+    # запрос MissingGreenlet.
+    roles = (await db.execute(
+        select(Role).join(user_role).where(user_role.c.person_id == user.id)
+    )).scalars().all()
 
     # Jinja2 рендерит шаблон синхронно. Если передать ORM-объект напрямую,
-    # обращение к «ленивым» атрибутам (например, user.role.name) внутри шаблона
-    # вызовет MissingGreenlet: SQLAlchemy не может выполнить SELECT вне async-контекста.
-    # Все нужные значения извлекаются здесь, пока сессия открыта, и передаются
-    # в шаблон как обычные Python-значения.
+    # обращение к «ленивым» атрибутам внутри шаблона вызовет MissingGreenlet:
+    # SQLAlchemy не может выполнить SELECT вне async-контекста. Все нужные значения
+    # извлекаются здесь, пока сессия открыта, и передаются в шаблон как обычные
+    # Python-значения.
     response = templates.TemplateResponse(
         request,
         "profile.html",
@@ -137,7 +144,7 @@ async def profile_page(
             "patronymic":    user.patronymic or "",
             "email":         user.email,
             "username":      user.username,
-            "role_name":     role.name if role else "—",
+            "role_names":    [role.name for role in roles] if roles else ["—"],
             "registered_at": (
                 user.registered_at.strftime("%d.%m.%Y") if user.registered_at else "—"
             ),

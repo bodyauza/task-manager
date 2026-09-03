@@ -60,9 +60,9 @@ async def create_initial_roles():
 
             roles_to_add = []
             if 1 not in existing_ids:
-                roles_to_add.append(Role(id=1, name="user", permissions=["read", "write"]))
+                roles_to_add.append(Role(id=1, name="user"))
             if 2 not in existing_ids:
-                roles_to_add.append(Role(id=2, name="admin", permissions=["read", "write", "delete"]))
+                roles_to_add.append(Role(id=2, name="admin"))
 
             if roles_to_add:
                 session.add_all(roles_to_add)
