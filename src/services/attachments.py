@@ -111,6 +111,94 @@ SUBTASK_ATTACHMENTS = AttachmentConfig(
 
 
 # ════════════════════════════════════════════════════════════
+# Атомарное создание сущности с файлами (POST /create-task/, /create-subtask/)
+# ════════════════════════════════════════════════════════════
+
+async def validate_files_for_create(
+    specification: Optional[UploadFile],
+    other_files: Optional[list[UploadFile]],
+) -> tuple[Optional[tuple[bytes, str, str]], list[tuple[bytes, str, str]]]:
+    """Валидирует spec (если есть) и other_files (если есть) полностью в памяти.
+
+    Вызывается ПЕРВЫМ шагом create-флоу, до создания CRM-записи и до INSERT в БД —
+    единственный невалидный файл должен блокировать создание сущности целиком (422),
+    ничего не должно быть тронуто. Отдельно от save_files_for_create() ниже: та
+    вызывается уже после того, как сущность гарантированно существует, и её сбои
+    best-effort, а не 422.
+
+    other_files создаётся "с нуля" (существующих файлов ещё нет), поэтому лимит
+    MAX_OTHER_FILES проверяется просто как len(other_files) — в отличие от
+    upload_other_files(), где к нему прибавляется количество уже загруженных.
+    """
+    other_files = other_files or []
+    if len(other_files) > MAX_OTHER_FILES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Превышен лимит файлов ({MAX_OTHER_FILES} штук).",
+        )
+
+    spec_validated: Optional[tuple[bytes, str, str]] = None
+    if specification is not None:
+        content = await read_and_validate(specification)
+        spec_validated = (content, safe_filename(specification.filename), specification.filename)
+
+    other_validated = await _validate_other_files(other_files) if other_files else []
+    return spec_validated, other_validated
+
+
+async def save_files_for_create(
+    entity_id: int,
+    config: AttachmentConfig,
+    spec_validated: Optional[tuple[bytes, str, str]],
+    other_validated: list[tuple[bytes, str, str]],
+) -> tuple[Optional[str], list[str], dict[str, str]]:
+    """Best-effort сохранение уже провалидированных файлов на диск.
+
+    Вызывается ПОСЛЕ db.flush() (когда entity_id уже известен) и ДО финального
+    db.commit() — сущность к этому моменту уже гарантированно вставлена в сессию.
+    Сбой сохранения одного файла (диск, права доступа и т.п.) не поднимается наружу
+    и не влияет на соседние файлы — попадает в возвращаемый errors по оригинальному
+    имени файла. Если один и тот же оригинальный файл упоминается дважды и оба раза
+    падает — вторая ошибка перезапишет первую в словаре (редкий косметический случай,
+    не устраняется).
+    """
+    errors: dict[str, str] = {}
+
+    spec_path: Optional[str] = None
+    if spec_validated is not None:
+        content, filename, original_name = spec_validated
+        dest_dir = UPLOAD_ROOT / config.dir_segment / str(entity_id) / "specification"
+        try:
+            spec_path = await asyncio.to_thread(save_file, dest_dir, filename, content)
+        except Exception as exc:
+            logger.error("Create %s %s: spec save failed: %s", config.singular_name, entity_id, exc)
+            errors[original_name] = str(exc)
+
+    other_paths: list[str] = []
+    if other_validated:
+        dest_dir = UPLOAD_ROOT / config.dir_segment / str(entity_id) / "other"
+
+        async def _save_one(content: bytes, filename: str) -> str:
+            return await asyncio.to_thread(save_file, dest_dir, filename, content)
+
+        results = await asyncio.gather(
+            *[_save_one(content, filename) for content, filename, _ in other_validated],
+            return_exceptions=True,
+        )
+        for (_, _, original_name), result in zip(other_validated, results):
+            if isinstance(result, Exception):
+                logger.error(
+                    "Create %s %s: other-file save failed for '%s': %s",
+                    config.singular_name, entity_id, original_name, result,
+                )
+                errors[original_name] = str(result)
+            else:
+                other_paths.append(result)
+
+    return spec_path, other_paths, errors
+
+
+# ════════════════════════════════════════════════════════════
 # Техническое задание (одиночный файл)
 # ════════════════════════════════════════════════════════════
 
@@ -225,6 +313,33 @@ async def delete_specification(
 # Иные документы (множественные файлы)
 # ════════════════════════════════════════════════════════════
 
+async def _validate_other_files(files: list[UploadFile]) -> list[tuple[bytes, str, str]]:
+    """Валидирует все файлы параллельно, ничего не сохраняя на диск.
+
+    Возвращает (content, safe_filename, original_filename) для каждого файла —
+    original_filename нужен вызывающему коду create-флоу для ключей file_upload_errors,
+    upload_other_files его игнорирует.
+
+    return_exceptions=True вместо того чтобы дать gather самому оборвать ожидание на
+    первой ошибке: поток ОС, уже занятый magic.from_buffer() для другого файла, всё
+    равно не остановить снаружи — он доработает сам по себе, просто впустую. Дожидаемся
+    всех результатов и поднимаем первую ошибку сами — так на диске не остаётся частично
+    сохранённых файлов (сохранение начинается только после этой проверки).
+    """
+    async def _validate_one(upload: UploadFile) -> tuple[bytes, str, str]:
+        content = await read_and_validate(upload)
+        filename = safe_filename(upload.filename)
+        return content, filename, upload.filename
+
+    validation_results = await asyncio.gather(
+        *[_validate_one(upload) for upload in files], return_exceptions=True
+    )
+    for result in validation_results:
+        if isinstance(result, BaseException):
+            raise result
+    return validation_results  # после цикла выше — только tuple
+
+
 async def upload_other_files(
     db: AsyncSession,
     user: User,
@@ -273,35 +388,15 @@ async def upload_other_files(
 
     dest_dir = UPLOAD_ROOT / config.dir_segment / str(entity_id) / "other"
 
-    # Проход 1: валидируем все файлы до записи на диск. asyncio.gather не выполняет их
-    # параллельно сам по себе — он просто не ждёт завершения одной корутины перед
-    # запуском следующей. Реальный параллелизм даёт magic.from_buffer внутри
-    # read_and_validate(), обёрнутый в asyncio.to_thread, — это настоящие отдельные
-    # потоки ОС (см. file_utils.py).
-    # return_exceptions=True вместо того чтобы дать gather самому оборвать ожидание на первой
-    # ошибке: поток ОС, уже занятый magic.from_buffer() для другого файла, всё равно не
-    # остановить снаружи — он доработает сам по себе, просто впустую. Дожидаемся всех
-    # результатов и поднимаем первую ошибку сами — так на диске по-прежнему не остаётся
-    # частично сохранённых файлов (сохранение всё ещё начинается только после этой проверки).
-    async def _validate_one(upload: UploadFile) -> tuple[bytes, str]:
-        content = await read_and_validate(upload)
-        filename = safe_filename(upload.filename)
-        return content, filename
-
-    validation_results = await asyncio.gather(
-        *[_validate_one(upload) for upload in files], return_exceptions=True
-    )
-    for result in validation_results:
-        if isinstance(result, BaseException):
-            raise result
-    validated: list[tuple[bytes, str]] = validation_results  # после цикла выше — только tuple
+    # Проход 1: валидируем все файлы до записи на диск (см. _validate_other_files выше).
+    validated = await _validate_other_files(files)
 
     # Проход 2: все файлы валидны — сохраняем на диск параллельно. В отличие от MIME-проверки
     # выше (сериализована общим локом внутри python-magic), запись на диск такого ограничения
     # не имеет — у каждого файла свой UUID-префикс от safe_filename(), коллизий имён нет.
     # gather() уже возвращает list — оборачивать в list() не нужно.
     new_paths: list[str] = await asyncio.gather(
-        *[asyncio.to_thread(save_file, dest_dir, filename, content) for content, filename in validated]
+        *[asyncio.to_thread(save_file, dest_dir, filename, content) for content, filename, _ in validated]
     )
 
     updated = existing + new_paths

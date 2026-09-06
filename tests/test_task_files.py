@@ -69,7 +69,10 @@ async def _auth(client: AsyncClient, mock_smtp: dict) -> None:
 
 
 async def _make_task(client: AsyncClient) -> dict:
-    r = await client.post("/create-task/", json={"title": "FileTask", "description": "d"})
+    # POST /create-task/ теперь multipart/form-data — см. tests/test_tasks.py::_create.
+    r = await client.post(
+        "/create-task/", data={"data": json.dumps({"title": "FileTask", "description": "d"})}
+    )
     assert r.status_code == 201
     return r.json()
 
@@ -486,7 +489,7 @@ async def test_delete_task_removes_subtask_files(client, mock_smtp, mock_magic, 
     tid = task["id"]
     subtask = (await client.post(
         "/create-subtask/",
-        json={"task_id": tid, "title": "SubWithFiles", "description": ""},
+        data={"data": json.dumps({"task_id": tid, "title": "SubWithFiles", "description": ""})},
     )).json()
     sid = subtask["id"]
     await client.post(f"/subtasks/{sid}/specification", files=_spec_upload(_pdf()))

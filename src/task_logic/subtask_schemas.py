@@ -65,3 +65,6 @@ class SubtaskResponse(BaseModel):
     # ORM-колонка JSONB: asyncpg десериализует JSONB → list[str] при чтении автоматически.
     # None/[] — документов нет.
     other_file_paths: Optional[list[str]] = None
+
+    # См. TaskResponse.file_upload_errors в task_schemas.py — то же самое для подзадач.
+    file_upload_errors: Optional[dict[str, str]] = None

@@ -1,6 +1,8 @@
-from typing import List
+import json
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.auth_config import current_user
@@ -16,12 +18,23 @@ router = APIRouter(tags=["Working with tasks"])
 
 @router.post("/create-task/", response_model=TaskResponse, status_code=201)
 async def create_task(
-    task: TaskCreate,
+    # multipart/form-data: тело задачи — JSON-строка в form-поле "data", а не
+    # Annotated[TaskCreate, Form()] — FastAPI 0.115 не разворачивает Pydantic-модель
+    # в form-поля, когда рядом с ней в сигнатуре есть File(...)-параметры (проверено
+    # эмпирически). Позволяет создать задачу и файлы вложений одним HTTP-запросом
+    # (атомарно на стороне сервиса — см. services/tasks.py::create_task).
+    data: str = Form(...),
+    specification: Optional[UploadFile] = File(None),
+    other_files: List[UploadFile] = File([]),
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
     crm: TaskCRMSync = Depends(get_task_crm_sync),
 ):
-    return await task_service.create_task(db, user, task, crm)
+    try:
+        task = TaskCreate.model_validate_json(data)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=json.loads(exc.json()))
+    return await task_service.create_task(db, user, task, crm, specification, other_files)
 
 
 @router.get("/tasks/", response_model=List[TaskResponse])

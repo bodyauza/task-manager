@@ -59,7 +59,10 @@ async def _auth(client: AsyncClient, mock_smtp: dict) -> None:
 
 
 async def _make_task(client: AsyncClient) -> dict:
-    r = await client.post("/create-task/", json={"title": "SubFileTask", "description": "d"})
+    # POST /create-task/ теперь multipart/form-data — см. tests/test_tasks.py::_create.
+    r = await client.post(
+        "/create-task/", data={"data": json.dumps({"title": "SubFileTask", "description": "d"})}
+    )
     assert r.status_code == 201
     return r.json()
 
@@ -67,7 +70,7 @@ async def _make_task(client: AsyncClient) -> dict:
 async def _make_subtask(client: AsyncClient, task_id: int) -> dict:
     r = await client.post(
         "/create-subtask/",
-        json={"task_id": task_id, "title": "SubFileSubtask", "description": "d"},
+        data={"data": json.dumps({"task_id": task_id, "title": "SubFileSubtask", "description": "d"})},
     )
     assert r.status_code == 201
     return r.json()

@@ -10,7 +10,7 @@ import asyncio
 import logging
 from typing import List, Optional
 
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,8 +41,19 @@ def _subtask_count_subquery():
 
 
 async def create_task(
-    db: AsyncSession, user: User, task: TaskCreate, crm: TaskCRMSync,
+    db: AsyncSession,
+    user: User,
+    task: TaskCreate,
+    crm: TaskCRMSync,
+    specification: Optional[UploadFile] = None,
+    other_files: Optional[list[UploadFile]] = None,
 ) -> TaskResponse:
+    # Валидация файлов — первым делом, до CRM/БД: единственный невалидный файл
+    # должен блокировать создание задачи целиком (422), ничего не должно быть тронуто.
+    spec_validated, other_validated = await attachments.validate_files_for_create(
+        specification, other_files
+    )
+
     # Проверяем уникальность title+owner ДО вызова CRM, чтобы не создавать
     # дубликаты в CRM при повторном запросе с тем же названием.
     existing = (
@@ -80,10 +91,14 @@ async def create_task(
     db_task = Task(**task.model_dump(), owner_id=user.id, crm_task_id=crm_task_id)
     db.add(db_task)
     try:
-        await db.commit()
+        # flush() (не commit()): нужен db_task.id для путей файлов ниже, но файлы ещё
+        # не должны быть записаны на диск, если сама вставка задачи упадёт (дубликат
+        # title под гонкой — UNIQUE(title, owner_id) проверяется PostgreSQL уже здесь,
+        # на INSERT, а не откладывается до commit()).
+        await db.flush()
     except IntegrityError:
         await db.rollback()
-        # Компенсирующая транзакция: CRM-запись создана, но commit упал →
+        # Компенсирующая транзакция: CRM-запись создана, но flush упал →
         # удаляем запись из CRM, чтобы не оставить сироту.
         if crm_task_id is not None:
             try:
@@ -91,13 +106,42 @@ async def create_task(
             except Exception as crm_exc:
                 logger.error("CRM compensating delete failed for crm_id=%s: %s", crm_task_id, crm_exc)
         raise HTTPException(status_code=409, detail=f"Task with title '{task.title}' already exists")
+
+    # Сущность гарантированно существует (в рамках открытой транзакции) — сохранение
+    # файлов на диск теперь best-effort: сбой одного файла не откатывает задачу.
+    spec_path, other_paths, file_upload_errors = await attachments.save_files_for_create(
+        db_task.id, attachments.TASK_ATTACHMENTS, spec_validated, other_validated,
+    )
+    if spec_path is not None:
+        db_task.specification_path = spec_path
+    if other_paths:
+        db_task.other_file_paths = other_paths
+    await db.commit()
     # db.refresh() здесь не нужен: async_session_maker сконфигурирован с
     # expire_on_commit=False (src/database.py) — атрибуты db_task не инвалидируются
     # после commit(), а id уже заполнен через INSERT ... RETURNING id, который
     # SQLAlchemy 2.0 + asyncpg используют автоматически при flush.
+
+    # Синхронизация путей файлов с CRM — отдельный best-effort вызов ПОСЛЕ commit
+    # (в отличие от текстовых полей выше): CRM не принимает файлы при создании,
+    # только при update; и "задача создана" не должно зависеть от исхода этого вызова.
+    if crm_task_id is not None and (spec_path is not None or other_paths):
+        try:
+            await crm.update_task(
+                task_id=crm_task_id,
+                specification_abs_path=(attachments.UPLOAD_ROOT / spec_path) if spec_path else None,
+                other_file_abs_paths=(
+                    [attachments.UPLOAD_ROOT / p for p in other_paths] if other_paths else None
+                ),
+            )
+            logger.info("CRM: task id=%s files synced (crm_id=%s)", db_task.id, crm_task_id)
+        except Exception as exc:
+            logger.error("CRM update_task (files) failed for task id=%s: %s", db_task.id, exc)
+
     await broadcast_task_event("task_created", db_task.title, exclude_user_id=user.id, sender_email=user.email)
     result = TaskResponse.model_validate(db_task)
     result.crm_synced = crm_task_id is not None
+    result.file_upload_errors = file_upload_errors or None
     return result
 
 

@@ -245,6 +245,33 @@ function sendMessage() {
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
 
+// Снимок полей editModal на момент открытия — editTitle/editDescription/editCompleted
+// изначально ПРЕДЗАПОЛНЕНЫ данными редактируемой задачи (не пусты), поэтому здесь
+// нельзя использовать hasUnsavedFormData (проверка "пусто/не пусто"); нужен именно
+// снимок + сравнение с текущим состоянием на момент закрытия.
+let _editModalSnapshot = null;
+
+function _readEditModalFields() {
+    return {
+        title: document.getElementById('editTitle').value,
+        description: document.getElementById('editDescription').value,
+        completed: document.getElementById('editCompleted').checked,
+    };
+}
+
+function _editModalHasUnsavedChanges() {
+    if (!_editModalSnapshot) return false;
+    const current = _readEditModalFields();
+    return current.title !== _editModalSnapshot.title
+        || current.description !== _editModalSnapshot.description
+        || current.completed !== _editModalSnapshot.completed;
+}
+
+registerModalCloseGuard(
+    'editModal', _editModalHasUnsavedChanges,
+    'Отменить редактирование? Несохранённые данные будут потеряны.',
+);
+
 function openEditModal(id) {
     // Поиск в кэше currentTasks: избегает дополнительного GET-запроса при открытии модала.
     const task = currentTasks.find(t => t.id === id);
@@ -255,11 +282,12 @@ function openEditModal(id) {
     document.getElementById('editDescription').value = task.description;
     document.getElementById('editCompleted').checked = task.completed;
     _updateCharCounter(editTitleEl, document.getElementById('editTitleCounter'), TITLE_MAX_LENGTH);
-    document.getElementById('editModal').style.display = 'flex';
+    _editModalSnapshot = _readEditModalFields();
+    openModal('editModal');
 }
 
 function closeEditModal() {
-    document.getElementById('editModal').style.display = 'none';
+    closeModal('editModal');
 }
 
 async function submitEdit() {
@@ -268,28 +296,150 @@ async function submitEdit() {
     const description = document.getElementById('editDescription').value;
     const completed   = document.getElementById('editCompleted').checked;
     if (!title) { alert('Title cannot be empty'); return; }
+    // Прямой closeEditModal(), не requestCloseModal: сохранение — осознанное действие,
+    // подтверждение не нужно (см. общий принцип в common.js::requestCloseModal).
     closeEditModal();
     await updateTask(id, title, description, completed);
 }
 
-// Клик вне модального окна (на затемнённый оверлей) — закрывает окно.
+// Клик вне модального окна (на затемнённый оверлей) — запрашивает закрытие через guard.
 document.getElementById('editModal').addEventListener('click', function(e) {
-    if (e.target === this) closeEditModal();
+    if (e.target === this) requestCloseModal('editModal');
 });
 
 // ── Task CRUD ─────────────────────────────────────────────────────────────────
 
-document.getElementById('createTaskForm').addEventListener('submit', async function(e) {
-    e.preventDefault();
-    const title       = document.getElementById('title').value;
-    const description = document.getElementById('description').value;
+// ── Create task modal (атомарное создание задачи + файлов одним запросом) ──────
+
+// Файлы, выбранные в модалке, но ещё не отправленные на сервер — отправляются
+// одним запросом вместе с текстовыми полями при клике на "Создать", а не сразу
+// при выборе (в отличие от specInput/otherInput на task-detail.html, которые
+// оперируют уже существующей задачей и грузят файл немедленно).
+let createPendingSpecFile = null;
+let createPendingOtherFiles = [];
+
+// createSpecInput — обычный input[type=file], его выбранный файл уже виден
+// hasUnsavedFormData() через сам DOM-элемент. createOtherInput — не виден: его
+// value сбрасывается сразу после выбора (см. обработчик change ниже), а сами файлы
+// живут в отдельном JS-массиве createPendingOtherFiles — общий чекер формы этого
+// не увидит, поэтому очередь проверяется здесь отдельно, явно.
+registerModalCloseGuard(
+    'createTaskModal',
+    () => hasUnsavedFormData(document.getElementById('createTaskModal')) || createPendingOtherFiles.length > 0,
+    'Отменить создание? Несохранённые данные будут потеряны.',
+);
+
+function _resetCreateTaskModal() {
+    document.getElementById('createTitle').value = '';
+    document.getElementById('createDescription').value = '';
+    _updateCharCounter(
+        document.getElementById('createTitle'),
+        document.getElementById('createTitleCounter'),
+        TITLE_MAX_LENGTH,
+    );
+    createPendingSpecFile = null;
+    createPendingOtherFiles = [];
+    document.getElementById('createSpecInput').value = '';
+    document.getElementById('createOtherInput').value = '';
+    _renderCreateSpecPending();
+    _renderCreateOtherPending();
+}
+
+function openCreateTaskModal() {
+    _resetCreateTaskModal();
+    openModal('createTaskModal');
+}
+
+function _renderCreateSpecPending() {
+    const row = document.getElementById('createSpecPendingRow');
+    const name = document.getElementById('createSpecPendingName');
+    if (createPendingSpecFile) {
+        name.textContent = createPendingSpecFile.name;
+        row.style.display = 'flex';
+    } else {
+        row.style.display = 'none';
+    }
+}
+
+function _renderCreateOtherPending() {
+    const list = document.getElementById('createOtherPendingList');
+    const counter = document.getElementById('createOtherCount');
+    counter.textContent = `(${createPendingOtherFiles.length} / ${MAX_OTHER_FILES})`;
+    list.innerHTML = '';
+    createPendingOtherFiles.forEach((file, index) => {
+        const li = document.createElement('li');
+        li.innerHTML = `
+            <span class="file-pending-name">${escapeHtml(file.name)}</span>
+            <button class="btn-delete-file" data-remove-pending="${index}">✕</button>
+        `;
+        list.appendChild(li);
+    });
+}
+
+// validateOtherFileClientSide — то же правило, что и на task-detail.js (расширение +
+// размер, до отправки на сервер): дублируется здесь, а не выносится в common.js,
+// т.к. там же не вынесено на момент этой доработки (не расширяем область правки).
+function _validateOtherFileClientSide(file) {
+    const dotIndex = file.name.lastIndexOf('.');
+    const ext = dotIndex >= 0 ? file.name.slice(dotIndex).toLowerCase() : '';
+    const allowed = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.jpg', '.jpeg', '.png', '.txt'];
+    if (!allowed.includes(ext)) return `расширение «${ext || '(нет)'}» не поддерживается`;
+    if (file.size > OTHER_FILES_MAX_SIZE) return `размер превышает лимит ${OTHER_FILES_MAX_SIZE / (1024 * 1024)} МБ`;
+    return null;
+}
+
+document.getElementById('openCreateTaskModalBtn').addEventListener('click', openCreateTaskModal);
+document.getElementById('createTaskCancelBtn').addEventListener('click', function() { requestCloseModal('createTaskModal'); });
+document.getElementById('createTaskModal').addEventListener('click', function(e) {
+    if (e.target === this) requestCloseModal('createTaskModal');
+});
+
+document.getElementById('createSpecInput').addEventListener('change', function(e) {
+    createPendingSpecFile = e.target.files[0] || null;
+    _renderCreateSpecPending();
+});
+
+document.getElementById('createSpecRemoveBtn').addEventListener('click', function() {
+    createPendingSpecFile = null;
+    document.getElementById('createSpecInput').value = '';
+    _renderCreateSpecPending();
+});
+
+document.getElementById('createOtherInput').addEventListener('change', function(e) {
+    const chosen = Array.from(e.target.files);
+    e.target.value = ''; // диалог можно открыть заново без потери уже выбранных файлов
+    for (const file of chosen) {
+        const err = _validateOtherFileClientSide(file);
+        if (err) { showToast(`«${file.name}»: ${err}`, 'warning'); continue; }
+        if (createPendingOtherFiles.length >= MAX_OTHER_FILES) {
+            showToast(`Превышен лимит файлов (${MAX_OTHER_FILES} штук)`, 'warning');
+            break;
+        }
+        createPendingOtherFiles.push(file);
+    }
+    _renderCreateOtherPending();
+});
+
+document.getElementById('createOtherPendingList').addEventListener('click', function(e) {
+    const btn = e.target.closest('[data-remove-pending]');
+    if (!btn) return;
+    createPendingOtherFiles.splice(parseInt(btn.dataset.removePending, 10), 1);
+    _renderCreateOtherPending();
+});
+
+document.getElementById('createTaskSubmitBtn').addEventListener('click', async function() {
+    const title = document.getElementById('createTitle').value;
+    const description = document.getElementById('createDescription').value;
+
+    const fd = new FormData();
+    fd.append('data', JSON.stringify({ title, description }));
+    if (createPendingSpecFile) fd.append('specification', createPendingSpecFile);
+    for (const file of createPendingOtherFiles) fd.append('other_files', file);
 
     try {
-        const response = await fetchWithAuth('/create-task/', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title, description }),
-        });
+        // Content-Type не выставляется вручную — браузер сам проставит multipart
+        // boundary при теле FormData; явный 'application/json' здесь сломал бы запрос.
+        const response = await fetchWithAuth('/create-task/', { method: 'POST', body: fd });
         if (!response) return;
 
         if (response.ok) {
@@ -297,22 +447,25 @@ document.getElementById('createTaskForm').addEventListener('submit', async funct
             if (task.crm_synced === false) {
                 showToast('Задача создана без синхронизации с CRM', 'warning');
             }
+            if (task.file_upload_errors) {
+                for (const [name, msg] of Object.entries(task.file_upload_errors)) {
+                    showToast(`«${name}»: ${msg}`, 'warning');
+                }
+            }
             addMessage(`Task created: ${task.title}`);
-            document.getElementById('createTaskForm').reset();
+            closeModal('createTaskModal'); // без confirm — данные уже успешно отправлены
             loadTasks();
-        } else if (response.status === 422) {
+        } else {
             const error = await response.json();
             const msg = Array.isArray(error.detail)
                 ? error.detail.map(e => e.msg).join('; ')
-                : (error.detail || 'Ошибка валидации');
-            alert(`Ошибка валидации: ${msg}`);
-        } else {
-            const error = await response.json();
-            alert(`Error creating task: ${error.detail}`);
+                : (error.detail || 'Ошибка создания задачи');
+            // Модалка остаётся открытой: пользователь не теряет введённые данные/файлы.
+            showToast(msg, 'warning');
         }
     } catch (error) {
         console.error('Error:', error);
-        alert('Failed to create task');
+        showToast('Не удалось создать задачу', 'warning');
     }
 });
 
@@ -590,14 +743,14 @@ window.addEventListener('load', function() {
     document.getElementById('clearHistoryBtn').addEventListener('click', clearChatHistory);
     document.getElementById('searchBtn').addEventListener('click', searchTasksByTitle);
     document.getElementById('saveEditBtn').addEventListener('click', submitEdit);
-    document.getElementById('cancelEditBtn').addEventListener('click', closeEditModal);
+    document.getElementById('cancelEditBtn').addEventListener('click', function() { requestCloseModal('editModal'); });
 
-    const titleInput     = document.getElementById('title');
-    const titleCounter   = document.getElementById('titleCounter');
-    const editTitleInput = document.getElementById('editTitle');
-    const editCounter    = document.getElementById('editTitleCounter');
+    const createTitleInput = document.getElementById('createTitle');
+    const createCounter    = document.getElementById('createTitleCounter');
+    const editTitleInput   = document.getElementById('editTitle');
+    const editCounter      = document.getElementById('editTitleCounter');
 
-    titleInput.addEventListener('input', () => _updateCharCounter(titleInput, titleCounter, TITLE_MAX_LENGTH));
+    createTitleInput.addEventListener('input', () => _updateCharCounter(createTitleInput, createCounter, TITLE_MAX_LENGTH));
     editTitleInput.addEventListener('input', () => _updateCharCounter(editTitleInput, editCounter, TITLE_MAX_LENGTH));
 
     document.getElementById('messageInput').addEventListener('keypress', function(event) {

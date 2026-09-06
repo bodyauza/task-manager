@@ -79,6 +79,55 @@ function showToast(message, type = 'info') {
     }, 4000);
 }
 
+// openModal/closeModal — общие хелперы поверх .modal-overlay (см. task-board.html/
+// subtask-board.html): раньше каждая страница определяла свои open*Modal/close*Modal
+// с идентичным телом (style.display = 'flex'/'none'), продублированным для editModal
+// и (после появления второй модалки создания на тех же страницах) для createModal.
+function openModal(id) { document.getElementById(id).style.display = 'flex'; }
+function closeModal(id) { document.getElementById(id).style.display = 'none'; }
+
+// hasUnsavedFormData(container) — есть ли непустой текст в input[type=text]/textarea
+// или выбранный файл хотя бы в одном input[type=file] внутри container. Подходит для
+// форм/модалок СОЗДАНИЯ, у которых исходное состояние — пустота (любое заполненное
+// поле уже означает "есть что терять"). НЕ подходит для форм РЕДАКТИРОВАНИЯ — там
+// поля изначально предзаполнены существующими данными, и проверку "пусто/не пусто"
+// нужно заменять сравнением со снимком, снятым в момент открытия формы (см., например,
+// _editModalHasUnsavedChanges в task-board.js/subtask-board.js или снимок формы в
+// task-detail.js/subtask-detail.js).
+function hasUnsavedFormData(container) {
+    const textFields = container.querySelectorAll('input[type="text"], textarea');
+    for (const el of textFields) {
+        if (el.value.trim()) return true;
+    }
+    const fileFields = container.querySelectorAll('input[type="file"]');
+    for (const el of fileFields) {
+        if (el.files && el.files.length > 0) return true;
+    }
+    return false;
+}
+
+// registerModalCloseGuard/requestCloseModal — общий реестр "проверок перед закрытием"
+// по id модалки. Крестик/фон-подложка/«Отмена» должны вызывать requestCloseModal
+// вместо closeModal напрямую: closeModal() выполняется только если для этой модалки
+// не зарегистрирован guard, либо guard сообщает об отсутствии несохранённых данных,
+// либо пользователь явно подтвердил закрытие в confirm(). message переопределяется
+// на регистрации — текст «отменить создание»/«отменить редактирование» отличается
+// по контексту конкретной модалки.
+const _modalCloseGuards = {};
+
+function registerModalCloseGuard(modalId, checkFn, message) {
+    _modalCloseGuards[modalId] = {
+        checkFn,
+        message: message || 'Отменить создание? Несохранённые данные будут потеряны.',
+    };
+}
+
+function requestCloseModal(modalId) {
+    const guard = _modalCloseGuards[modalId];
+    if (guard && guard.checkFn() && !confirm(guard.message)) return;
+    closeModal(modalId);
+}
+
 // subtaskLabel — русское склонение числительных для счётчика подзадач.
 // Алгоритм работает по последней цифре (mod10), с отдельной обработкой чисел 11–14 (mod100):
 //   11, 12, 13, 14 — всегда «подзадач» (исключение из правила «1 → подзадача»).

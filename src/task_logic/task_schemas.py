@@ -70,3 +70,10 @@ class TaskResponse(BaseModel):
     # Pydantic получает готовый list[str] — ручной десериализации не требуется.
     # None/[] — документов нет.
     other_file_paths: Optional[list[str]] = None
+
+    # Заполняется только атомарным созданием (create_task с файлами), когда валидация
+    # прошла, но сохранение на диск части файлов упало ПОСЛЕ гарантированного создания
+    # задачи (см. attachments.py::save_files_for_create) — не персистентное поле,
+    # как и crm_synced выше. Ключ — оригинальное имя файла, значение — текст ошибки.
+    # None — либо не create-эндпоинт, либо все файлы (если были) сохранились успешно.
+    file_upload_errors: Optional[dict[str, str]] = None

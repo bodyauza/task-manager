@@ -1,3 +1,5 @@
+import json
+
 from httpx import AsyncClient
 
 from tests.conftest import register_user
@@ -15,7 +17,10 @@ async def _register_login(
 
 
 async def _create_task(client: AsyncClient, title: str = "Parent Task") -> dict:
-    r = await client.post("/create-task/", json={"title": title, "description": "desc"})
+    # POST /create-task/ теперь multipart/form-data — см. tests/test_tasks.py::_create.
+    r = await client.post(
+        "/create-task/", data={"data": json.dumps({"title": title, "description": "desc"})}
+    )
     return r.json()
 
 
@@ -27,7 +32,7 @@ async def _create_subtask(
 ):
     return await client.post(
         "/create-subtask/",
-        json={"task_id": task_id, "title": title, "description": description},
+        data={"data": json.dumps({"task_id": task_id, "title": title, "description": description})},
     )
 
 
@@ -49,7 +54,8 @@ async def test_create_subtask_success(client: AsyncClient, mock_smtp: dict):
 
 async def test_create_subtask_unauthenticated(client: AsyncClient):
     r = await client.post(
-        "/create-subtask/", json={"task_id": 1, "title": "X", "description": ""}
+        "/create-subtask/",
+        data={"data": json.dumps({"task_id": 1, "title": "X", "description": ""})},
     )
     assert r.status_code == 401
 
@@ -65,7 +71,7 @@ async def test_create_subtask_empty_title(client: AsyncClient, mock_smtp: dict):
     task = await _create_task(client)
     r = await client.post(
         "/create-subtask/",
-        json={"task_id": task["id"], "title": "", "description": ""},
+        data={"data": json.dumps({"task_id": task["id"], "title": "", "description": ""})},
     )
     assert r.status_code == 422
 
@@ -76,7 +82,7 @@ async def test_create_subtask_whitespace_title_normalized(client: AsyncClient, m
     task = await _create_task(client)
     r = await client.post(
         "/create-subtask/",
-        json={"task_id": task["id"], "title": "  foo   bar  ", "description": ""},
+        data={"data": json.dumps({"task_id": task["id"], "title": "  foo   bar  ", "description": ""})},
     )
     assert r.status_code == 201
     assert r.json()["title"] == "foo bar"
@@ -137,7 +143,7 @@ async def test_create_subtask_no_description(client: AsyncClient, mock_smtp: dic
     task = await _create_task(client)
     r = await client.post(
         "/create-subtask/",
-        json={"task_id": task["id"], "title": "No Desc"},
+        data={"data": json.dumps({"task_id": task["id"], "title": "No Desc"})},
     )
     assert r.status_code == 201
     assert r.json()["description"] == ""
@@ -163,7 +169,7 @@ async def test_create_subtask_no_crm_sync_when_task_lacks_crm_id(
     await _register_login(client, mock_smtp)
     mock_crm["task_mgr"].create_task.return_value = {"id": None}
     task = (
-        await client.post("/create-task/", json={"title": "No CRM", "description": ""})
+        await client.post("/create-task/", data={"data": json.dumps({"title": "No CRM", "description": ""})})
     ).json()
     r = await _create_subtask(client, task["id"])
     assert r.status_code == 201
@@ -336,7 +342,7 @@ async def test_update_subtask_crm_synced_false_when_no_crm_id(
     await _register_login(client, mock_smtp)
     mock_crm["task_mgr"].create_task.return_value = {"id": None}
     task = (
-        await client.post("/create-task/", json={"title": "No CRM T", "description": ""})
+        await client.post("/create-task/", data={"data": json.dumps({"title": "No CRM T", "description": ""})})
     ).json()
     subtask = (await _create_subtask(client, task["id"])).json()
     assert subtask["crm_subtask_id"] is None

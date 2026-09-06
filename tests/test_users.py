@@ -1,3 +1,5 @@
+import json
+
 from httpx import AsyncClient
 from sqlalchemy import select
 
@@ -80,12 +82,12 @@ async def test_delete_user_cascades_tasks_and_subtasks(client: AsyncClient, mock
     # удалить его задачи, а через них — и подзадачи.
     await _register_login(client, mock_smtp, USER_EMAIL)
     task_r = await client.post(
-        "/create-task/", json={"title": "Owned task", "description": "desc"}
+        "/create-task/", data={"data": json.dumps({"title": "Owned task", "description": "desc"})}
     )
     task_id = task_r.json()["id"]
     subtask_r = await client.post(
         "/create-subtask/",
-        json={"task_id": task_id, "title": "Owned subtask", "description": "desc"},
+        data={"data": json.dumps({"task_id": task_id, "title": "Owned subtask", "description": "desc"})},
     )
     subtask_id = subtask_r.json()["id"]
 

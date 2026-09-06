@@ -377,6 +377,22 @@
 
         .char-counter.limit-near { color: #e65100; }
         .char-counter.limit-reached { color: #b71c1c; font-weight: 700; }
+
+        /* ── Секция файлов (модалка создания задачи) — см. task-detail.html ── */
+        .file-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid #dee2e6; }
+        .file-upload-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+        .file-upload-row input[type="file"] { flex: 1; min-width: 0; font-size: 13px; }
+        .btn-upload { background-color: #546e7a; }
+        .btn-upload:hover { background-color: #37474f; }
+        .file-current { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+        .file-link { font-size: 13px; color: #003f6b; word-break: break-all; }
+        .btn-delete-file { background-color: #b71c1c; padding: 4px 10px; font-size: 12px; }
+        .btn-delete-file:hover { background-color: #961515; }
+        .file-list { list-style: none; padding: 0; margin: 6px 0 0; }
+        .file-list li { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+        .files-counter { font-size: 11px; color: #6c757d; margin-left: 4px; }
+        .pending-caption { font-size: 11px; font-weight: 700; color: #e65100; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 8px; }
+        .file-pending-name { font-size: 13px; color: #6c757d; font-style: italic; word-break: break-all; }
     </style>
 </head>
 <body>
@@ -404,18 +420,7 @@
 
             <div class="card">
                 <h2>Создать задачу</h2>
-                <form id="createTaskForm">
-                    <div class="form-group">
-                        <label for="title">Название</label>
-                        <input type="text" id="title" required maxlength="100">
-                        <div class="char-counter"><span id="titleCounter">0</span> / 100</div>
-                    </div>
-                    <div class="form-group">
-                        <label for="description">Описание</label>
-                        <textarea id="description" required maxlength="2000"></textarea>
-                    </div>
-                    <button type="submit">Создать задачу</button>
-                </form>
+                <button id="openCreateTaskModalBtn">Добавить задачу</button>
             </div>
 
             <div class="card">
@@ -461,7 +466,59 @@
         </div>
     </div>
 
-    <script src="/static/js/common.js?v=2" defer></script>
-    <script src="/static/js/task-board.js?v=4" defer></script>
+    <div id="createTaskModal" class="modal-overlay">
+        <div class="modal-box">
+            <h3>Добавить задачу</h3>
+            <div class="form-group">
+                <label for="createTitle">Название</label>
+                <input type="text" id="createTitle" maxlength="100">
+                <div class="char-counter"><span id="createTitleCounter">0</span> / 100</div>
+            </div>
+            <div class="form-group">
+                <label for="createDescription">Описание</label>
+                <textarea id="createDescription" maxlength="2000"></textarea>
+            </div>
+
+            <!-- ── Техническое задание ─────────────────────────────────────── -->
+            <div class="file-section">
+                <span class="field-label">Техническое задание</span>
+                <!-- createSpecPendingRow скрыт, пока файл не выбран — JS управляет видимостью -->
+                <div class="file-current" id="createSpecPendingRow" style="display:none;">
+                    <span class="file-pending-name" id="createSpecPendingName"></span>
+                    <button class="btn-delete-file" id="createSpecRemoveBtn">✕ Убрать</button>
+                </div>
+                <div class="file-upload-row">
+                    <!-- accept: браузерный фильтр диалога выбора файла (не замена серверной валидации) -->
+                    <input type="file" id="createSpecInput"
+                           accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png,.txt">
+                </div>
+            </div>
+
+            <!-- ── Иные документы ──────────────────────────────────────────── -->
+            <div class="file-section">
+                <span class="field-label">
+                    Иные документы
+                    <span class="files-counter" id="createOtherCount">(0 / 10)</span>
+                </span>
+                <!-- createOtherPendingList заполняется JS по мере выбора файлов -->
+                <ul class="file-list" id="createOtherPendingList"></ul>
+                <div class="file-upload-row">
+                    <!-- multiple: диалог выбора можно открывать повторно — новые файлы
+                         добавляются к списку, не заменяя предыдущий выбор. Отправка на
+                         сервер — только вместе с самой задачей, по клику на "Создать". -->
+                    <input type="file" id="createOtherInput" multiple
+                           accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png,.txt">
+                </div>
+            </div>
+
+            <div class="modal-actions">
+                <button id="createTaskSubmitBtn">Создать</button>
+                <button class="delete" id="createTaskCancelBtn">Отмена</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/common.js?v=4" defer></script>
+    <script src="/static/js/task-board.js?v=6" defer></script>
 </body>
 </html>

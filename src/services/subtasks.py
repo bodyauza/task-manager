@@ -6,7 +6,7 @@
 import logging
 from typing import List, Optional
 
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,8 +22,19 @@ logger = logging.getLogger(__name__)
 
 
 async def create_subtask(
-    db: AsyncSession, user: User, subtask: SubtaskCreate, crm: SubtaskCRMSync,
+    db: AsyncSession,
+    user: User,
+    subtask: SubtaskCreate,
+    crm: SubtaskCRMSync,
+    specification: Optional[UploadFile] = None,
+    other_files: Optional[list[UploadFile]] = None,
 ) -> SubtaskResponse:
+    # Валидация файлов — первым делом, до CRM/БД: единственный невалидный файл
+    # должен блокировать создание подзадачи целиком (422), ничего не должно быть тронуто.
+    spec_validated, other_validated = await attachments.validate_files_for_create(
+        specification, other_files
+    )
+
     task = (await db.execute(select(Task).where(Task.id == subtask.task_id))).scalar_one_or_none()
     # scalar_one_or_none(): вернёт объект Task или None; SELECT FROM task WHERE id=?
     if task is None:
@@ -60,10 +71,12 @@ async def create_subtask(
     )
     db.add(db_subtask)                              # добавить в сессию (состояние pending)
     try:
-        await db.commit()                           # INSERT INTO subtask ...; фиксирует транзакцию
+        # flush() (не commit()): нужен db_subtask.id для путей файлов ниже, но файлы ещё
+        # не должны быть записаны на диск, если сама вставка подзадачи упадёт.
+        await db.flush()                            # INSERT INTO subtask ...
     except IntegrityError:
         await db.rollback()                         # откатить транзакцию при нарушении ограничения БД
-        # Компенсирующая транзакция: CRM-запись создана, но commit упал →
+        # Компенсирующая транзакция: CRM-запись создана, но flush упал →
         # удаляем запись из CRM, чтобы не оставить сироту.
         if crm_subtask_id is not None:
             try:
@@ -89,10 +102,36 @@ async def create_subtask(
             status_code=409,
             detail=f"Subtask with title '{subtask.title}' already exists in this task",
         )
+    # Сущность гарантированно существует (в рамках открытой транзакции) — сохранение
+    # файлов на диск теперь best-effort: сбой одного файла не откатывает подзадачу.
+    spec_path, other_paths, file_upload_errors = await attachments.save_files_for_create(
+        db_subtask.id, attachments.SUBTASK_ATTACHMENTS, spec_validated, other_validated,
+    )
+    if spec_path is not None:
+        db_subtask.specification_path = spec_path
+    if other_paths:
+        db_subtask.other_file_paths = other_paths
+    await db.commit()
     # db.refresh() не нужен: async_session_maker сконфигурирован с expire_on_commit=False
     # (src/database.py) — атрибуты db_subtask не инвалидируются после commit(), а id уже
     # заполнен через INSERT ... RETURNING id, который SQLAlchemy 2.0 + asyncpg используют
     # автоматически при flush.
+
+    # Синхронизация путей файлов с CRM — отдельный best-effort вызов ПОСЛЕ commit,
+    # только если сама подзадача зарегистрирована в CRM (см. crm_subtask_id выше).
+    if crm_subtask_id is not None and (spec_path is not None or other_paths):
+        try:
+            await crm.update_subtask(
+                subtask_id=crm_subtask_id,
+                specification_abs_path=(attachments.UPLOAD_ROOT / spec_path) if spec_path else None,
+                other_file_abs_paths=(
+                    [attachments.UPLOAD_ROOT / p for p in other_paths] if other_paths else None
+                ),
+            )
+            logger.info("CRM: subtask id=%s files synced (crm_id=%s)", db_subtask.id, crm_subtask_id)
+        except Exception as exc:
+            logger.error("CRM update_subtask (files) failed for subtask id=%s: %s", db_subtask.id, exc)
+
     await broadcast_task_event(
         "subtask_created", db_subtask.title,
         sender_email=user.email,  # email актора → data.sender для других пользователей
@@ -107,6 +146,7 @@ async def create_subtask(
     )
     result = SubtaskResponse.model_validate(db_subtask)     # ORM-объект → Pydantic-схема
     result.crm_synced = crm_subtask_id is not None  # True если CRM вернул id, False если нет
+    result.file_upload_errors = file_upload_errors or None
     return result
 
 

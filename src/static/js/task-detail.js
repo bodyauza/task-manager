@@ -347,6 +347,30 @@ async function loadTask() {
     }
 }
 
+// Снимок формы редактирования на момент открытия. editForm — не оверлей-модалка
+// (переключается CSS-классом .visible, а не показывается/скрывается через
+// openModal/closeModal), поэтому общий registerModalCloseGuard/requestCloseModal
+// из common.js сюда не подходит напрямую — тот управляет именно модалками по id.
+// Поля здесь ПРЕДЗАПОЛНЕНЫ данными задачи (не пусты изначально), поэтому, как и у
+// editModal на task-board.js, нужен снимок + сравнение, а не hasUnsavedFormData.
+let _editFormSnapshot = null;
+
+function _readEditFormFields() {
+    return {
+        title: document.getElementById('editTitle').value,
+        description: document.getElementById('editDescription').value,
+        completed: document.getElementById('editCompleted').checked,
+    };
+}
+
+function _editFormHasUnsavedChanges() {
+    if (!_editFormSnapshot) return false;
+    const current = _readEditFormFields();
+    return current.title !== _editFormSnapshot.title
+        || current.description !== _editFormSnapshot.description
+        || current.completed !== _editFormSnapshot.completed;
+}
+
 function openEditForm() {
     if (!currentTask) return;
     const titleEl = document.getElementById('editTitle');
@@ -354,6 +378,7 @@ function openEditForm() {
     document.getElementById('editDescription').value = currentTask.description;
     document.getElementById('editCompleted').checked = currentTask.completed;
     _updateCharCounter(titleEl, document.getElementById('editTitleCounter'), TITLE_MAX_LENGTH);
+    _editFormSnapshot = _readEditFormFields();
     document.getElementById('editForm').classList.add('visible');
     document.getElementById('editToggleBtn').style.display = 'none';
 }
@@ -361,6 +386,18 @@ function openEditForm() {
 function closeEditForm() {
     document.getElementById('editForm').classList.remove('visible');
     document.getElementById('editToggleBtn').style.display = '';
+}
+
+// Кнопка «Отмена»: спрашивает подтверждение только если форма реально менялась
+// относительно снимка, снятого при открытии (см. _editFormSnapshot выше). Прямое
+// сохранение (saveTask → closeEditForm()) confirm() не проходит — это осознанное
+// сохраняющее действие, а не "закрыть без сохранения".
+function requestCloseEditForm() {
+    if (_editFormHasUnsavedChanges()
+        && !confirm('Отменить редактирование? Несохранённые данные будут потеряны.')) {
+        return;
+    }
+    closeEditForm();
 }
 
 async function saveTask() {
@@ -466,7 +503,7 @@ window.addEventListener('load', function() {
     connectWebSocket();
 
     document.getElementById('editToggleBtn').addEventListener('click', openEditForm);
-    document.getElementById('cancelBtn').addEventListener('click', closeEditForm);
+    document.getElementById('cancelBtn').addEventListener('click', requestCloseEditForm);
     document.getElementById('saveBtn').addEventListener('click', saveTask);
     document.getElementById('deleteBtn').addEventListener('click', deleteTask);
 

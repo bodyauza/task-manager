@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 from httpx import AsyncClient
 
@@ -17,7 +18,11 @@ async def _register_login(
 
 
 async def _create(client: AsyncClient, title: str = "My Task", description: str = "desc"):
-    return await client.post("/create-task/", json={"title": title, "description": description})
+    # POST /create-task/ теперь multipart/form-data: тело задачи — JSON-строка в
+    # form-поле "data" (см. routers/task_routers.py); файлы в этих тестах не нужны.
+    return await client.post(
+        "/create-task/", data={"data": json.dumps({"title": title, "description": description})}
+    )
 
 
 # ── Create ───────────────────────────────────────────────────────────────────
@@ -45,7 +50,7 @@ async def test_create_task_duplicate_title(client: AsyncClient, mock_smtp: dict)
 
 async def test_create_task_empty_title(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp)
-    r = await client.post("/create-task/", json={"title": "", "description": "d"})
+    r = await client.post("/create-task/", data={"data": json.dumps({"title": "", "description": "d"})})
     assert r.status_code == 422
 
 
@@ -225,7 +230,7 @@ async def test_concurrent_delete_and_create_subtask_no_crash(client: AsyncClient
         client.delete(f"/delete-task/{tid}"),
         client.post(
             "/create-subtask/",
-            json={"task_id": tid, "title": "RaceSub", "description": ""},
+            data={"data": json.dumps({"task_id": tid, "title": "RaceSub", "description": ""})},
         ),
     )
 

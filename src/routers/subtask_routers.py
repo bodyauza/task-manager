@@ -1,6 +1,8 @@
-from typing import List
+import json
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.auth_config import current_user       # DI: возвращает текущего аутентифицированного User
@@ -15,12 +17,20 @@ router = APIRouter(tags=["Working with subtasks"])  # тег группируе�
 
 @router.post("/create-subtask/", response_model=SubtaskResponse, status_code=201)
 async def create_subtask(
-    subtask: SubtaskCreate,                         # тело запроса: task_id, title, description
+    # multipart/form-data — см. пояснение в routers/task_routers.py::create_task.
+    # task_id остаётся внутри JSON-строки "data" (SubtaskCreate не меняется).
+    data: str = Form(...),
+    specification: Optional[UploadFile] = File(None),
+    other_files: List[UploadFile] = File([]),
     user: User = Depends(current_user),             # требует аутентификации; 401 если токен недействителен
     db: AsyncSession = Depends(get_async_session),  # сессия выдаётся на время запроса
     crm: SubtaskCRMSync = Depends(get_subtask_crm_sync),
 ):
-    return await subtask_service.create_subtask(db, user, subtask, crm)
+    try:
+        subtask = SubtaskCreate.model_validate_json(data)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=json.loads(exc.json()))
+    return await subtask_service.create_subtask(db, user, subtask, crm, specification, other_files)
 
 
 @router.get("/subtasks/", response_model=List[SubtaskResponse])

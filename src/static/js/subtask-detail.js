@@ -336,6 +336,27 @@ async function loadSubtask() {
     }
 }
 
+// Снимок формы редактирования — см. подробное пояснение в task-detail.js
+// (editForm не оверлей-модалка, общий requestCloseModal сюда не подходит;
+// поля предзаполнены данными подзадачи, поэтому нужен снимок, а не hasUnsavedFormData).
+let _editFormSnapshot = null;
+
+function _readEditFormFields() {
+    return {
+        title: document.getElementById('editTitle').value,
+        description: document.getElementById('editDescription').value,
+        completed: document.getElementById('editCompleted').checked,
+    };
+}
+
+function _editFormHasUnsavedChanges() {
+    if (!_editFormSnapshot) return false;
+    const current = _readEditFormFields();
+    return current.title !== _editFormSnapshot.title
+        || current.description !== _editFormSnapshot.description
+        || current.completed !== _editFormSnapshot.completed;
+}
+
 function openEditForm() {
     if (!currentSubtask) return;
     const titleEl = document.getElementById('editTitle');
@@ -343,6 +364,7 @@ function openEditForm() {
     document.getElementById('editDescription').value = currentSubtask.description;
     document.getElementById('editCompleted').checked = currentSubtask.completed;
     _updateCharCounter(titleEl, document.getElementById('editTitleCounter'), TITLE_MAX_LENGTH);
+    _editFormSnapshot = _readEditFormFields();
     document.getElementById('editForm').classList.add('visible');
     document.getElementById('editToggleBtn').style.display = 'none';
 }
@@ -350,6 +372,16 @@ function openEditForm() {
 function closeEditForm() {
     document.getElementById('editForm').classList.remove('visible');
     document.getElementById('editToggleBtn').style.display = '';
+}
+
+// Кнопка «Отмена»: подтверждение только при реальном изменении относительно снимка.
+// saveSubtask → closeEditForm() напрямую — сохранение confirm() не проходит.
+function requestCloseEditForm() {
+    if (_editFormHasUnsavedChanges()
+        && !confirm('Отменить редактирование? Несохранённые данные будут потеряны.')) {
+        return;
+    }
+    closeEditForm();
 }
 
 async function saveSubtask() {
@@ -467,7 +499,7 @@ window.addEventListener('load', function() {
     connectWebSocket();
 
     document.getElementById('editToggleBtn').addEventListener('click', openEditForm);
-    document.getElementById('cancelBtn').addEventListener('click', closeEditForm);
+    document.getElementById('cancelBtn').addEventListener('click', requestCloseEditForm);
     document.getElementById('saveBtn').addEventListener('click', saveSubtask);
     document.getElementById('deleteBtn').addEventListener('click', deleteSubtask);
 
