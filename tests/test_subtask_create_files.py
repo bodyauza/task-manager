@@ -1,18 +1,32 @@
 """Тесты атомарного создания подзадачи с файлами одним HTTP-запросом (POST /create-subtask/).
 
-Зеркалирует tests/test_task_create_files.py — см. его docstring за описанием покрытия.
-Дополнительно: CRM-синхронизация файлов подзадачи зависит не только от собственного
-crm_subtask_id, но и от того, зарегистрирована ли в CRM родительская задача.
+Зеркалирует tests/test_task_create_files.py — см. его docstring за описанием покрытия
+и за тем, почему CRM-синхронизация проверяется через содержимое outbox-строк, а не
+через факт прямого CRM-вызова (тот теперь целиком в Celery-воркере).
 """
 
 import json
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 
-from tests.conftest import register_user
+from src.database import async_session_maker
+from src.task_logic.models import CrmOutbox
+from tests.conftest import register_and_login
 
 EMAIL = "create_files_subtask@example.com"
+
+
+async def _outbox_rows_for_subtask(subtask_id: int) -> list[CrmOutbox]:
+    async with async_session_maker() as session:
+        return (
+            await session.execute(
+                select(CrmOutbox)
+                .where(CrmOutbox.aggregate_type == "subtask", CrmOutbox.aggregate_id == subtask_id)
+                .order_by(CrmOutbox.id)
+            )
+        ).scalars().all()
 
 
 def _pdf() -> bytes:
@@ -20,8 +34,7 @@ def _pdf() -> bytes:
 
 
 async def _auth(client: AsyncClient, mock_smtp: dict) -> None:
-    await register_user(client, mock_smtp, EMAIL)
-    await client.post("/auth/login", data={"username": EMAIL, "password": "Password1!"})
+    await register_and_login(client, mock_smtp, EMAIL)
 
 
 async def _create_task(client: AsyncClient, title: str = "Parent") -> dict:
@@ -144,60 +157,33 @@ async def test_create_subtask_multipart_duplicate_title(client, mock_smtp, uploa
 # ── CRM-синхронизация ─────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_create_subtask_crm_files_synced(client, mock_smtp, mock_magic, upload_root, mock_crm):
+async def test_create_subtask_with_files_enqueues_create_and_sync_files_rows(
+    client, mock_smtp, mock_magic, upload_root,
+):
     await _auth(client, mock_smtp)
     task = await _create_task(client)
     data, files = _multipart(task["id"], spec=(_pdf(), "tz.pdf"), other=[(_pdf(), "a.pdf")])
     r = await client.post("/create-subtask/", data=data, files=files)
     assert r.status_code == 201
-
-    mock_crm["subtask_mgr"].create_subtask.assert_called_once()
-    mock_crm["subtask_mgr"].update_subtask.assert_called_once()
-    kwargs = mock_crm["subtask_mgr"].update_subtask.call_args.kwargs
-    assert kwargs["subtask_id"] == r.json()["crm_subtask_id"]
-    assert kwargs["specification_abs_path"] is not None
-    assert len(kwargs["other_file_abs_paths"]) == 1
+    body = r.json()
+    # crm_subtask_id/crm_synced не в ответе (см. SubtaskResponse) — статус
+    # синхронизации проверяется через outbox-строки ниже, не через ответ.
+    rows = await _outbox_rows_for_subtask(body["id"])
+    assert [row.operation for row in rows] == ["create", "sync_files"]
+    create_row, sync_row = rows
+    assert sync_row.depends_on_event_id == create_row.id
+    assert sync_row.payload["crm_subtask_id"] is None
+    assert sync_row.payload["specification_path"] is not None
+    assert len(sync_row.payload["other_file_paths"]) == 1
 
 
 @pytest.mark.asyncio
-async def test_create_subtask_no_parent_crm_id_skips_file_sync(
-    client, mock_smtp, mock_magic, upload_root, mock_crm
-):
-    """Родительская задача не зарегистрирована в CRM → подзадача тоже не регистрируется
-    (существующее правило, см. services/subtasks.py), файлы всё равно сохраняются на
-    диск, но update_subtask вообще не вызывается — синхронизировать в CRM нечего.
-    """
-    mock_crm["task_mgr"].create_task.return_value = {"id": None}
+async def test_create_subtask_no_files_skips_sync_files_row(client, mock_smtp, upload_root):
     await _auth(client, mock_smtp)
     task = await _create_task(client)
-    assert task["crm_task_id"] is None
-
-    data, files = _multipart(task["id"], spec=(_pdf(), "tz.pdf"))
+    data, files = _multipart(task["id"])
     r = await client.post("/create-subtask/", data=data, files=files)
-
     assert r.status_code == 201
-    body = r.json()
-    assert body["crm_subtask_id"] is None
-    assert body["crm_synced"] is False
-    assert body["specification_path"] is not None
-    mock_crm["subtask_mgr"].create_subtask.assert_not_called()
-    mock_crm["subtask_mgr"].update_subtask.assert_not_called()
 
-
-@pytest.mark.asyncio
-async def test_create_subtask_crm_create_fails_files_still_saved(
-    client, mock_smtp, mock_magic, upload_root, mock_crm
-):
-    await _auth(client, mock_smtp)
-    task = await _create_task(client)
-    mock_crm["subtask_mgr"].create_subtask.side_effect = Exception("CRM down")
-
-    data, files = _multipart(task["id"], spec=(_pdf(), "tz.pdf"))
-    r = await client.post("/create-subtask/", data=data, files=files)
-
-    assert r.status_code == 201
-    body = r.json()
-    assert body["crm_synced"] is False
-    assert body["crm_subtask_id"] is None
-    assert body["specification_path"] is not None
-    mock_crm["subtask_mgr"].update_subtask.assert_not_called()
+    rows = await _outbox_rows_for_subtask(r.json()["id"])
+    assert [row.operation for row in rows] == ["create"]

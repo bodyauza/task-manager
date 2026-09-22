@@ -2,8 +2,10 @@
 Юнит-тесты для SubtaskManager из src/crm/subtask_service.py.
 
 Все HTTP-вызовы перехватываются через unittest.mock: реальных запросов нет.
-Фикстура autouse mock_crm из conftest.py здесь переопределяется — каждый
-тест настраивает собственный mock для полного контроля сценария.
+Тесты работают с SubtaskManager напрямую, минуя приложение, поэтому
+autouse-фикстура mock_crm из conftest.py (подмена зависимости FastAPI
+get_user_registrar) на них не влияет — каждый тест сам настраивает свой mock
+для полного контроля сценария.
 """
 import json
 
@@ -185,7 +187,8 @@ async def test_update_subtask_success():
 async def test_update_subtask_empty_id_raises():
     """Регрессия (docs/crm_issue.md): если подзадачу удалили в CRM напрямую, CRM отвечает
     "success" с пустым data.id — expect_id должен превратить это в Exception, чтобы
-    update_subtask() в services/subtasks.py выставил crm_synced=False, а не True."""
+    _do_update_subtask (src/tasks/crm_outbox_tasks.py) не принял это за успех и
+    оставил строку crm_outbox на повторную попытку, а не пометил её 'done'."""
     patcher, _ = _patch_httpx(_resp({"id": ""}))
     try:
         with pytest.raises(Exception, match="no valid id"):

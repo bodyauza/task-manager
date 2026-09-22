@@ -128,6 +128,90 @@ function requestCloseModal(modalId) {
     closeModal(modalId);
 }
 
+// Статус синхронизации с CRM (Task.sync_status/Subtask.sync_status).
+// SYNC_STATUS_LABELS — технические подписи для администратора (admin-crm-sync.js).
+const SYNC_STATUS_LABELS = {
+    unsynced: 'Не синхронизировано',
+    pending: 'В очереди',
+    synced: 'Синхронизировано',
+    failed: 'Ошибка синхронизации',
+};
+
+// Подписи и подсказки для ОБЫЧНОГО пользователя (task-board/subtask-board):
+// без CRM-жаргона и без тревожных формулировок там, где пользователь ничего не
+// может сделать. failed: данные сохранены, а причину увидит и исправит
+// администратор (/admin → «CRM outbox», действие «Повторить»).
+const USER_SYNC_STATUS = {
+    unsynced: { text: 'Ожидает отправки', title: 'Данные сохранены и ещё не отправлены в CRM' },
+    pending: { text: 'В обработке', title: 'Данные передаются в CRM' },
+    synced: { text: 'Синхронизировано с CRM', title: 'Синхронизировано с CRM' },
+    failed: {
+        text: 'Не удалось отправить',
+        title: 'Данные сохранены. Администратор увидит проблему и повторит отправку',
+    },
+};
+
+// Бейдж статуса рядом со счётчиком подзадач (тот же класс .subtask-count, что и у
+// счётчика; цвет и вид задаёт модификатор .sync-status-<status> в стилях страницы).
+//   synced  — только галочка (без плашки с текстом: в списке из десятков строк
+//             одинаковые «Синхронизировано» были бы шумом); текст — в title и
+//             aria-label для скринридера;
+//   pending — спиннер и «В обработке» (role="status" — смена состояния
+//             озвучивается), список сам обновляется (createSyncPoller);
+//   прочее  — короткая текстовая плашка с пояснением в title.
+// Пустая строка, если статус не пришёл (старый ответ API).
+function syncStatusTag(status) {
+    if (!status) return '';
+    const info = USER_SYNC_STATUS[status];
+    const cls = `subtask-count sync-status sync-status-${escapeHtml(status)}`;
+    if (!info) {
+        return `<span class="${cls}">${escapeHtml(status)}</span>`;
+    }
+    const title = escapeHtml(info.title);
+    if (status === 'synced') {
+        return `<span class="${cls}" role="img" aria-label="${title}" title="${title}">\u2713</span>`;
+    }
+    if (status === 'pending') {
+        return `<span class="${cls}" role="status" title="${title}">` +
+               `<span class="sync-spinner" aria-hidden="true"></span>${escapeHtml(info.text)}</span>`;
+    }
+    return `<span class="${cls}" title="${title}">${escapeHtml(info.text)}</span>`;
+}
+
+// Опрос закончился (maxAttempts), а запись всё ещё pending: спиннер, который
+// крутится вечно, вводил бы в заблуждение — заменяем его спокойным сообщением.
+// Данные при этом сохранены; актуальный статус покажет обновление страницы.
+function markSyncStalled() {
+    document.querySelectorAll('.sync-status-pending').forEach(el => {
+        el.classList.add('sync-status-stalled');
+        el.title = 'Обработка занимает дольше обычного. Данные сохранены; обновите страницу, чтобы проверить статус';
+        el.textContent = 'Обработка затянулась';
+    });
+}
+
+// Автообновление списка, пока хотя бы у одной записи статус 'pending': воркер
+// выставляет 'synced' через секунды после ответа API, а WS-событий о смене
+// статуса нет. reload() перечитывает текущую страницу; не более maxAttempts
+// подряд (воркер лежит — не опрашиваем бесконечно). Вызов onRender(items, false)
+// из «обычной» отрисовки (загрузка, WS-событие, смена страницы) обнуляет счётчик;
+// onRender(items, true) — из самого опроса.
+function createSyncPoller(reload, intervalMs = 3000, maxAttempts = 20) {
+    let timer = null;
+    let attempts = 0;
+    return function onRender(items, isPoll) {
+        clearTimeout(timer);
+        if (!isPoll) attempts = 0;
+        const hasPending = items.some(item => item.sync_status === 'pending');
+        if (!hasPending) return;
+        if (attempts >= maxAttempts) {
+            markSyncStalled();
+            return;
+        }
+        attempts++;
+        timer = setTimeout(reload, intervalMs);
+    };
+}
+
 // subtaskLabel — русское склонение числительных для счётчика подзадач.
 // Алгоритм работает по последней цифре (mod10), с отдельной обработкой чисел 11–14 (mod100):
 //   11, 12, 13, 14 — всегда «подзадач» (исключение из правила «1 → подзадача»).
@@ -169,13 +253,6 @@ async function fetchWithAuth(url, options = {}) {
         }
         // Повторяем исходный запрос; к этому моменту браузер уже сохранил новый access_token.
         resp = await fetch(url, opts);
-    }
-
-    if (resp.status === 503) {
-        const body = await resp.clone().json().catch(() => ({}));
-        if (body.detail === 'CRM_UNAVAILABLE') {
-            alert('CRM недоступна, обратитесь в техподдержку Предприятия');
-        }
     }
 
     return resp;

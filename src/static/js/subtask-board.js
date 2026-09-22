@@ -109,7 +109,11 @@ document.getElementById('editModal').addEventListener('click', function(e) {
     if (e.target === this) requestCloseModal('editModal');
 });
 
-async function loadSubtasks(page = 1) {
+// Автообновление, пока у какой-либо подзадачи sync_status = 'pending' (см. createSyncPoller
+// в common.js). isPoll — вызов из самого опроса: ошибки в нём не показываются alert'ом.
+const syncPoller = createSyncPoller(() => loadSubtasks(currentPage, true));
+
+async function loadSubtasks(page = 1, isPoll = false) {
     currentPage = page;
     // skip — SQL OFFSET; переводим номер страницы (с 1) в смещение строк (с 0).
     // page=1 → skip=0  (первые 5 строк таблицы: OFFSET 0 LIMIT 5)
@@ -132,12 +136,13 @@ async function loadSubtasks(page = 1) {
             totalPages = Math.max(1, Math.ceil(total / SUBTASKS_PAGE_SIZE));
             displaySubtasks(subtasks);
             updatePagination();
-        } else {
+            syncPoller(subtasks, isPoll);
+        } else if (!isPoll) {
             const err = await resp.json();
             alert(`Ошибка загрузки: ${err.detail}`);
         }
     } catch (e) {
-        alert('Не удалось загрузить подзадачи');
+        if (!isPoll) alert('Не удалось загрузить подзадачи');
     }
 }
 
@@ -153,9 +158,6 @@ function displaySubtasks(subtasks) {
     subtasks.forEach(s => {
         const li = document.createElement('li');
         li.className = `task-item ${s.completed ? 'completed' : ''}`;
-        const crmBadge = s.crm_subtask_id == null
-            ? '<span class="crm-badge">Отсутствует в CRM</span>'
-            : '';
         // Описание обрезается до 20 символов для компактности карточки.
         // slice(0, 20) не мутирует строку; '…' — типографское многоточие (U+2026), не три точки.
         // escapeHtml применяется к обрезанному фрагменту, а не к исходной строке:
@@ -167,7 +169,7 @@ function displaySubtasks(subtasks) {
             <div class="task-header">
                 <div class="task-title-row">
                     <div class="task-title">${escapeHtml(s.title)}</div>
-                    ${crmBadge}
+                    ${syncStatusTag(s.sync_status)}
                 </div>
                 <span class="task-status ${s.completed ? 'status-completed' : 'status-pending'}">
                     ${s.completed ? 'Выполнена' : 'В работе'}
@@ -330,7 +332,6 @@ document.getElementById('createSubtaskSubmitBtn').addEventListener('click', asyn
 
         if (resp.ok) {
             const s = await resp.json();
-            if (s.crm_synced === false) showToast('Подзадача создана без синхронизации с CRM', 'warning');
             if (s.file_upload_errors) {
                 for (const [name, msg] of Object.entries(s.file_upload_errors)) {
                     showToast(`«${name}»: ${msg}`, 'warning');
@@ -361,8 +362,6 @@ async function updateSubtask(id, title, description, completed) {
         });
         if (!resp) return;
         if (resp.ok) {
-            const s = await resp.json();
-            if (s.crm_synced === false) showToast('Подзадача обновлена без синхронизации с CRM', 'warning');
             loadSubtasks(currentPage);
         // } else if (resp.status === 403) {
         //     showToast('Нет доступа: вы не являетесь владельцем этой задачи', 'error');
@@ -381,8 +380,6 @@ async function deleteSubtask(id) {
         const resp = await fetchWithAuth(`/delete-subtask/${id}`, { method: 'DELETE' });
         if (!resp) return;
         if (resp.ok) {
-            const s = await resp.json();
-            if (s.crm_synced === false) showToast('Подзадача удалена без синхронизации с CRM', 'warning');
             // currentSubtasks.length === 1: на странице была ровно одна запись — только что удалённая.
             // После loadSubtasks(currentPage) страница вернулась бы пустой.
             // Проверяем длину ДО перезагрузки: именно сейчас массив содержит удалённый объект.
@@ -428,9 +425,11 @@ function connectWebSocket() {
                     loadSubtasks(currentPage);
                     showToast(`${data.sender}: список подзадач обновлён`, 'info');
                 } else if (data.type === 'task_deleted' && data.task_id === taskId) {
-                    // Задачу, чьи подзадачи мы просматриваем, удалил другой пользователь —
+                    // Задачу, чьи подзадачи мы просматриваем, удалили (возможно, из другой своей
+                    // же вкладки — task_deleted актора больше не исключает, см. services/tasks.py) —
                     // страница подзадач для неё больше не существует (404 при любом действии).
-                    alert('Задача была удалена другим пользователем');
+                    // Без уточнения "кем" — этой странице неважно, свой это был actor_id или чужой.
+                    alert('Задача была удалена — переход к списку задач');
                     window.location.href = '/task-board';
                 }
             } catch (e) { /* нераспознанное сообщение — игнорируем */ }

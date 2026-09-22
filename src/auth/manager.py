@@ -12,7 +12,6 @@ from pwdlib.hashers.bcrypt import BcryptHasher
 
 from sqlalchemy import select
 
-from src.crm.client import CRMUnavailableError
 from src.crm.user_service import UserRegistrar, get_user_registrar
 
 from .user_models import Role, User
@@ -20,8 +19,14 @@ from .user_repository import get_user_db
 
 logger = logging.getLogger(__name__)
 
-# rounds=14: число итераций bcrypt. При 14 раундах хеширование одного пароля
-# занимает ~0.5 с — достаточно для защиты от brute-force, приемлемо для пользователя.
+# bcrypt (rounds=14) здесь используется ТОЛЬКО для хеша 6-значного кода подтверждения
+# регистрации (registration_endpoints.py: password_helper_bc) — НЕ для паролей
+# пользователей. Пароли хеширует стандартный PasswordHelper() из fastapi-users
+# (argon2id; verify_and_update при входе понимает и bcrypt-хеши): BaseUserManager.
+# __init__ создаёт его сам, см. UserManager ниже.
+#
+# rounds=14: число итераций bcrypt. При 14 раундах хеширование занимает ~0.5 с —
+# достаточно для защиты кода от перебора, приемлемо для пользователя.
 # 12 — минимум для production; 16 — задержка ~2 с без существенного прироста стойкости.
 password_hash = PasswordHash((
     BcryptHasher(rounds=14),
@@ -31,7 +36,12 @@ password_helper_bc = PasswordHelper(password_hash)
 
 
 class UserManager(IntegerIDMixin, BaseUserManager[User, int]):
-    password_helper = password_helper_bc
+    # password_helper намеренно не переопределяется: BaseUserManager.__init__ создаёт
+    # PasswordHelper() (argon2id) как атрибут ЭКЗЕМПЛЯРА, и любой одноимённый
+    # класс-атрибут им перекрывался бы — раньше здесь стояло
+    # `password_helper = password_helper_bc` и создавало ложное впечатление, что
+    # пароли хешируются bcrypt'ом (реально — argon2id). Админ-форма
+    # (admin/user_admin.py) берёт тот же помощник из экземпляра менеджера.
 
     def __init__(self, user_db, crm_registrar: UserRegistrar):
         # crm_registrar внедряется через get_user_manager (Depends(get_user_registrar)) —
@@ -61,10 +71,10 @@ class UserManager(IntegerIDMixin, BaseUserManager[User, int]):
             else user_create.create_update_dict_superuser()
         )
         password = user_dict.pop("password")
-        # asyncio.to_thread: bcrypt (rounds=14, ~0.5с — см. комментарий у password_hash
-        # выше) — синхронный CPU-bound вызов. fastapi-users вызывает password_helper.hash()
+        # asyncio.to_thread: хеширование пароля (argon2id, десятки-сотни миллисекунд) —
+        # синхронный CPU-bound вызов. fastapi-users вызывает password_helper.hash()
         # без await (не оборачивает сама), поэтому оставленный «как есть» синхронный вызов
-        # блокировал бы единственный event loop процесса на ~0.5с при каждой регистрации,
+        # блокировал бы единственный event loop процесса при каждой регистрации,
         # замораживая вообще все остальные запросы приложения в этот момент — тот же приём,
         # что уже применён для magic.from_buffer в src/utils/file_utils.py. Безопасно
         # оборачивать именно здесь: create()/authenticate() — единственные во всём проекте
@@ -93,12 +103,22 @@ class UserManager(IntegerIDMixin, BaseUserManager[User, int]):
         # Та же логика применяется для username-поля при регистрации в CRM.
         user_dict["username"] = user_create.email.split("@")[0]
 
-        # Порядок: сначала CRM, затем PostgreSQL.
-        # Если CRM вернёт ошибку — person не создаётся, транзакция чистая.
-        # Обратный порядок создал бы риск: пользователь есть в БД, но отсутствует в CRM,
-        # что заблокирует ему вход (login-эндпоинт проверяет наличие в CRM).
-        # Если PostgreSQL упадёт после успешного CRM — в CRM останется «висячая» запись;
-        # сценарий маловероятен и требует ручной очистки через CRM-интерфейс.
+        # CRM-регистрация — best-effort, а не блокирующее условие: недоступность
+        # CRM (сеть, таймаут, невалидный ответ) НЕ прерывает регистрацию и не
+        # мешает создать пользователя в PostgreSQL. Раньше здесь при любой
+        # ошибке CRM бросался CRMUnavailableError, что превращало временный сбой
+        # внешнего сервиса в невозможность зарегистрироваться вовсе — риск,
+        # который тогда обосновывался тем, что "пользователь есть в БД, но не
+        # может войти, т.к. отсутствует в CRM" (login-эндпоинт якобы проверял
+        # наличие в CRM). Этот риск больше не существует: /auth/login (см.
+        # auth/endpoints.py) к CRM не обращается вообще — аутентификация целиком
+        # на локальной БД (см. также mock_crm в tests/conftest.py). Блокировать
+        # регистрацию из-за CRM смысла больше нет.
+        #
+        # Если CRM-регистрация не удалась, ошибка только логируется — в CRM не
+        # появится соответствующей записи "Пользователь", пока кто-то не
+        # заведёт её вручную; durable retry (по аналогии с CrmOutbox для Task/
+        # Subtask) для этого случая не реализован — не запрошено.
         from src.crm.crm_config import crm_settings
 
         try:
@@ -113,15 +133,12 @@ class UserManager(IntegerIDMixin, BaseUserManager[User, int]):
             )
             logger.info("CRM: user %s registered successfully", user_create.email)
         except Exception as exc:
-            logger.error("CRM registration failed for %s: %s", user_create.email, exc)
-            # UserManager — доменный слой; он не решает, каким HTTP-кодом ответить клиенту
-            # (fastapi-users перехватывает только UserAlreadyExists/InvalidPasswordException,
-            # раньше здесь бросался голый HTTPException в обход их контракта — LSP-нарушение
-            # относительно BaseUserManager.create()). Перевод в HTTP-ответ — на границе,
-            # см. except CRMUnavailableError в registration_endpoints.py.
-            raise CRMUnavailableError(str(exc)) from exc
+            logger.error(
+                "CRM registration failed for %s: %s — пользователь всё равно "
+                "будет создан в PostgreSQL", user_create.email, exc,
+            )
 
-        # INSERT выполняется только после успешной регистрации в CRM
+        # INSERT выполняется независимо от результата CRM-регистрации (см. выше).
         created_user = await self.user_db.create(user_dict)
         await self.on_after_register(created_user, request)
         return created_user
@@ -171,8 +188,8 @@ class UserManager(IntegerIDMixin, BaseUserManager[User, int]):
             return None
 
         # asyncio.to_thread — см. пояснение в create() выше: verify_and_update()
-        # внутри тоже запускает bcrypt (~0.5с), без выноса в поток блокирует event loop
-        # на каждый login.
+        # внутри тоже считает хеш (argon2id/bcrypt — CPU-bound), без выноса в поток
+        # блокирует event loop на каждый login.
         verified, updated_password_hash = await asyncio.to_thread(
             self.password_helper.verify_and_update, password, user.hashed_password
         )

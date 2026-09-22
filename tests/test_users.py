@@ -1,31 +1,41 @@
+"""Управление пользователями (admin-only): src/routers/users.py.
+
+Проверяется не только код ответа, но и состояние БД после операции — иначе тест
+прошёл бы и при «пустой» реализации, которая отвечает 200, ничего не меняя.
+"""
+
 import json
 
 from httpx import AsyncClient
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
+from src.auth.user_models import User
 from src.database import async_session_maker
 from src.task_logic.models import Subtask, Task
-from tests.conftest import promote_to_admin, register_user
+from tests.conftest import login_as_admin, register_and_login
 
 ADMIN_EMAIL = "admin@example.com"
 USER_EMAIL  = "user@example.com"
 PASSWORD    = "Password1!"
 
 
-async def _register_login(
-    client: AsyncClient, mock_smtp: dict, email: str, password: str = PASSWORD
-) -> None:
-    await register_user(client, mock_smtp, email, password)
-    await client.post("/auth/login", data={"username": email, "password": password})
+async def _get_user(email: str) -> User | None:
+    async with async_session_maker() as session:
+        return (await session.execute(
+            select(User).options(selectinload(User.roles)).where(User.email == email)
+        )).scalar_one_or_none()
+
+
+async def _target_id(client: AsyncClient, email: str) -> int:
+    users = (await client.get("/users/")).json()
+    return next(u["id"] for u in users if u["email"] == email)
 
 
 # ── list users ───────────────────────────────────────────────────────────────
 
 async def test_list_users_as_admin(client: AsyncClient, mock_smtp: dict):
-    await _register_login(client, mock_smtp, ADMIN_EMAIL)
-    await promote_to_admin(ADMIN_EMAIL)
-    await client.post("/auth/logout")
-    await client.post("/auth/login", data={"username": ADMIN_EMAIL, "password": PASSWORD})
+    await login_as_admin(client, mock_smtp, ADMIN_EMAIL)
 
     r = await client.get("/users/")
     assert r.status_code == 200
@@ -34,7 +44,7 @@ async def test_list_users_as_admin(client: AsyncClient, mock_smtp: dict):
 
 
 async def test_list_users_as_regular_user_forbidden(client: AsyncClient, mock_smtp: dict):
-    await _register_login(client, mock_smtp, USER_EMAIL)
+    await register_and_login(client, mock_smtp, USER_EMAIL)
     r = await client.get("/users/")
     assert r.status_code == 403
 
@@ -44,62 +54,78 @@ async def test_list_users_unauthenticated(client: AsyncClient):
     assert r.status_code == 401
 
 
+async def test_list_users_does_not_expose_password_hash(client: AsyncClient, mock_smtp: dict):
+    await login_as_admin(client, mock_smtp, ADMIN_EMAIL)
+    r = await client.get("/users/")
+    assert "hashed_password" not in r.text
+    assert "$argon2" not in r.text and "$2b$" not in r.text
+
+
 # ── delete user ──────────────────────────────────────────────────────────────
 
 async def test_delete_user_as_admin(client: AsyncClient, mock_smtp: dict):
-    await _register_login(client, mock_smtp, USER_EMAIL)
+    await register_and_login(client, mock_smtp, USER_EMAIL)
+    await login_as_admin(client, mock_smtp, ADMIN_EMAIL)
+    target_id = await _target_id(client, USER_EMAIL)
 
-    await _register_login(client, mock_smtp, ADMIN_EMAIL)
-    await promote_to_admin(ADMIN_EMAIL)
-    await client.post("/auth/logout")
-    await client.post("/auth/login", data={"username": ADMIN_EMAIL, "password": PASSWORD})
-
-    users_r = await client.get("/users/")
-    target = next(u for u in users_r.json() if u["email"] == USER_EMAIL)
-
-    r = await client.delete(f"/users/{target['id']}")
+    r = await client.delete(f"/users/{target_id}")
     assert r.status_code == 200
     assert r.json()["email"] == USER_EMAIL
 
+    # Пользователь действительно удалён из БД, остальные не затронуты.
+    assert await _get_user(USER_EMAIL) is None
+    assert await _get_user(ADMIN_EMAIL) is not None
+    assert USER_EMAIL not in [u["email"] for u in (await client.get("/users/")).json()]
+
 
 async def test_delete_user_as_regular_user_forbidden(client: AsyncClient, mock_smtp: dict):
-    await _register_login(client, mock_smtp, ADMIN_EMAIL)
-    await promote_to_admin(ADMIN_EMAIL)
+    await login_as_admin(client, mock_smtp, ADMIN_EMAIL)
+    admin_id = await _target_id(client, ADMIN_EMAIL)
     await client.post("/auth/logout")
 
-    await _register_login(client, mock_smtp, USER_EMAIL)
+    await register_and_login(client, mock_smtp, USER_EMAIL)
 
     users_r = await client.get("/users/")
     assert users_r.status_code == 403
 
-    r = await client.delete("/users/1")
+    r = await client.delete(f"/users/{admin_id}")
     assert r.status_code == 403
+    assert await _get_user(ADMIN_EMAIL) is not None   # запрещённое удаление ничего не удалило
+
+
+async def test_delete_own_account_is_rejected(client: AsyncClient, mock_smtp: dict):
+    """Запрет самоудаления: единственный admin не должен потерять доступ к
+    управлению пользователями (routers/users.py::delete_user)."""
+    await login_as_admin(client, mock_smtp, ADMIN_EMAIL)
+    own_id = await _target_id(client, ADMIN_EMAIL)
+
+    r = await client.delete(f"/users/{own_id}")
+    assert r.status_code == 400
+    assert r.json()["detail"] == "Cannot delete your own account"
+    assert await _get_user(ADMIN_EMAIL) is not None
 
 
 async def test_delete_user_cascades_tasks_and_subtasks(client: AsyncClient, mock_smtp: dict):
     # Регрессия на ondelete="CASCADE" + passive_deletes=True (User.tasks):
     # удаление пользователя через ORM (session.delete) должно каскадно
     # удалить его задачи, а через них — и подзадачи.
-    await _register_login(client, mock_smtp, USER_EMAIL)
+    await register_and_login(client, mock_smtp, USER_EMAIL)
     task_r = await client.post(
         "/create-task/", data={"data": json.dumps({"title": "Owned task", "description": "desc"})}
     )
+    assert task_r.status_code == 201
     task_id = task_r.json()["id"]
     subtask_r = await client.post(
         "/create-subtask/",
         data={"data": json.dumps({"task_id": task_id, "title": "Owned subtask", "description": "desc"})},
     )
+    assert subtask_r.status_code == 201
     subtask_id = subtask_r.json()["id"]
 
-    await _register_login(client, mock_smtp, ADMIN_EMAIL)
-    await promote_to_admin(ADMIN_EMAIL)
-    await client.post("/auth/logout")
-    await client.post("/auth/login", data={"username": ADMIN_EMAIL, "password": PASSWORD})
+    await login_as_admin(client, mock_smtp, ADMIN_EMAIL)
+    target_id = await _target_id(client, USER_EMAIL)
 
-    users_r = await client.get("/users/")
-    target = next(u for u in users_r.json() if u["email"] == USER_EMAIL)
-
-    r = await client.delete(f"/users/{target['id']}")
+    r = await client.delete(f"/users/{target_id}")
     assert r.status_code == 200
 
     async with async_session_maker() as session:
@@ -110,10 +136,7 @@ async def test_delete_user_cascades_tasks_and_subtasks(client: AsyncClient, mock
 
 
 async def test_delete_user_not_found(client: AsyncClient, mock_smtp: dict):
-    await _register_login(client, mock_smtp, ADMIN_EMAIL)
-    await promote_to_admin(ADMIN_EMAIL)
-    await client.post("/auth/logout")
-    await client.post("/auth/login", data={"username": ADMIN_EMAIL, "password": PASSWORD})
+    await login_as_admin(client, mock_smtp, ADMIN_EMAIL)
 
     r = await client.delete("/users/99999")
     assert r.status_code == 404
@@ -122,22 +145,71 @@ async def test_delete_user_not_found(client: AsyncClient, mock_smtp: dict):
 # ── update user ──────────────────────────────────────────────────────────────
 
 async def test_update_user_as_admin(client: AsyncClient, mock_smtp: dict):
-    await _register_login(client, mock_smtp, USER_EMAIL)
+    await register_and_login(client, mock_smtp, USER_EMAIL)
+    await login_as_admin(client, mock_smtp, ADMIN_EMAIL)
+    target_id = await _target_id(client, USER_EMAIL)
 
-    await _register_login(client, mock_smtp, ADMIN_EMAIL)
-    await promote_to_admin(ADMIN_EMAIL)
-    await client.post("/auth/logout")
-    await client.post("/auth/login", data={"username": ADMIN_EMAIL, "password": PASSWORD})
-
-    users_r = await client.get("/users/")
-    target = next(u for u in users_r.json() if u["email"] == USER_EMAIL)
-
-    r = await client.patch(f"/users/{target['id']}", json={"username": "renamed"})
+    r = await client.patch(f"/users/{target_id}", json={"username": "renamed"})
     assert r.status_code == 200
     assert r.json()["username"] == "renamed"
+    assert (await _get_user(USER_EMAIL)).username == "renamed"     # изменение сохранено в БД
+
+
+async def test_update_user_is_partial(client: AsyncClient, mock_smtp: dict):
+    """PATCH меняет только переданные поля."""
+    await register_and_login(client, mock_smtp, USER_EMAIL)
+    before = await _get_user(USER_EMAIL)
+    await login_as_admin(client, mock_smtp, ADMIN_EMAIL)
+
+    r = await client.patch(f"/users/{before.id}", json={"is_active": False})
+    assert r.status_code == 200
+
+    after = await _get_user(USER_EMAIL)
+    assert after.is_active is False
+    assert (after.username, after.firstname, after.lastname) == (
+        before.username, before.firstname, before.lastname,
+    )
+    assert [role.name for role in after.roles] == ["user"]
+
+
+async def test_update_user_role_ids_replaces_roles(client: AsyncClient, mock_smtp: dict):
+    """role_ids заменяет набор ролей целиком (не добавляет к существующим)."""
+    await register_and_login(client, mock_smtp, USER_EMAIL)
+    target = await _get_user(USER_EMAIL)
+    await login_as_admin(client, mock_smtp, ADMIN_EMAIL)
+
+    r = await client.patch(f"/users/{target.id}", json={"role_ids": [2]})   # 2 = admin
+    assert r.status_code == 200
+    assert r.json()["role_ids"] == [2]
+    assert [role.name for role in (await _get_user(USER_EMAIL)).roles] == ["admin"]
+
+
+async def test_update_user_role_ids_invalid_returns_400_and_keeps_roles(client: AsyncClient, mock_smtp: dict):
+    await register_and_login(client, mock_smtp, USER_EMAIL)
+    target = await _get_user(USER_EMAIL)
+    await login_as_admin(client, mock_smtp, ADMIN_EMAIL)
+
+    r = await client.patch(f"/users/{target.id}", json={"role_ids": [1, 999]})
+    assert r.status_code == 400
+    assert r.json()["detail"] == "Invalid role_ids"
+    # Ни одна роль не изменилась (в том числе валидная из того же запроса).
+    assert [role.name for role in (await _get_user(USER_EMAIL)).roles] == ["user"]
+
+
+async def test_update_user_not_found(client: AsyncClient, mock_smtp: dict):
+    await login_as_admin(client, mock_smtp, ADMIN_EMAIL)
+    r = await client.patch("/users/99999", json={"username": "x"})
+    assert r.status_code == 404
 
 
 async def test_update_user_as_regular_user_forbidden(client: AsyncClient, mock_smtp: dict):
-    await _register_login(client, mock_smtp, USER_EMAIL)
-    r = await client.patch("/users/1", json={"username": "hacker"})
+    await register_and_login(client, mock_smtp, USER_EMAIL)
+    before = await _get_user(USER_EMAIL)
+
+    r = await client.patch(f"/users/{before.id}", json={"username": "hacker", "role_ids": [2]})
     assert r.status_code == 403
+
+    # Обычный пользователь не смог ни переименоваться, ни назначить себе admin.
+    after = await _get_user(USER_EMAIL)
+    assert after.username == before.username
+    assert [role.name for role in after.roles] == ["user"]

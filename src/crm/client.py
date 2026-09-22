@@ -23,13 +23,13 @@ logger = logging.getLogger(__name__)
 # is None). Такой синглтон надёжен, только если первым инстанцируется сам
 # базовый класс: тогда атрибут пишется в его __dict__, и подклассы находят его
 # обычным lookup по MRO. Но CRMClient никогда не инстанцируется напрямую —
-# используются только TaskManager, SubtaskManager, CRMUserSelector и
-# CRMUserRegistrar. Присваивание через cls внутри classmethod пишет атрибут
+# используются только TaskManager, SubtaskManager и CRMUserRegistrar.
+# Присваивание через cls внутри classmethod пишет атрибут
 # в __dict__ ТОГО класса, что передан как cls, а не мутирует атрибут родителя —
-# значит первый же вызов _get_client() у каждого из четырёх подклассов заводил
+# значит первый же вызов _get_client() у каждого из подклассов заводил
 # свой собственный httpx.AsyncClient, а CRMClient._http так и оставался None,
-# потому что ни один подкласс не писал в него напрямую. Итог — четыре
-# независимых TCP-пула вместо одного разделяемого (проверено эмпирически:
+# потому что ни один подкласс не писал в него напрямую. Итог —
+# независимые TCP-пулы вместо одного разделяемого (проверено эмпирически:
 # TaskManager()._get_client() is not SubtaskManager()._get_client() → True).
 #
 # Module-level singleton этой проблемы не имеет: здесь нет иерархии классов,
@@ -56,13 +56,18 @@ async def aclose_http_client() -> None:
         _shared_http_client = None
 
 
-class CRMUnavailableError(Exception):
-    """CRM-операция завершилась ошибкой (сеть, таймаут, невалидный ответ и т.д.).
+class CRMRecordNotFoundError(Exception):
+    """update/delete с expect_id=True над записью, которой в CRM уже нет
+    (удалена вручную через веб-интерфейс CRM, либо предыдущая попытка retry
+    этой же outbox-строки уже успешно её удалила) — CRM отвечает "success" с
+    пустым data.id, а не явной ошибкой (см. проверку expect_id в _call() ниже
+    и docs/crm_issue.md).
 
-    Выбрасывается на границе доменной логики (например, UserManager.create()),
-    а не как есть — HTTPException, — чтобы не завязывать доменный слой на
-    HTTP-статусы. Перевод в конкретный HTTP-код — забота эндпоинта, который
-    ловит это исключение и решает, что ответить клиенту.
+    Отдельный класс (не голый Exception, как раньше) специально для того,
+    чтобы src/tasks/crm_outbox_tasks.py::_do_delete мог отличить «запись уже
+    отсутствует — цель достигнута, это не сбой» от реальных сбоев (сеть,
+    таймаут, невалидный ответ) и не заставлял retry «проваливаться» вечно
+    на уже достигнутой цели — см. докстринг _do_delete.
     """
 
 
@@ -397,6 +402,6 @@ class CRMClient:
             data = result.get("data")
             if not isinstance(data, dict) or not data.get("id"):
                 logger.warning("CRM: expected non-empty id in response data, got: %r", data)
-                raise Exception("CRM returned success but no valid id in data")
+                raise CRMRecordNotFoundError("CRM returned success but no valid id in data")
 
         return result

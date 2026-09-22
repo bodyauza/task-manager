@@ -33,8 +33,6 @@
         .status-badge { display: inline-block; padding: 3px 10px; border-radius: 2px; font-size: 12px; font-weight: 700; letter-spacing: 0.3px; }
         .status-completed { background-color: #198754; color: white; }
         .status-pending { background-color: #ffc107; color: #212529; }
-        .crm-badge { display: inline-block; background-color: #b71c1c; color: white; padding: 2px 8px; border-radius: 2px; font-size: 11px; font-weight: 700; letter-spacing: 0.3px; }
-        .crm-badge-ok { display: inline-block; background-color: #198754; color: white; padding: 2px 8px; border-radius: 2px; font-size: 11px; font-weight: 700; letter-spacing: 0.3px; }
         .subtask-count { display: inline-block; background-color: #003f6b; color: white; padding: 2px 8px; border-radius: 2px; font-size: 11px; font-weight: 700; letter-spacing: 0.3px; }
         .actions-row { display: flex; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
         .edit-form { display: none; margin-top: 20px; border-top: 1px solid #dee2e6; padding-top: 20px; }
@@ -87,16 +85,16 @@
                     <span class="field-value" id="viewDescription" style="white-space: pre-wrap;">—</span>
                 </div>
                 <div class="field-row">
+                    <span class="field-label">Проект</span>
+                    <span class="field-value" id="viewProject">—</span>
+                </div>
+                <div class="field-row">
                     <span class="field-label">Статус</span>
                     <span id="viewStatus"></span>
                 </div>
                 <div class="field-row">
                     <span class="field-label">Подзадачи</span>
                     <span id="viewSubtaskCount"></span>
-                </div>
-                <div class="field-row">
-                    <span class="field-label">Синхронизация CRM</span>
-                    <span id="viewCrm"></span>
                 </div>
                 <!-- ── Техническое задание ─────────────────────────────────────── -->
                 <div class="file-section">
@@ -158,6 +156,15 @@
                     <textarea id="editDescription" maxlength="2000"></textarea>
                 </div>
                 <div class="form-group">
+                    <label for="editProject">Проект</label>
+                    <select id="editProject" class="form-select">
+                        <option value="">— не выбран —</option>
+                        {% for id, label in project_options.items() %}
+                        <option value="{{ id }}">{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="form-group">
                     <label class="checkbox-label">
                         <input type="checkbox" id="editCompleted"> Отметить как выполненную
                     </label>
@@ -170,7 +177,7 @@
         </div>
     </div>
 
-    <script src="/static/js/common.js?v=4" defer></script>
+    <script src="/static/js/common.js?v=5" defer></script>
     <script src="/static/js/task-detail.js?v=8" defer></script>
 </body>
 </html>

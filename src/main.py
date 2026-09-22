@@ -11,14 +11,17 @@ from fastapi.openapi.docs import (
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
+from src.admin import setup_admin
 from src.auth.endpoints import auth_router
 from src.auth.user_models import Role
 from src.auth.registration_endpoints import registration_router
+from src.config import settings
 from src.crm.client import aclose_http_client
 from src.database import async_session_maker
 from src.errors_handlers import register_errors_handlers
 from src.middlewares import register_middlewares
-from src.realtime import websocket_router
+from src.realtime import connection_manager, websocket_router
+from src.routers.admin import admin_router
 from src.routers.pages import router as pages_router
 from src.routers.subtask_routers import router as subtasks_router
 from src.routers.subtask_files import router as subtask_files_router   # файлы подзадач
@@ -84,7 +87,12 @@ async def lifespan(app: FastAPI):
     # через UPLOAD_ROOT.mkdir(...), путь к которому вычисляется от __file__, а не от cwd
     # процесса.
     await create_initial_roles()
+    # Фоновая подписка на Redis Pub/Sub для WebSocket-рассылки между
+    # несколькими uvicorn-воркерами (docs/task-manager-documentation.md,
+    # «Векторы развития проекта», п. 7) — см. src/realtime/connection_manager.py.
+    connection_manager.start_listening()
     yield
+    await connection_manager.stop_listening()
     # Закрываем разделяемый httpx.AsyncClient CRM-модуля, иначе TCP-соединения
     # из его пула остаются открытыми до завершения процесса. Парная операция к
     # ленивому созданию клиента в src/crm/client.py::_get_shared_http_client().
@@ -108,9 +116,15 @@ uvicorn запускает приложение
 def register_docs_routes(app: FastAPI) -> None:
     """Swagger UI/ReDoc с бандлами, раздаваемыми локально из /static, а не с CDN.
 
-    Иначе пришлось бы разрешать cdn.jsdelivr.net/unpkg.com в CSP (см. register_middlewares) —
-    для страниц документации, которые в production обычно вообще отключены (docs_url=None).
+    Иначе пришлось бы разрешать cdn.jsdelivr.net/unpkg.com в CSP (см. register_middlewares).
+    Favicon и шрифты тоже локальные: по умолчанию FastAPI тянет favicon с
+    fastapi.tiangolo.com, а ReDoc — шрифты с fonts.googleapis.com.
+
+    Маршруты регистрируются только если settings.docs_enabled (по умолчанию — не в
+    production, см. DOCS_ENABLED в src/config.py).
     """
+    if not settings.docs_enabled:
+        return
 
     @app.get("/docs", include_in_schema=False)
     async def custom_swagger_ui_html(request: Request):
@@ -130,6 +144,7 @@ def register_docs_routes(app: FastAPI) -> None:
                     path="/css/swagger-ui.css",
                 ),
             ),
+            swagger_favicon_url=str(request.url_for("static", path="/img/favicon.svg")),
         )
 
     @app.get(app.swagger_ui_oauth2_redirect_url, include_in_schema=False)
@@ -147,6 +162,8 @@ def register_docs_routes(app: FastAPI) -> None:
                     path="/js/redoc.standalone.js",
                 ),
             ),
+            redoc_favicon_url=str(request.url_for("static", path="/img/favicon.svg")),
+            with_google_fonts=False,
         )
 
 
@@ -164,6 +181,9 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
+        # openapi_url=None отключает и /openapi.json: без него Swagger/ReDoc бесполезны,
+        # а схема API сама по себе раскрывает все маршруты.
+        openapi_url="/openapi.json" if settings.docs_enabled else None,
     )
 
     register_docs_routes(app)
@@ -195,6 +215,12 @@ def create_app() -> FastAPI:
     app.include_router(subtask_files_router)  # /subtasks/{id}/specification, /subtasks/{id}/files
     app.include_router(uploads_router)        # /uploads/{file_path} — аутентифицированная раздача файлов
     app.include_router(users_router)
+    # admin_router — ДО setup_admin(app): sqladmin монтируется как Mount на /admin, а
+    # Starlette матчит маршруты в порядке регистрации и не проваливается дальше после
+    # совпадения префикса Mount — /admin/crm-sync и т.п., зарегистрированные позже,
+    # получили бы 404 от sqladmin (см. src/routers/admin.py).
+    app.include_router(admin_router)          # /admin/crm-sync, /admin/crm-sync-status/*, /admin/crm-options/refresh
+    setup_admin(app)                          # /admin — sqladmin-панель (User/Role/Task/Subtask/...)
     app.include_router(pages_router)          # HTML-страницы монтируются последними
 
     return app

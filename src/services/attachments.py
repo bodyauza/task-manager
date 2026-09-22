@@ -23,10 +23,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.user_models import User
-from src.crm.subtask_service import SubtaskCRMSync
-from src.crm.task_service import TaskCRMSync
 from src.realtime import broadcast_task_event
-from src.task_logic.models import Subtask, Task
+from src.task_logic.models import CrmOutbox, Subtask, Task
+from src.tasks.crm_outbox_tasks import dispatch_outbox_row
+from src.tasks.sharding import ensure_task_shard
 from src.utils.file_utils import (
     MAX_OTHER_FILES,     # лимит файлов в «Иных документах» (10 штук)
     UPLOAD_ROOT,         # абсолютный путь к src/uploads/ (единая точка определения)
@@ -56,19 +56,25 @@ class AttachmentConfig:
     singular_name: str                                     # "task" | "subtask" — для логов
     not_found_detail: str                                  # "Task not found" | "Subtask not found"
     event_type: str                                        # "task_files_updated" | "subtask_files_updated"
+    aggregate_type: str                                    # "task" | "subtask" — CrmOutbox.aggregate_type
+    crm_id_payload_key: str                                 # "crm_task_id" | "crm_subtask_id" — ключ в payload,
+        # который читают _do_sync_files_task/_do_sync_files_subtask (crm_outbox_tasks.py)
     get_crm_id: Callable[[Any], Optional[int]]              # entity -> crm_task_id | crm_subtask_id
-    crm_sync: Callable[..., Awaitable[dict]]                # (crm, crm_id, **kwargs) -> await crm.update_task/update_subtask
+    get_shard: Callable[[AsyncSession, Any], Awaitable[str]]
+        # entity -> шард агрегата: для Task — сама entity (ensure_task_shard), для Subtask —
+        # шард родительской задачи (у Subtask своего crm_shard нет, см. sharding.py)
     event_extra: Callable[[AsyncSession, Any], Awaitable[dict]]
         # -> {"title": ..., "task_id": ...} либо {"title": ..., "task_id": ..., "subtask_id": ..., "task_title": ...}
         # вычисляется ДО commit — после expire атрибуты сущности могут стать недоступны
 
 
-async def _sync_task(crm: TaskCRMSync, crm_id: int, **kwargs) -> dict:
-    return await crm.update_task(task_id=crm_id, **kwargs)
+async def _task_shard(db: AsyncSession, task: Task) -> str:
+    return ensure_task_shard(task)
 
 
-async def _sync_subtask(crm: SubtaskCRMSync, crm_id: int, **kwargs) -> dict:
-    return await crm.update_subtask(subtask_id=crm_id, **kwargs)
+async def _subtask_shard(db: AsyncSession, subtask: Subtask) -> str:
+    parent_task = await db.get(Task, subtask.task_id)
+    return ensure_task_shard(parent_task)
 
 
 async def _task_event_extra(db: AsyncSession, task: Task) -> dict:
@@ -93,8 +99,10 @@ TASK_ATTACHMENTS = AttachmentConfig(
     singular_name="task",
     not_found_detail="Task not found",
     event_type="task_files_updated",
+    aggregate_type="task",
+    crm_id_payload_key="crm_task_id",
     get_crm_id=lambda task: task.crm_task_id,
-    crm_sync=_sync_task,
+    get_shard=_task_shard,
     event_extra=_task_event_extra,
 )
 
@@ -104,10 +112,37 @@ SUBTASK_ATTACHMENTS = AttachmentConfig(
     singular_name="subtask",
     not_found_detail="Subtask not found",
     event_type="subtask_files_updated",
+    aggregate_type="subtask",
+    crm_id_payload_key="crm_subtask_id",
     get_crm_id=lambda subtask: subtask.crm_subtask_id,
-    crm_sync=_sync_subtask,
+    get_shard=_subtask_shard,
     event_extra=_subtask_event_extra,
 )
+
+
+async def _enqueue_sync_files(
+    db: AsyncSession, config: AttachmentConfig, entity: Any, entity_id: int, crm_id: int, **payload_fields: Any,
+) -> CrmOutbox:
+    """Строит и добавляет в сессию outbox-строку operation='sync_files' для
+    обновления файлового поля УЖЕ существующей в CRM сущности (в отличие от
+    sync_files, вставляемой в create-флоу services/tasks.py/subtasks.py — та
+    зависит от 'create' того же агрегата через depends_on_event_id, здесь же
+    crm_id уже известен, поэтому зависимость не нужна).
+
+    Вызывается ДО db.commit() (в той же транзакции, что и изменение
+    specification_path/other_file_paths) — вызывающий код обязан сам
+    диспатчить возвращённую строку через dispatch_outbox_row() ПОСЛЕ commit.
+    """
+    outbox_row = CrmOutbox(
+        aggregate_type=config.aggregate_type,
+        aggregate_id=entity_id,
+        operation="sync_files",
+        shard=await config.get_shard(db, entity),
+        payload={config.crm_id_payload_key: crm_id, **payload_fields},
+    )
+    db.add(outbox_row)
+    entity.sync_status = "pending"   # вернётся в 'synced' после успешного sync_files в воркере
+    return outbox_row
 
 
 # ════════════════════════════════════════════════════════════
@@ -207,12 +242,12 @@ async def upload_specification(
     user: User,
     entity_id: int,
     file: UploadFile,
-    crm,
     config: AttachmentConfig,
 ) -> dict:
     """Загружает (или заменяет) файл ТЗ. При повторной загрузке старый файл удаляется с диска.
 
-    Синхронизация с CRM — best-effort: ошибка CRM не блокирует сохранение.
+    Синхронизация с CRM — через durable outbox (см. _enqueue_sync_files): веб-процесс
+    сам CRM не вызывает, ошибка/недоступность CRM не блокирует и не задерживает сохранение.
     """
     entity = (
         await db.execute(select(config.model).where(config.model.id == entity_id))
@@ -235,20 +270,25 @@ async def upload_specification(
     # в поток он держит event loop занятым на время записи (для больших файлов заметно).
     rel_path = await asyncio.to_thread(save_file, dest_dir, filename, content)
 
-    # CRM-синхронизация — best-effort: только если сущность зарегистрирована в CRM.
+    # Outbox — только если сущность зарегистрирована в CRM (иначе синхронизировать
+    # нечего: crm_task_id/crm_subtask_id ещё не известен, а create-флоу сам поставит
+    # свою sync_files-строку, см. services/tasks.py::create_task). Вставляется в ТОЙ
+    # ЖЕ транзакции, что и entity.specification_path ниже.
     crm_id = config.get_crm_id(entity)
+    outbox_row: Optional[CrmOutbox] = None
     if crm_id is not None:
-        try:
-            await config.crm_sync(crm, crm_id, specification_abs_path=dest_dir / filename)
-            logger.info("CRM: %s %s specification synced", config.singular_name, entity_id)
-        except Exception as exc:
-            logger.error("CRM: %s %s specification sync failed: %s", config.singular_name, entity_id, exc)
+        outbox_row = await _enqueue_sync_files(
+            db, config, entity, entity_id, crm_id, specification_path=rel_path,
+        )
 
     # extra захватывается ДО commit — иначе MissingGreenlet после expire (title, task_title и т.д.).
     extra = await config.event_extra(db, entity)
     title = extra.pop("title")
     entity.specification_path = rel_path
     await db.commit()
+
+    if outbox_row is not None:
+        dispatch_outbox_row(outbox_row)
 
     # Удаляем старый файл только после успешного commit: если commit упал бы раньше,
     # старый файл остался бы на диске и путь в БД не изменился бы → нет потери данных.
@@ -267,7 +307,7 @@ async def upload_specification(
 
 
 async def delete_specification(
-    db: AsyncSession, user: User, entity_id: int, crm, config: AttachmentConfig,
+    db: AsyncSession, user: User, entity_id: int, config: AttachmentConfig,
 ) -> dict:
     """Удаляет файл ТЗ с диска и обнуляет путь в БД."""
     entity = (
@@ -286,21 +326,23 @@ async def delete_specification(
     old_path = UPLOAD_ROOT / entity.specification_path
 
     crm_id = config.get_crm_id(entity)
+    outbox_row: Optional[CrmOutbox] = None
+    if crm_id is not None:
+        outbox_row = await _enqueue_sync_files(
+            db, config, entity, entity_id, crm_id, clear_specification=True,
+        )
+
     extra = await config.event_extra(db, entity)  # захватить до commit — иначе MissingGreenlet после expire
     title = extra.pop("title")
     entity.specification_path = None
     await db.commit()
 
+    if outbox_row is not None:
+        dispatch_outbox_row(outbox_row)
+
     # asyncio.to_thread: unlink — синхронный блокирующий I/O; без выноса в поток
     # он держит event loop занятым на время удаления, как и запись файла в upload_specification.
     await asyncio.to_thread(old_path.unlink, missing_ok=True)
-
-    if crm_id is not None:
-        try:
-            await config.crm_sync(crm, crm_id, clear_specification=True)
-            logger.info("CRM: %s %s specification cleared", config.singular_name, entity_id)
-        except Exception as exc:
-            logger.error("CRM: %s %s specification clear failed: %s", config.singular_name, entity_id, exc)
 
     await broadcast_task_event(
         config.event_type, title, sender_email=user.email, actor_id=user.id, action="deleted", **extra,
@@ -345,7 +387,6 @@ async def upload_other_files(
     user: User,
     entity_id: int,
     files: list[UploadFile],
-    crm,
     config: AttachmentConfig,
 ) -> dict:
     """Добавляет файлы в «Иные документы» (максимум MAX_OTHER_FILES суммарно)."""
@@ -401,21 +442,22 @@ async def upload_other_files(
 
     updated = existing + new_paths
     crm_id = config.get_crm_id(entity)                        # захватить до commit
+    # Outbox — CRM-поле заменяется целиком (передаём ВСЕ текущие файлы поля, не
+    # только new_paths — иначе CRM потеряет ранее загруженные файлы записи); та же
+    # транзакция, что и entity.other_file_paths ниже.
+    outbox_row: Optional[CrmOutbox] = None
+    if crm_id is not None:
+        outbox_row = await _enqueue_sync_files(
+            db, config, entity, entity_id, crm_id, other_file_paths=updated,
+        )
     extra = await config.event_extra(db, entity)               # захватить до commit
     title = extra.pop("title")
     # JSONB: передаём list[str] напрямую; asyncpg сериализует в бинарный JSON при INSERT/UPDATE.
     entity.other_file_paths = updated
     await db.commit()
 
-    if crm_id is not None:
-        try:
-            # CRM-поле заменяется целиком: передаём все текущие файлы поля.
-            # Передать только new_paths — CRM потеряет ранее загруженные файлы записи.
-            all_abs = [UPLOAD_ROOT / p for p in updated]
-            await config.crm_sync(crm, crm_id, other_file_abs_paths=all_abs)
-            logger.info("CRM: %s %s other files synced (%d files)", config.singular_name, entity_id, len(all_abs))
-        except Exception as exc:
-            logger.error("CRM: %s %s other files sync failed: %s", config.singular_name, entity_id, exc)
+    if outbox_row is not None:
+        dispatch_outbox_row(outbox_row)
 
     await broadcast_task_event(
         config.event_type, title, sender_email=user.email, actor_id=user.id, action="uploaded", **extra,
@@ -425,7 +467,7 @@ async def upload_other_files(
 
 
 async def delete_other_file(
-    db: AsyncSession, user: User, entity_id: int, filename: str, crm, config: AttachmentConfig,
+    db: AsyncSession, user: User, entity_id: int, filename: str, config: AttachmentConfig,
 ) -> dict:
     """Удаляет один файл из «Иных документов» по имени файла."""
     # Тот же lost-update race, что и в upload_other_files — только в обратную сторону: если это
@@ -456,23 +498,25 @@ async def delete_other_file(
 
     updated = [p for p in existing if p != target]
     crm_id = config.get_crm_id(entity)
+    # Outbox — [] в payload означает «очистить поле в CRM» (обработчик различает
+    # отсутствие ключа от [] — см. _do_sync_files_task/_do_sync_files_subtask),
+    # [p1,…] — полную замену содержимого. Та же транзакция, что и other_file_paths ниже.
+    outbox_row: Optional[CrmOutbox] = None
+    if crm_id is not None:
+        outbox_row = await _enqueue_sync_files(
+            db, config, entity, entity_id, crm_id, other_file_paths=updated,
+        )
     extra = await config.event_extra(db, entity)   # захватить до commit — иначе MissingGreenlet после expire
     title = extra.pop("title")
     # NULL вместо [] при пустом списке: соответствует начальному состоянию колонки.
     entity.other_file_paths = updated if updated else None
     await db.commit()
 
+    if outbox_row is not None:
+        dispatch_outbox_row(outbox_row)
+
     # asyncio.to_thread: unlink — синхронный блокирующий I/O, тот же принцип, что и в save_file.
     await asyncio.to_thread(target_path.unlink, missing_ok=True)
-
-    if crm_id is not None:
-        try:
-            # [] очищает CRM-поле; [p1,…] заменяет всё содержимое поля.
-            remaining_abs = [UPLOAD_ROOT / p for p in updated]
-            await config.crm_sync(crm, crm_id, other_file_abs_paths=remaining_abs)
-            logger.info("CRM: %s %s other files synced after delete", config.singular_name, entity_id)
-        except Exception as exc:
-            logger.error("CRM: %s %s other files sync failed: %s", config.singular_name, entity_id, exc)
 
     await broadcast_task_event(
         config.event_type, title, sender_email=user.email, actor_id=user.id, action="deleted", **extra,

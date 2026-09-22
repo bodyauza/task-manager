@@ -15,6 +15,10 @@ def _normalize_whitespace(v: str) -> str:
 class TaskCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=100)
     description: str = Field(..., max_length=2000)
+    # CRM-ID опции списка "Проект" (значение <option value="...">, не сама метка) —
+    # формальная проверка длины, не членства в списке (это делает сервис через
+    # локальную таблицу project, см. services/tasks.py::_resolve_project_id).
+    project: Optional[str] = Field(None, max_length=20)
 
     # mode='before': нормализация запускается до type-coercion Pydantic.
     # При mode='after' строка из одного таба прошла бы проверку min_length=1,
@@ -32,6 +36,10 @@ class TaskUpdate(BaseModel):
     title: Optional[str] = Field(None, min_length=1, max_length=100)
     description: Optional[str] = Field(None, max_length=2000)
     completed: Optional[bool] = None
+    # None здесь — «поле не передано, не трогать» (exclude_unset=True в update_task);
+    # "" (пустая строка) — явная очистка выбранного проекта. См. §3.9.1
+    # docs/project_field_crm_implementation_guide.md.
+    project: Optional[str] = Field(None, max_length=20)
 
     @field_validator("title", mode="before")
     @classmethod
@@ -50,12 +58,14 @@ class TaskResponse(BaseModel):
     title: str
     description: str
     completed: bool
-    crm_task_id: Optional[int] = None
-    # crm_synced не хранится в БД — вычисляется в роутере по результату CRM-запроса.
-    # None  = операция не предполагала обращения к CRM (GET-запросы).
-    # True  = последняя синхронизация прошла успешно.
-    # False = последняя синхронизация завершилась ошибкой.
-    crm_synced: Optional[bool] = None
+    # crm_task_id/crm_synced НЕ являются полями этого ответа — сам CRM-id и
+    # внутренние детали (шард, outbox, попытки) клиенту не отдаются; они видны
+    # только администратору (src/routers/admin.py, /admin/crm-sync).
+    # sync_status — единственная деталь синхронизации, которую видит любой
+    # пользователь: бейдж рядом со счётчиком подзадач на task-board/
+    # subtask-board ('unsynced' | 'pending' | 'synced' | 'failed', см.
+    # Task.sync_status в models.py). Читается напрямую из ORM-колонки.
+    sync_status: str = "unsynced"
     # subtask_count вычисляется через подзапрос в read_tasks; None в остальных эндпоинтах.
     subtask_count: Optional[int] = None
 
@@ -77,3 +87,13 @@ class TaskResponse(BaseModel):
     # как и crm_synced выше. Ключ — оригинальное имя файла, значение — текст ошибки.
     # None — либо не create-эндпоинт, либо все файлы (если были) сохранились успешно.
     file_upload_errors: Optional[dict[str, str]] = None
+
+    # Значение опции ("Альфа"), не CRM-ID — читается через relationship task.project.label
+    # (from_attributes=True само по себе не читает вложенный объект под другим именем,
+    # см. services/tasks.py::_attach_project_option_id). None — проект не выбран.
+    project: Optional[str] = None
+    # Текущий CRM-ID выбранного проекта (task.project.crm_id) — только для
+    # предзаполнения <select> в режиме редактирования, см.
+    # docs/project_field_crm_implementation_guide.md §3.11.2. Вычисляемое поле,
+    # как crm_synced — в БД не хранится.
+    project_option_id: Optional[str] = None

@@ -10,6 +10,13 @@
                class="nav-link{% if current_page == 'profile' %} fw-semibold text-white{% else %} text-white-50{% endif %}">
                 Личный кабинет
             </a>
+            {% if is_admin %}
+            <a href="/admin/crm-sync"
+               class="nav-link{% if current_page == 'admin-crm-sync' %} fw-semibold text-white{% else %} text-white-50{% endif %}">
+                CRM-синхронизация (admin)
+            </a>
+            <a href="/admin/" class="nav-link text-white-50">Админ-панель</a>
+            {% endif %}
         </div>
     </div>
 </nav>

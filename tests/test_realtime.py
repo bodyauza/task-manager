@@ -10,6 +10,7 @@
 """
 
 import json
+from unittest.mock import AsyncMock, patch
 
 from src.realtime.events import broadcast_task_event
 from src.realtime.connection_manager import ConnectionManager
@@ -208,7 +209,111 @@ async def test_broadcast_removes_only_dead_tab_keeps_other_tab_alive():
     assert json.loads(alive_tab.sent[0]) == {"type": "ping"}
 
 
+# ── ConnectionManager: Redis Pub/Sub (рассылка между uvicorn-воркерами) ──────
+#
+# mock_realtime_redis (tests/conftest.py, autouse) уже патчит
+# src.realtime.connection_manager._get_redis для ВСЕГО файла — здесь он
+# запрашивается как параметр фикстуры только там, где тесту нужна ссылка на
+# сам фейковый клиент (проверить publish), а не только избежать реального
+# сетевого соединения.
+
+async def test_broadcast_publishes_to_redis_with_origin_and_payload(mock_realtime_redis):
+    manager = ConnectionManager()
+
+    await manager.broadcast({"type": "ping"}, exclude_user_id=7)
+
+    mock_realtime_redis.publish.assert_called_once()
+    channel, message = mock_realtime_redis.publish.call_args.args
+    assert channel == "task_events"
+    assert json.loads(message) == {
+        "origin": manager._origin,
+        "payload": {"type": "ping"},
+        "exclude_user_id": 7,
+    }
+
+
+async def test_broadcast_survives_redis_publish_failure():
+    """Локальная доставка уже произошла к моменту публикации — сбой Redis
+    (сеть недоступна, контейнер не поднят и т.п.) не должен ронять broadcast()
+    для процесса-инициатора."""
+    manager = ConnectionManager()
+    ws = FakeWebSocket()
+    manager.register(1, ws, "alice@example.com")
+
+    with patch(
+        "src.realtime.connection_manager._get_redis",
+        side_effect=RuntimeError("Redis unreachable"),
+    ):
+        await manager.broadcast({"type": "ping"})  # не должно бросить исключение
+
+    assert json.loads(ws.sent[0]) == {"type": "ping"}  # локальная доставка всё равно произошла
+
+
+async def test_pubsub_message_from_other_origin_delivers_locally():
+    manager = ConnectionManager()
+    ws = FakeWebSocket()
+    manager.register(1, ws, "alice@example.com")
+
+    message = {
+        "type": "message",
+        "data": json.dumps({"origin": "some-other-process", "payload": {"type": "ping"}, "exclude_user_id": None}),
+    }
+    await manager._handle_pubsub_message(message)
+
+    assert json.loads(ws.sent[0]) == {"type": "ping"}
+
+
+async def test_pubsub_message_from_own_origin_is_ignored():
+    """Redis рассылает публикацию всем подписчикам, включая публикующего —
+    без этой проверки процесс доставил бы своё же событие дважды (сразу в
+    broadcast() и повторно здесь)."""
+    manager = ConnectionManager()
+    ws = FakeWebSocket()
+    manager.register(1, ws, "alice@example.com")
+
+    message = {
+        "type": "message",
+        "data": json.dumps({"origin": manager._origin, "payload": {"type": "ping"}, "exclude_user_id": None}),
+    }
+    await manager._handle_pubsub_message(message)
+
+    assert ws.sent == []
+
+
+async def test_pubsub_message_ignores_non_message_type():
+    """redis-py отдаёт через listen() и служебные события подписки
+    (type='subscribe') — не доменные события, доставлять их не нужно."""
+    manager = ConnectionManager()
+    ws = FakeWebSocket()
+    manager.register(1, ws, "alice@example.com")
+
+    await manager._handle_pubsub_message({"type": "subscribe", "data": 1})
+
+    assert ws.sent == []
+
+
+async def test_pubsub_message_respects_exclude_user_id():
+    manager = ConnectionManager()
+    ws1, ws2 = FakeWebSocket(), FakeWebSocket()
+    manager.register(1, ws1, "alice@example.com")
+    manager.register(2, ws2, "bob@example.com")
+
+    message = {
+        "type": "message",
+        "data": json.dumps({"origin": "other", "payload": {"type": "ping"}, "exclude_user_id": 1}),
+    }
+    await manager._handle_pubsub_message(message)
+
+    assert ws1.sent == []
+    assert json.loads(ws2.sent[0]) == {"type": "ping"}
+
+
 # ── broadcast_task_event: форма payload и DIP-подмена broadcaster ──────────
+#
+# task_created/task_updated/task_deleted — персистируемые типы (src/realtime/
+# events.py::_PERSISTED_EVENT_TYPES) — payload дополняется id/created_at из
+# chat_history.append_event (mock_chat_history_redis, tests/conftest.py,
+# autouse, даёт рабочий incr-счётчик) ещё до того, как дойдёт до broadcaster.
 
 async def test_broadcast_task_event_builds_expected_payload():
     fake = FakeBroadcaster()
@@ -222,12 +327,11 @@ async def test_broadcast_task_event_builds_expected_payload():
 
     assert len(fake.calls) == 1
     payload, exclude_user_id = fake.calls[0]
-    assert payload == {
-        "type": "task_updated",
-        "title": "Задача №1",
-        "sender": "alice@example.com",
-        "task_id": 87,
-    }
+    assert payload["type"] == "task_updated"
+    assert payload["title"] == "Задача №1"
+    assert payload["sender"] == "alice@example.com"
+    assert payload["task_id"] == 87
+    assert "id" in payload and "created_at" in payload
     assert exclude_user_id == 7
 
 
@@ -237,7 +341,10 @@ async def test_broadcast_task_event_defaults_are_empty():
     await broadcast_task_event("task_created", "Задача №2", broadcaster=fake)
 
     payload, exclude_user_id = fake.calls[0]
-    assert payload == {"type": "task_created", "title": "Задача №2", "sender": ""}
+    assert payload["type"] == "task_created"
+    assert payload["title"] == "Задача №2"
+    assert payload["sender"] == ""
+    assert "id" in payload and "created_at" in payload
     assert exclude_user_id is None
 
 
@@ -253,8 +360,159 @@ async def test_broadcast_task_event_uses_connection_manager_by_default():
     finally:
         connection_manager.unregister(42, ws)
 
-    assert json.loads(ws.sent[0]) == {
-        "type": "task_deleted",
-        "title": "Задача №3",
-        "sender": "carol@example.com",
+    sent = json.loads(ws.sent[0])
+    assert sent["type"] == "task_deleted"
+    assert sent["title"] == "Задача №3"
+    assert sent["sender"] == "carol@example.com"
+    assert "id" in sent and "created_at" in sent
+
+
+# ── broadcast_task_event: персистентность CRUD-событий, не файловых ────────
+# (docs/chat_history_redis_list_guide.md, §1.4, обновлённое решение №2)
+
+async def test_broadcast_task_event_persists_all_crud_and_file_types(mock_chat_history_redis):
+    fake = FakeBroadcaster()
+    crud_types = (
+        "task_created", "task_updated", "task_deleted",
+        "subtask_created", "subtask_updated", "subtask_deleted",
+        "task_files_updated", "subtask_files_updated",
+    )
+    for event_type in crud_types:
+        await broadcast_task_event(event_type, "Title", broadcaster=fake, sender_email="a@b.c")
+
+    assert mock_chat_history_redis.rpush.call_count == len(crud_types)
+    for payload, _ in fake.calls:
+        assert "id" in payload and "created_at" in payload
+
+
+async def test_broadcast_task_event_does_not_persist_unknown_event(mock_chat_history_redis):
+    """Тип вне _PERSISTED_EVENT_TYPES остаётся эфемерным."""
+    fake = FakeBroadcaster()
+
+    await broadcast_task_event("something_else", "Title", broadcaster=fake, sender_email="a@b.c")
+
+    mock_chat_history_redis.rpush.assert_not_called()
+    for payload, _ in fake.calls:
+        assert "id" not in payload  # не персистировано — id/created_at не добавляются
+
+
+# ── _publish_chat_message: персист в chat_history + broadcast (docs/ ────────
+# chat_history_redis_list_guide.md) ──────────────────────────────────────────
+#
+# chat_history.append_event мокается напрямую (не Redis-уровень) — сама
+# логика Redis List/пагинации тестируется отдельно, в tests/test_chat_history.py.
+# Здесь проверяется только оркестрация router.py::_publish_chat_message:
+# персист вызывается с правильным payload, а payload broadcast() дополняется
+# id/created_at из результата append_event.
+
+async def test_publish_chat_message_persists_then_broadcasts_with_id_and_created_at():
+    from src.realtime.router import _publish_chat_message
+    from src.realtime.connection_manager import connection_manager
+
+    sender_ws, other_ws = FakeWebSocket(), FakeWebSocket()
+    connection_manager.register(1, sender_ws, "alice@example.com")
+    connection_manager.register(2, other_ws, "bob@example.com")
+    try:
+        with patch(
+            "src.realtime.router.chat_history.append_event",
+            AsyncMock(return_value={"id": 42, "created_at": "2026-01-01T00:00:00+00:00"}),
+        ) as mock_append:
+            await _publish_chat_message(1, "hello")
+    finally:
+        connection_manager.unregister(1, sender_ws)
+        connection_manager.unregister(2, other_ws)
+
+    mock_append.assert_called_once_with(
+        {"type": "chat", "sender": "alice@example.com", "text": "hello", "sender_user_id": 1}
+    )
+    base = {
+        "type": "chat",
+        "sender": "alice@example.com",
+        "text": "hello",
+        "id": 42,
+        "created_at": "2026-01-01T00:00:00+00:00",
     }
+    # Отправитель получает эхо (рисуется как «You: ...»), остальные — то же
+    # сообщение с is_own=False; внутренний sender_user_id клиентам не уходит.
+    assert json.loads(sender_ws.sent[0]) == {**base, "is_own": True}
+    assert json.loads(other_ws.sent[0]) == {**base, "is_own": False}
+
+
+async def test_publish_chat_message_skips_persistence_when_sender_not_registered():
+    """sender_email is None (пользователь не зарегистрирован в ConnectionManager,
+    например соединение уже закрылось) — персистентность не вызывается вовсе,
+    как и раньше broadcast() не вызывался."""
+    from src.realtime.router import _publish_chat_message
+
+    with patch("src.realtime.router.chat_history.append_event", AsyncMock()) as mock_append:
+        await _publish_chat_message(999, "hello")
+
+    mock_append.assert_not_called()
+
+
+# ── is_own: сообщение чата рассылается всем, признак «своё» — на получателя ──
+
+async def test_deliver_local_sets_is_own_per_recipient_and_strips_sender_user_id():
+    manager = ConnectionManager()
+    author_tab1, author_tab2, other = FakeWebSocket(), FakeWebSocket(), FakeWebSocket()
+    manager.register(1, author_tab1, "alice@example.com")
+    manager.register(1, author_tab2, "alice@example.com")
+    manager.register(2, other, "bob@example.com")
+
+    await manager._deliver_local(
+        {"type": "chat", "sender": "alice@example.com", "text": "hi", "sender_user_id": 1}
+    )
+
+    frames = [json.loads(ws.sent[0]) for ws in (author_tab1, author_tab2, other)]
+    assert [f["is_own"] for f in frames] == [True, True, False]   # обе вкладки автора — «свои»
+    for frame in frames:
+        assert "sender_user_id" not in frame                       # внутренний id клиентам не отдаётся
+        assert frame["text"] == "hi" and frame["sender"] == "alice@example.com"
+
+
+async def test_deliver_local_without_sender_user_id_sends_payload_unchanged():
+    manager = ConnectionManager()
+    ws = FakeWebSocket()
+    manager.register(1, ws, "alice@example.com")
+
+    await manager._deliver_local({"type": "task_created", "title": "T", "actor_id": 1})
+
+    assert json.loads(ws.sent[0]) == {"type": "task_created", "title": "T", "actor_id": 1}
+
+
+async def test_pubsub_message_from_other_worker_tailors_is_own_for_local_sockets():
+    """Сообщение чата, опубликованное другим uvicorn-воркером (с sender_user_id
+    в payload), этот воркер доставляет своим сокетам с is_own на получателя и без
+    sender_user_id."""
+    manager = ConnectionManager()
+    author_ws, other_ws = FakeWebSocket(), FakeWebSocket()
+    manager.register(1, author_ws, "alice@example.com")   # вторая вкладка автора — на ЭТОМ воркере
+    manager.register(2, other_ws, "bob@example.com")
+
+    message = {
+        "type": "message",
+        "data": json.dumps({
+            "origin": "some-other-process",
+            "payload": {"type": "chat", "sender": "alice@example.com", "text": "hi", "sender_user_id": 1},
+            "exclude_user_id": None,
+        }),
+    }
+    await manager._handle_pubsub_message(message)
+
+    assert json.loads(author_ws.sent[0])["is_own"] is True
+    assert json.loads(other_ws.sent[0])["is_own"] is False
+    assert "sender_user_id" not in author_ws.sent[0] and "sender_user_id" not in other_ws.sent[0]
+
+
+async def test_broadcast_publishes_sender_user_id_through_redis_for_other_workers(mock_realtime_redis):
+    """Через Redis payload идёт С sender_user_id (каждый воркер сам решает
+    is_own для своих сокетов) — клиентам локального воркера он не уходит."""
+    manager = ConnectionManager()
+    ws = FakeWebSocket()
+    manager.register(1, ws, "alice@example.com")
+
+    await manager.broadcast({"type": "chat", "text": "hi", "sender_user_id": 1})
+
+    published = json.loads(mock_realtime_redis.publish.call_args.args[1])
+    assert published["payload"]["sender_user_id"] == 1
+    assert "sender_user_id" not in ws.sent[0]

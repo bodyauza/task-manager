@@ -34,24 +34,34 @@ async def test_login_success(client: AsyncClient, registered_user: dict):
     r = await _login(client, **registered_user)
     assert r.status_code == 200
     assert "access_token" in r.cookies
+    assert "refresh_token" in r.cookies
+    # Выданная кука действительно даёт доступ к защищённому эндпоинту.
+    assert (await client.get("/tasks/")).status_code == 200
 
 
 async def test_login_wrong_password(client: AsyncClient, registered_user: dict):
     r = await _login(client, email=registered_user["email"], password="WrongPass1!")
     assert r.status_code == 400
+    assert "access_token" not in r.cookies and "refresh_token" not in r.cookies
 
 
 async def test_login_nonexistent_user(client: AsyncClient):
     r = await _login(client, email="nobody@example.com")
     assert r.status_code == 400
+    assert "access_token" not in r.cookies
 
 
 # ── Logout ───────────────────────────────────────────────────────────────────
 
 async def test_logout(client: AsyncClient, registered_user: dict):
     await _login(client, **registered_user)
+    assert (await client.get("/tasks/")).status_code == 200    # сессия действительно была
     r = await client.post("/auth/logout")
     assert r.status_code == 200
+    _assert_clears_both_cookies(r.headers.get_list("set-cookie"))
+    # После выхода доступа нет, а refresh-токен больше не работает.
+    assert (await client.get("/tasks/")).status_code == 401
+    assert (await client.post("/auth/access-token")).status_code == 401
 
 
 async def test_logout_without_session_succeeds(client: AsyncClient):

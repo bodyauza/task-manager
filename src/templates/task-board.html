@@ -114,9 +114,6 @@
         button.update { background-color: #e65100; }
         button.update:hover { background-color: #bf360c; }
 
-        button.clear-history { background-color: #546e7a; }
-        button.clear-history:hover { background-color: #37474f; }
-
         .task-list {
             list-style: none;
             padding: 0;
@@ -225,17 +222,21 @@
             letter-spacing: 0.3px;
         }
 
-        .crm-badge {
-            display: inline-block;
-            background-color: #b71c1c;
-            color: white;
-            padding: 2px 8px;
-            border-radius: 2px;
-            font-size: 11px;
-            font-weight: 700;
-            white-space: nowrap;
-            letter-spacing: 0.3px;
+        /* Бейдж статуса CRM-синхронизации (syncStatusTag в common.js) — базовый вид даёт
+           .subtask-count, здесь цвет и особые состояния; двойной селектор перекрывает фон .subtask-count. */
+        .subtask-count.sync-status-unsynced { background-color: #6c757d; }
+        .subtask-count.sync-status-pending  { background-color: #ffc107; color: #212529; }
+        .subtask-count.sync-status-stalled  { background-color: #c05e00; color: #fff; }
+        .subtask-count.sync-status-failed   { background-color: #b71c1c; }
+        /* synced — только галочка без плашки. */
+        .subtask-count.sync-status-synced   { background: transparent; color: #198754; padding: 0 2px; font-size: 15px; cursor: default; }
+        .sync-spinner {
+            display: inline-block; width: 9px; height: 9px; margin-right: 5px; vertical-align: -1px;
+            border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+            animation: sync-spin 0.8s linear infinite;
         }
+        @keyframes sync-spin { to { transform: rotate(360deg); } }
+        @media (prefers-reduced-motion: reduce) { .sync-spinner { animation: none; } }
 
         .pagination {
             display: flex;
@@ -413,9 +414,6 @@
                     <input type="text" id="messageInput" placeholder="Введите сообщение">
                 </div>
                 <button id="sendBtn">Отправить</button>
-                <div style="margin-top: 8px;">
-                    <button class="clear-history" id="clearHistoryBtn">Очистить историю</button>
-                </div>
             </div>
 
             <div class="card">
@@ -455,6 +453,15 @@
                 <textarea id="editDescription" maxlength="2000"></textarea>
             </div>
             <div class="form-group">
+                <label for="editProject">Проект</label>
+                <select id="editProject" class="form-select">
+                    <option value="">— не выбран —</option>
+                    {% for id, label in project_options.items() %}
+                    <option value="{{ id }}">{{ label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="form-group">
                 <label class="modal-checkbox-label">
                     <input type="checkbox" id="editCompleted"> Отметить как выполненную
                 </label>
@@ -477,6 +484,17 @@
             <div class="form-group">
                 <label for="createDescription">Описание</label>
                 <textarea id="createDescription" maxlength="2000"></textarea>
+            </div>
+            <div class="form-group">
+                <label for="createProject">Проект</label>
+                <select id="createProject" class="form-select">
+                    <!-- Пустое значение по умолчанию обязательно: без него браузер отправил бы
+                         CRM-ID первой опции списка, даже если пользователь его не выбирал. -->
+                    <option value="">— не выбран —</option>
+                    {% for id, label in project_options.items() %}
+                    <option value="{{ id }}">{{ label }}</option>
+                    {% endfor %}
+                </select>
             </div>
 
             <!-- ── Техническое задание ─────────────────────────────────────── -->
@@ -518,7 +536,7 @@
         </div>
     </div>
 
-    <script src="/static/js/common.js?v=4" defer></script>
-    <script src="/static/js/task-board.js?v=6" defer></script>
+    <script src="/static/js/common.js?v=6" defer></script>
+    <script src="/static/js/task-board.js?v=9" defer></script>
 </body>
 </html>

@@ -19,8 +19,8 @@ from src.auth.user_schemas import (
     is_valid_password_format,
 )
 from src.config import settings
-from src.crm.client import CRMUnavailableError
 from src.database import get_async_session
+from src.openapi_responses import responses
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +63,8 @@ class _CompleteBody(BaseModel):
     # patronymic не является обязательным полем: отсутствие в теле запроса
     # не вызывает ошибку валидации — Pydantic подставляет None по умолчанию.
     patronymic: Optional[str] = Field(default=None, max_length=255)
-    # max_length=72: bcrypt учитывает только первые 72 байта пароля и молча
-    # обрезает остальное — см. пояснение в src/auth/user_schemas.py::UserCreate.password.
+    # max_length=72 — практическая граница длины пароля, см. пояснение в
+    # src/auth/user_schemas.py::UserCreate.password.
     password:   str = Field(..., min_length=5, max_length=72)
 
 
@@ -121,7 +121,12 @@ def _now_utc() -> datetime:
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
-@registration_router.post("/register/request-code", status_code=200)
+@registration_router.post(
+    "/register/request-code",
+    status_code=200,
+    summary="Шаг 1: отправить код подтверждения на email",
+    responses=responses(400, 409, 429, 503, c400="INVALID_EMAIL", c409="EMAIL_ALREADY_REGISTERED", c429="RATE_LIMIT:<секунд> — повторный запрос раньше чем через 60 с", c503="SMTP_ERROR — не удалось отправить письмо"),
+)
 async def request_registration_code(
     body: _RequestCodeBody,
     db: AsyncSession = Depends(get_async_session),
@@ -194,7 +199,13 @@ async def request_registration_code(
     return {"message": "Code sent"}
 
 
-@registration_router.post("/register/verify-code", status_code=200)
+@registration_router.post(
+    "/register/verify-code",
+    status_code=200,
+    summary="Шаг 2: подтвердить код",
+    description="До 3 попыток, TTL кода 15 минут. При успехе выставляет HttpOnly-куку `reg_token` (20 минут).",
+    responses=responses(400, c400="NO_PENDING_REGISTRATION, CODE_EXPIRED, TOO_MANY_ATTEMPTS или INVALID_CODE:<осталось попыток>"),
+)
 async def verify_registration_code(
     body: _VerifyCodeBody,
     response: Response,
@@ -272,7 +283,13 @@ async def verify_registration_code(
     return {"message": "Email confirmed"}
 
 
-@registration_router.post("/register/complete", status_code=201)
+@registration_router.post(
+    "/register/complete",
+    status_code=201,
+    summary="Шаг 3: создать пользователя",
+    description="Требует куку `reg_token` из шага 2. Регистрация в CRM выполняется best-effort.",
+    responses=responses(401, 409, 422, c401="MISSING_REG_TOKEN — нет куки reg_token или токен недействителен", c409="EMAIL_ALREADY_REGISTERED", c422="Слабый пароль или ошибка валидации полей"),
+)
 async def complete_registration(
     body: _CompleteBody,
     response: Response,
@@ -312,12 +329,10 @@ async def complete_registration(
     )
 
     try:
-        # user_manager.create: регистрирует в CRM → затем INSERT в person.
+        # user_manager.create: пытается зарегистрировать в CRM (best-effort,
+        # сбой только логируется — см. auth/manager.py::create), затем INSERT
+        # в person независимо от результата CRM-регистрации.
         await user_manager.create(user_create)
-    except CRMUnavailableError:
-        # Перевод доменного исключения в HTTP-ответ — граница ответственности
-        # эндпоинта, а не UserManager (см. auth/manager.py::create).
-        raise HTTPException(status_code=503, detail="CRM_UNAVAILABLE")
     except Exception as exc:
         from fastapi_users import exceptions as fu_exc
         if isinstance(exc, fu_exc.UserAlreadyExists):

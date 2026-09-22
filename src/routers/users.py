@@ -11,6 +11,7 @@ from src.auth.auth_config import require_role
 from src.auth.user_models import Role, User
 from src.auth.user_schemas import UserRead
 from src.database import get_async_session
+from src.openapi_responses import responses
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
@@ -31,7 +32,12 @@ class UserAdminUpdate(BaseModel):
     is_active:  Optional[bool]       = None
 
 
-@router.get("/", response_model=list[UserRead])
+@router.get(
+    "/",
+    response_model=list[UserRead],
+    summary="Список пользователей",
+    responses=responses(401, 403),
+)
 async def list_users(
     admin: User = Depends(_admin_only),
     db: AsyncSession = Depends(get_async_session),
@@ -45,7 +51,13 @@ async def list_users(
     return users
 
 
-@router.patch("/{user_id}", response_model=UserRead)
+@router.patch(
+    "/{user_id}",
+    response_model=UserRead,
+    summary="Изменить пользователя",
+    description="Частичное обновление. `role_ids` заменяет весь набор ролей целиком.",
+    responses=responses(400, 401, 403, 404, 409, c400="Несуществующий id в `role_ids`"),
+)
 # PATCH — семантика частичного обновления: клиент передаёт только изменяемые поля,
 # остальные остаются нетронутыми. response_model=UserRead ограничивает ответ:
 # поля, отсутствующие в UserRead (например, hashed_password), в JSON не попадут.
@@ -124,7 +136,12 @@ async def update_user(
     return user
 
 
-@router.delete("/{user_id}", response_model=UserRead)
+@router.delete(
+    "/{user_id}",
+    response_model=UserRead,
+    summary="Удалить пользователя",
+    responses=responses(400, 401, 403, 404, c400="Попытка удалить собственную учётную запись"),
+)
 async def delete_user(
     user_id: int,
     admin: User = Depends(_admin_only),

@@ -7,16 +7,49 @@ ConnectionManager отвечает за одну вещь (SRP): кто сейч
 Open/Closed на практике: чтобы завтра добавить, например,
 "comment_created", ConnectionManager менять не придётся — достаточно
 новой функции в events.py, использующей уже существующий broadcast().
+
+Redis Pub/Sub (docs/task-manager-documentation.md, «Векторы развития
+проекта», п. 7) — рассылка между несколькими uvicorn-воркерами. broadcast()
+делает ДВЕ вещи: (1) доставляет локальным соединениям ЭТОГО процесса сразу
+же, синхронно, как и раньше — низкая латентность и точное сохранение
+поведения для процесса-инициатора; (2) публикует то же событие в Redis-канал
+"task_events", чтобы ДРУГИЕ процессы (другие uvicorn-воркеры) тоже доставили
+его своим локальным соединениям. Сообщение несёт `origin` — случайный id,
+сгенерированный этим экземпляром при создании: получив обратно СВОЁ ЖЕ
+сообщение через подписку (Redis рассылает всем подписчикам, включая
+публикующего), процесс узнаёт его по origin и не доставляет повторно (уже
+доставил в п. 1). Публикация в Redis — best-effort (try/except): сбой
+публикации не должен ронять локальную доставку, которая к этому моменту уже
+произошла.
 """
 
 import asyncio
 import json
 import logging
+import uuid
 from typing import Protocol
 
+import redis.asyncio as redis
 from fastapi import WebSocket
 
+from src.config import settings
+
 logger = logging.getLogger(__name__)
+
+_CHANNEL = "task_events"
+_redis_client: redis.Redis | None = None
+
+
+def _get_redis() -> redis.Redis:
+    # Module-level singleton — тот же приём, что и _get_shared_http_client()
+    # в src/crm/client.py и _get_redis() в src/tasks/crm_rate_limit.py/
+    # crm_shard_lock.py: один клиент на процесс. Функция (не метод), чтобы
+    # тесты могли патчить её одной точкой независимо от того, сколько
+    # экземпляров ConnectionManager создано (см. tests/test_realtime.py).
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(settings.REDIS_URL)
+    return _redis_client
 
 
 class Broadcaster(Protocol):
@@ -46,6 +79,12 @@ class ConnectionManager:
     def __init__(self) -> None:
         self._connections: dict[int, set[WebSocket]] = {}
         self._emails: dict[int, str] = {}
+        # Случайный id ЭТОГО экземпляра/процесса — метка "origin" в
+        # публикуемых Redis-сообщениях, чтобы не доставить своё же
+        # событие повторно, получив его обратно через подписку (см.
+        # докстринг модуля и broadcast()/_handle_pubsub_message() ниже).
+        self._origin = uuid.uuid4().hex
+        self._pubsub_task: asyncio.Task | None = None
 
     def register(self, user_id: int, websocket: WebSocket, email: str) -> None:
         """Добавляет соединение в набор пользователя, не трогая остальные.
@@ -89,8 +128,8 @@ class ConnectionManager:
         except Exception:
             return False
 
-    async def broadcast(self, payload: dict, exclude_user_id: int | None = None) -> None:
-        """Рассылает payload всем подключённым соединениям, кроме exclude_user_id.
+    async def _deliver_local(self, payload: dict, exclude_user_id: int | None = None) -> None:
+        """Рассылает payload соединениям ЭТОГО процесса, кроме exclude_user_id.
 
         Если у пользователя открыто несколько вкладок — событие уходит в
         каждую из них независимо. Мёртвые соединения (send_text бросил
@@ -107,9 +146,22 @@ class ConnectionManager:
         остальных (хотя _send_safe и так перехватывает исключения сама —
         дополнительная защита на случай, если это изменится в будущем).
         """
-        data = json.dumps(payload)
-        targets: list[tuple[int, WebSocket]] = [
-            (uid, connection)
+        # sender_user_id — внутренний признак «это сообщение чата от пользователя
+        # N» (см. router.py::_publish_chat_message): каждому получателю уходит
+        # вариант БЕЗ этого поля, но с is_own (True для всех соединений
+        # отправителя — в т.ч. других его вкладок, False для остальных). Всего
+        # две сериализации на рассылку, а не по одной на получателя. Остальные
+        # события (без sender_user_id) идут как раньше — одна сериализация на всех.
+        sender_id = payload.get("sender_user_id")
+        if sender_id is None:
+            data_all = json.dumps(payload)
+            data_own = data_other = data_all
+        else:
+            base = {k: v for k, v in payload.items() if k != "sender_user_id"}
+            data_own = json.dumps({**base, "is_own": True})
+            data_other = json.dumps({**base, "is_own": False})
+        targets: list[tuple[int, WebSocket, str]] = [
+            (uid, connection, data_own if uid == sender_id else data_other)
             for uid, sockets in list(self._connections.items())
             if uid != exclude_user_id
             for connection in list(sockets)
@@ -117,12 +169,75 @@ class ConnectionManager:
         if not targets:
             return
         results = await asyncio.gather(
-            *(self._send_safe(connection, data) for _, connection in targets),
+            *(self._send_safe(connection, data) for _, connection, data in targets),
             return_exceptions=True,
         )
-        for (uid, connection), ok in zip(targets, results):
+        for (uid, connection, _), ok in zip(targets, results):
             if ok is not True:
                 self.unregister(uid, connection)
+
+    async def broadcast(self, payload: dict, exclude_user_id: int | None = None) -> None:
+        """Доставляет локальным соединениям СРАЗУ (см. _deliver_local — точно
+        то же поведение, что и раньше, для процесса-инициатора), затем
+        публикует то же событие в Redis-канал, чтобы другие uvicorn-воркеры
+        доставили его своим собственным локальным соединениям (см. докстринг
+        модуля). Публикация — best-effort: сбой Redis не должен ронять то,
+        что уже доставлено локально несколькими строками выше.
+        """
+        await self._deliver_local(payload, exclude_user_id)
+        try:
+            message = json.dumps(
+                {"origin": self._origin, "payload": payload, "exclude_user_id": exclude_user_id}
+            )
+            await _get_redis().publish(_CHANNEL, message)
+        except Exception:
+            logger.warning(
+                "Не удалось опубликовать событие в Redis Pub/Sub — доставлено только этому процессу",
+                exc_info=True,
+            )
+
+    async def _handle_pubsub_message(self, message: dict) -> None:
+        """Обрабатывает одно сообщение из redis.pubsub().listen() — вынесено
+        из _pubsub_loop отдельной функцией, чтобы тестировать без реального
+        бесконечного async-итератора (см. tests/test_realtime.py)."""
+        if message.get("type") != "message":
+            return  # подтверждения subscribe/unsubscribe и т.п. — не события
+        try:
+            data = json.loads(message["data"])
+        except Exception:
+            logger.exception("Не удалось разобрать сообщение из Redis-канала %s", _CHANNEL)
+            return
+        if data.get("origin") == self._origin:
+            return  # своё же сообщение — уже доставлено локально в broadcast()
+        await self._deliver_local(data.get("payload", {}), data.get("exclude_user_id"))
+
+    async def _pubsub_loop(self) -> None:
+        pubsub = _get_redis().pubsub()
+        await pubsub.subscribe(_CHANNEL)
+        try:
+            async for message in pubsub.listen():
+                await self._handle_pubsub_message(message)
+        finally:
+            await pubsub.unsubscribe(_CHANNEL)
+            await pubsub.aclose()
+
+    def start_listening(self) -> None:
+        """Запускает фоновую подписку на Redis-канал — вызывается из
+        lifespan() (src/main.py) при старте приложения. Идемпотентно:
+        повторный вызов при уже запущенной задаче не создаёт вторую."""
+        if self._pubsub_task is None:
+            self._pubsub_task = asyncio.create_task(self._pubsub_loop())
+
+    async def stop_listening(self) -> None:
+        """Останавливает фоновую подписку — вызывается из lifespan() при
+        остановке приложения, парная операция к start_listening()."""
+        if self._pubsub_task is not None:
+            self._pubsub_task.cancel()
+            try:
+                await self._pubsub_task
+            except asyncio.CancelledError:
+                pass
+            self._pubsub_task = None
 
 
 # Единственный экземпляр на процесс — как и раньше в routers/tasks.py,

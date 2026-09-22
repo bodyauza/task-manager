@@ -31,6 +31,11 @@ class Role(Base):
     # Обратная сторона many-to-many к User через user_role — см. её определение ниже.
     users: Mapped[List["User"]] = relationship("User", secondary="user_role", back_populates="roles")
 
+    def __str__(self) -> str:
+        # Подпись в ajax-полях/выпадающих списках sqladmin (str(model)); без
+        # __str__ там показывалось бы <Role object at 0x...>.
+        return self.name
+
 
 # Таблица-связка many-to-many между person и role. Составной первичный ключ
 # (person_id, role_id) одновременно даёт уникальность пары — назначить одну и ту же
@@ -80,6 +85,10 @@ class User(SQLAlchemyBaseUserTable[int], Base):
     # is_superuser не переопределяется: в проекте права задаются через roles/require_role().
     # Поле остаётся в БД через SQLAlchemyBaseUserTable, скрыто из API через UserRead.
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    def __str__(self) -> str:
+        # Подпись владельца в ajax-полях sqladmin (str(model)).
+        return self.email
 
     @property
     def role_ids(self) -> List[int]:

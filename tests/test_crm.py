@@ -1,9 +1,12 @@
 """
-Юнит-тесты для каждой функции пакета src/crm.
+Юнит-тесты CRM-клиентов из src/crm/user_service.py (CRMUserRegistrar) и
+src/crm/task_service.py (TaskManager); SubtaskManager — в test_crm_subtask.py.
 
-Все HTTP-вызовы перехватываются через unittest.mock: реальных запросов нет.
-Фикстура autouse mock_crm из conftest.py здесь переопределяется — каждый
-тест настраивает собственный mock для полного контроля сценария.
+Все HTTP-вызовы перехватываются через unittest.mock (httpx-клиент): реальных
+запросов нет. Тесты работают с менеджерами напрямую, минуя приложение, поэтому
+autouse-фикстура mock_crm из conftest.py (подмена зависимости FastAPI
+get_user_registrar) на них не влияет — каждый тест сам настраивает свой mock
+для полного контроля сценария.
 """
 import json
 
@@ -12,7 +15,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.crm.task_service import TaskManager
-from src.crm.user_service import CRMUserRegistrar, CRMUserSelector
+from src.crm.user_service import CRMUserRegistrar
 
 # Ключи полей CRM выводятся из констант TaskManager, а не хардкодятся строками:
 # сторонние разработчики меняют FIELD_TITLE/FIELD_DESCR/FIELD_DONE в task_service.py
@@ -147,44 +150,6 @@ async def test_register_user_invalid_json():
         patcher.stop()
 
 
-# ── CRMUserSelector.find_user_by_email ───────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_find_user_by_email_found():
-    """find_user_by_email возвращает первую запись, если пользователь найден."""
-    user_data = {"id": "30", "9": "ivan@example.com", "7": "Ivan", "8": "Petrov"}
-    patcher, mock_http = _patch_httpx(_resp([user_data]))
-    try:
-        result = await CRMUserSelector().find_user_by_email("ivan@example.com")
-        assert result is not None
-        assert result["id"] == "30"
-        payload = mock_http.post.call_args.kwargs["json"]
-        assert payload["action"] == "select"
-        assert payload["filters"]["9"]["condition"] == "include"
-    finally:
-        patcher.stop()
-
-
-@pytest.mark.asyncio
-async def test_find_user_by_email_not_found():
-    """find_user_by_email возвращает None при пустом data."""
-    patcher, _ = _patch_httpx(_resp([]))
-    try:
-        assert await CRMUserSelector().find_user_by_email("nobody@example.com") is None
-    finally:
-        patcher.stop()
-
-
-@pytest.mark.asyncio
-async def test_find_user_by_email_connection_error():
-    patcher, _ = _patch_httpx(side_effect=httpx.ConnectError("refused"))
-    try:
-        with pytest.raises(Exception, match="Connection error"):
-            await CRMUserSelector().find_user_by_email("ivan@example.com")
-    finally:
-        patcher.stop()
-
-
 # ── TaskManager.create_task ───────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -257,7 +222,8 @@ async def test_update_task_success():
 async def test_update_task_empty_id_raises():
     """Регрессия (docs/crm_issue.md): если задачу удалили в CRM напрямую, CRM отвечает
     "success" с пустым data.id вместо ошибки — expect_id должен превратить это в Exception,
-    чтобы update_task() в services/tasks.py выставил crm_synced=False, а не True."""
+    чтобы _do_update_task (src/tasks/crm_outbox_tasks.py) не принял это за успех и
+    оставил строку crm_outbox на повторную попытку, а не пометил её 'done'."""
     patcher, _ = _patch_httpx(_resp({"id": ""}))
     try:
         with pytest.raises(Exception, match="no valid id"):

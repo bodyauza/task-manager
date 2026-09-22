@@ -309,6 +309,7 @@ function renderTask(t) {
     currentTask = t;
     document.getElementById('viewTitle').textContent = t.title;
     document.getElementById('viewDescription').textContent = t.description || '—';
+    document.getElementById('viewProject').textContent = t.project || '—';
 
     // Отрисовываем файлы: renderSpecification и renderOtherFiles вызываются каждый раз
     // при loadTask() — это гарантирует актуальность состояния после перезагрузки страницы.
@@ -321,13 +322,6 @@ function renderTask(t) {
     const countEl = document.getElementById('viewSubtaskCount');
     const count = t.subtask_count != null ? t.subtask_count : 0;
     countEl.innerHTML = `<span class="subtask-count">${subtaskLabel(count)}</span>`;
-
-    const crmEl = document.getElementById('viewCrm');
-    if (t.crm_task_id != null) {
-        crmEl.innerHTML = `<span class="crm-badge-ok">Синхронизирована (ID ${t.crm_task_id})</span>`;
-    } else {
-        crmEl.innerHTML = '<span class="crm-badge">Отсутствует в CRM</span>';
-    }
 
     document.getElementById('subtasksLink').href = `/subtask-board/${taskId}`;
 }
@@ -359,6 +353,7 @@ function _readEditFormFields() {
     return {
         title: document.getElementById('editTitle').value,
         description: document.getElementById('editDescription').value,
+        project: document.getElementById('editProject').value,
         completed: document.getElementById('editCompleted').checked,
     };
 }
@@ -368,6 +363,7 @@ function _editFormHasUnsavedChanges() {
     const current = _readEditFormFields();
     return current.title !== _editFormSnapshot.title
         || current.description !== _editFormSnapshot.description
+        || current.project !== _editFormSnapshot.project
         || current.completed !== _editFormSnapshot.completed;
 }
 
@@ -376,6 +372,9 @@ function openEditForm() {
     const titleEl = document.getElementById('editTitle');
     titleEl.value = currentTask.title;
     document.getElementById('editDescription').value = currentTask.description;
+    // currentTask.project_option_id — CRM-ID для value <select>, не currentTask.project
+    // (та же метка, что видна в режиме просмотра) — см. task-board.js::openEditModal.
+    document.getElementById('editProject').value = currentTask.project_option_id || '';
     document.getElementById('editCompleted').checked = currentTask.completed;
     _updateCharCounter(titleEl, document.getElementById('editTitleCounter'), TITLE_MAX_LENGTH);
     _editFormSnapshot = _readEditFormFields();
@@ -403,6 +402,7 @@ function requestCloseEditForm() {
 async function saveTask() {
     const title       = document.getElementById('editTitle').value.trim();
     const description = document.getElementById('editDescription').value;
+    const project      = document.getElementById('editProject').value;
     const completed   = document.getElementById('editCompleted').checked;
     if (!title) { alert('Название не может быть пустым'); return; }
 
@@ -410,12 +410,11 @@ async function saveTask() {
         const resp = await fetchWithAuth(`/tasks/${taskId}`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title, description, completed }),
+            body: JSON.stringify({ title, description, project, completed }),
         });
         if (!resp) return;
         if (resp.ok) {
             const t = await resp.json();
-            if (t.crm_synced === false) showToast('Сохранено без синхронизации с CRM', 'warning');
             renderTask(t);
             closeEditForm();
         } else if (resp.status === 422) {
@@ -438,8 +437,6 @@ async function deleteTask() {
         const resp = await fetchWithAuth(`/delete-task/${taskId}`, { method: 'DELETE' });
         if (!resp) return;
         if (resp.ok) {
-            const t = await resp.json();
-            if (t.crm_synced === false) showToast('Удалено без синхронизации с CRM', 'warning');
             window.location.href = '/task-board';
         } else {
             const err = await resp.json();
@@ -465,8 +462,11 @@ function connectWebSocket() {
                 if (data.type === 'task_updated' && data.task_id === taskId) {
                     // Задачу отредактировал другой пользователь (PATCH /tasks/{id}), пока эта
                     // страница была открыта — без перечитывания здесь остались бы старые
-                    // название/описание/статус. exclude_user_id на сервере уже не пускает
-                    // актора получить собственное событие — свою правку он увидел из ответа PATCH.
+                    // название/описание/статус. actor_id (не exclude_user_id — событие теперь
+                    // персистируется в Redis List и должно доходить до актора тоже, см.
+                    // services/tasks.py::update_task): своё же редактирование мы уже увидели
+                    // из ответа PATCH, повторный loadTask()+toast по этому же событию не нужен.
+                    if (String(data.actor_id) === userId) return;
                     loadTask();
                     showToast(`${data.sender}: задача обновлена`, 'info');
                 } else if (data.type === 'task_files_updated' && data.task_id === taskId) {
@@ -481,8 +481,10 @@ function connectWebSocket() {
                 } else if (data.type === 'task_deleted' && data.task_id === taskId) {
                     // Задачу удалил другой пользователь, пока эта страница была открыта —
                     // дальнейшие действия (PATCH/DELETE) получили бы 404 Task not found.
-                    // exclude_user_id на сервере не даёт актору получить собственное событие —
-                    // его страница уже уходит на /task-board через deleteTask() выше.
+                    // actor_id (не exclude_user_id — см. комментарий у task_updated выше):
+                    // если удалили мы сами, страница уже уходит на /task-board через
+                    // deleteTask() выше — повторный alert/redirect здесь не нужен.
+                    if (String(data.actor_id) === userId) return;
                     alert('Задача была удалена другим пользователем');
                     window.location.href = '/task-board';
                 }

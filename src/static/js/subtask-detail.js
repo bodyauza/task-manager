@@ -312,13 +312,6 @@ function renderSubtask(s) {
 
     const statusEl = document.getElementById('viewStatus');
     statusEl.innerHTML = `<span class="status-badge ${s.completed ? 'status-completed' : 'status-pending'}">${s.completed ? 'Выполнена' : 'В работе'}</span>`;
-
-    const crmEl = document.getElementById('viewCrm');
-    if (s.crm_subtask_id != null) {
-        crmEl.innerHTML = `<span class="crm-badge-ok">Синхронизирована (ID ${s.crm_subtask_id})</span>`;
-    } else {
-        crmEl.innerHTML = '<span class="crm-badge">Отсутствует в CRM</span>';
-    }
 }
 
 async function loadSubtask() {
@@ -399,7 +392,6 @@ async function saveSubtask() {
         if (!resp) return;
         if (resp.ok) {
             const s = await resp.json();
-            if (s.crm_synced === false) showToast('Сохранено без синхронизации с CRM', 'warning');
             renderSubtask(s);
             closeEditForm();
         // Namespace-проверка владельца намеренно не выполняется — Shared board.
@@ -424,8 +416,6 @@ async function deleteSubtask() {
         const resp = await fetchWithAuth(`/delete-subtask/${subtaskId}`, { method: 'DELETE' });
         if (!resp) return;
         if (resp.ok) {
-            const s = await resp.json();
-            if (s.crm_synced === false) showToast('Удалено без синхронизации с CRM', 'warning');
             window.location.href = `/subtask-board/${taskId}`;
         // Namespace-проверка владельца намеренно не выполняется — Shared board.
         // См. src/services/subtasks.py::delete_subtask и docs/task-manager-documentation.md.
@@ -476,7 +466,9 @@ function connectWebSocket() {
                 } else if (data.type === 'task_deleted' && data.task_id === taskId) {
                     // Удалена родительская задача — эта подзадача каскадно удалена вместе с ней
                     // (ON DELETE CASCADE), хотя сама subtask_deleted для неё не рассылается.
-                    // exclude_user_id на сервере не даёт актору получить собственное событие.
+                    // Текст ниже нейтрален по "кем" намеренно: task_deleted actor'а больше не
+                    // исключает (см. services/tasks.py), и удалить родителя из другой своей же
+                    // вкладки — легитимный случай, не только "другой пользователь".
                     // Редирект на /task-board, а не /subtask-board/{taskId}: страница подзадач
                     // этой (уже несуществующей) задачи сама ответила бы 404 Task not found.
                     alert('Задача, к которой относится эта подзадача, была удалена');

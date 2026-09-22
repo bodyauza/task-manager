@@ -14,11 +14,35 @@ import json
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 
+from src.database import async_session_maker
 from src.realtime.connection_manager import connection_manager
-from tests.conftest import register_user
+from src.task_logic.models import CrmOutbox, Task
+from tests.conftest import register_and_login
 
 EMAIL = "file_task@example.com"
+
+
+async def _set_task_crm_id(task_id: int, crm_task_id: int) -> None:
+    """Симулирует то, что Celery уже выполнил 'create' для этой задачи —
+    напрямую в БД, так как реального Celery-воркера в тестах нет (см.
+    tests/conftest.py::mock_outbox_dispatch)."""
+    async with async_session_maker() as session:
+        task = await session.get(Task, task_id)
+        task.crm_task_id = crm_task_id
+        await session.commit()
+
+
+async def _outbox_rows_for_task(task_id: int) -> list[CrmOutbox]:
+    async with async_session_maker() as session:
+        return (
+            await session.execute(
+                select(CrmOutbox)
+                .where(CrmOutbox.aggregate_type == "task", CrmOutbox.aggregate_id == task_id)
+                .order_by(CrmOutbox.id)
+            )
+        ).scalars().all()
 
 # ID заведомо выше любого реального пользователя в тестовой БД (truncate между тестами) —
 # используется как "наблюдатель", не совпадающий с exclude_user_id актёра запроса.
@@ -63,9 +87,7 @@ def _garbage() -> bytes:
 
 async def _auth(client: AsyncClient, mock_smtp: dict) -> None:
     """Регистрирует и авторизует тестового пользователя."""
-    await register_user(client, mock_smtp, EMAIL)
-    # Логин принимает form-data с полем "username" (OAuth2PasswordRequestForm), а не JSON.
-    await client.post("/auth/login", data={"username": EMAIL, "password": "Password1!"})
+    await register_and_login(client, mock_smtp, EMAIL)
 
 
 async def _make_task(client: AsyncClient) -> dict:
@@ -102,6 +124,8 @@ async def test_upload_spec_success(client, mock_smtp, mock_magic, upload_root):
     path = r.json()["specification_path"]
     assert path.endswith(".pdf")
     assert "specification" in path
+    # Файл реально записан на диск с теми же байтами (а не только путь в ответе).
+    assert (upload_root / path).read_bytes() == _pdf()
 
 
 @pytest.mark.asyncio
@@ -110,15 +134,20 @@ async def test_upload_spec_replaces_existing(client, mock_smtp, mock_magic, uplo
     await _auth(client, mock_smtp)
     task = await _make_task(client)
     tid = task["id"]
-    await client.post(
+    first = await client.post(
         f"/tasks/{tid}/specification", files=_spec_upload(_pdf(), "v1.pdf")
     )
+    old_path = first.json()["specification_path"]
     r = await client.post(
         f"/tasks/{tid}/specification", files=_spec_upload(_pdf(), "v2.pdf")
     )
     assert r.status_code == 200
     # Имя нового файла содержит "v2" (UUID-префикс не мешает — "v2" есть в исходном имени)
-    assert "v2" in r.json()["specification_path"]
+    new_path = r.json()["specification_path"]
+    assert "v2" in new_path
+    # Старый файл удалён с диска (не копится), новый записан.
+    assert not (upload_root / old_path).exists()
+    assert (upload_root / new_path).exists()
 
 
 @pytest.mark.asyncio
@@ -132,6 +161,7 @@ async def test_upload_spec_size_limit(client, mock_smtp, mock_magic, upload_root
         f"/tasks/{task['id']}/specification", files=_spec_upload(_pdf())
     )
     assert r.status_code == 413
+    assert [p for p in upload_root.rglob("*") if p.is_file()] == []    # отклонённый файл на диск не попал
 
 
 @pytest.mark.asyncio
@@ -186,10 +216,14 @@ async def test_delete_spec_success(client, mock_smtp, mock_magic, upload_root):
     await _auth(client, mock_smtp)
     task = await _make_task(client)
     tid = task["id"]
-    await client.post(f"/tasks/{tid}/specification", files=_spec_upload(_pdf()))
+    uploaded = await client.post(f"/tasks/{tid}/specification", files=_spec_upload(_pdf()))
+    path = uploaded.json()["specification_path"]
+    assert (upload_root / path).exists()
     r = await client.delete(f"/tasks/{tid}/specification")
     assert r.status_code == 200
     assert r.json()["specification_path"] is None
+    assert not (upload_root / path).exists()                         # файл удалён с диска
+    assert (await client.get(f"/tasks/{tid}")).json()["specification_path"] is None
 
 
 @pytest.mark.asyncio
@@ -216,6 +250,7 @@ async def test_upload_other_files_success(client, mock_smtp, mock_magic, upload_
     paths = r.json()["other_file_paths"]
     assert len(paths) == 2
     assert all(p.endswith(".pdf") for p in paths)
+    assert all((upload_root / p).read_bytes() == _pdf() for p in paths)   # оба файла реально на диске
 
 
 @pytest.mark.asyncio
@@ -250,7 +285,10 @@ async def test_delete_one_other_file(client, mock_smtp, mock_magic, upload_root)
     filename = paths[0].split("/")[-1]   # "a1b2c3d4_a.pdf"
     r_del = await client.delete(f"/tasks/{tid}/files/{filename}")
     assert r_del.status_code == 200
-    assert len(r_del.json()["other_file_paths"]) == 1
+    # Удалён именно выбранный файл: в списке остался другой, на диске первого нет, второй цел.
+    assert r_del.json()["other_file_paths"] == [paths[1]]
+    assert not (upload_root / paths[0]).exists()
+    assert (upload_root / paths[1]).exists()
 
 
 @pytest.mark.asyncio
@@ -288,63 +326,92 @@ async def test_concurrent_uploads_do_not_lose_files(client, mock_smtp, mock_magi
 
 
 # ── CRM синхронизация ─────────────────────────────────────────────────────────
+#
+# CRM-вызов теперь целиком в Celery-воркере — веб-процесс его не делает (см.
+# src/tasks/crm_outbox_tasks.py::dispatch_outbox_row). Проверяется появление
+# outbox-строки operation='sync_files' с нужным payload, а не факт прямого
+# CRM-вызова. Задача синхронизирована с CRM напрямую через _set_task_crm_id
+# (в тестах нет живого Celery, который выполнил бы 'create' сам).
 
 @pytest.mark.asyncio
-async def test_upload_spec_crm_synced(client, mock_smtp, mock_magic, upload_root, mock_crm):
-    """Загрузка ТЗ → update_task вызван ровно один раз с task_id и specification_abs_path."""
+async def test_upload_spec_enqueues_sync_files_row(client, mock_smtp, mock_magic, upload_root):
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    await _set_task_crm_id(task["id"], 42)
+
+    await client.post(f"/tasks/{task['id']}/specification", files=_spec_upload(_pdf()))
+
+    rows = await _outbox_rows_for_task(task["id"])
+    sync_rows = [r for r in rows if r.operation == "sync_files"]
+    assert len(sync_rows) == 1
+    assert sync_rows[0].payload["crm_task_id"] == 42
+    assert sync_rows[0].payload["specification_path"] is not None
+    assert sync_rows[0].depends_on_event_id is None  # crm_task_id уже известен — не зависит от create
+
+
+@pytest.mark.asyncio
+async def test_upload_spec_skips_outbox_when_task_not_in_crm(client, mock_smtp, mock_magic, upload_root):
+    """Задача ещё не синхронизирована с CRM (crm_task_id is None) — синхронизировать
+    нечего, outbox-строка не создаётся вовсе."""
     await _auth(client, mock_smtp)
     task = await _make_task(client)
     await client.post(f"/tasks/{task['id']}/specification", files=_spec_upload(_pdf()))
-    mock_crm["task_mgr"].update_task.assert_called_once()
-    kwargs = mock_crm["task_mgr"].update_task.call_args.kwargs
-    assert kwargs["task_id"] == task["crm_task_id"]
-    assert "specification_abs_path" in kwargs
+
+    rows = await _outbox_rows_for_task(task["id"])
+    assert not any(r.operation == "sync_files" for r in rows)
 
 
 @pytest.mark.asyncio
-async def test_delete_spec_crm_cleared(client, mock_smtp, mock_magic, upload_root, mock_crm):
-    """Удаление ТЗ → update_task вызван с clear_specification=True."""
+async def test_delete_spec_enqueues_clear_specification_row(client, mock_smtp, mock_magic, upload_root):
     await _auth(client, mock_smtp)
     task = await _make_task(client)
     tid = task["id"]
+    await _set_task_crm_id(tid, 42)
     await client.post(f"/tasks/{tid}/specification", files=_spec_upload(_pdf()))
-    mock_crm["task_mgr"].update_task.reset_mock()
+
     await client.delete(f"/tasks/{tid}/specification")
-    mock_crm["task_mgr"].update_task.assert_called_once()
-    kwargs = mock_crm["task_mgr"].update_task.call_args.kwargs
-    assert kwargs["clear_specification"] is True
+
+    rows = await _outbox_rows_for_task(tid)
+    sync_rows = [r for r in rows if r.operation == "sync_files"]
+    assert len(sync_rows) == 2  # upload, затем delete
+    assert sync_rows[-1].payload["clear_specification"] is True
 
 
 @pytest.mark.asyncio
-async def test_upload_other_files_crm_synced(client, mock_smtp, mock_magic, upload_root, mock_crm):
-    """Загрузка 2 иных документов → update_task вызван с other_file_abs_paths длиной 2."""
+async def test_upload_other_files_enqueues_sync_files_row(client, mock_smtp, mock_magic, upload_root):
     await _auth(client, mock_smtp)
     task = await _make_task(client)
+    await _set_task_crm_id(task["id"], 42)
+
     await client.post(
         f"/tasks/{task['id']}/files",
         files=_other_uploads((_pdf(), "a.pdf"), (_pdf(), "b.pdf")),
     )
-    mock_crm["task_mgr"].update_task.assert_called_once()
-    kwargs = mock_crm["task_mgr"].update_task.call_args.kwargs
-    assert len(kwargs["other_file_abs_paths"]) == 2
+
+    rows = await _outbox_rows_for_task(task["id"])
+    sync_rows = [r for r in rows if r.operation == "sync_files"]
+    assert len(sync_rows) == 1
+    assert len(sync_rows[0].payload["other_file_paths"]) == 2
 
 
 @pytest.mark.asyncio
-async def test_delete_other_file_crm_synced(client, mock_smtp, mock_magic, upload_root, mock_crm):
-    """Удаление одного из двух файлов → update_task вызван с other_file_abs_paths длиной 1."""
+async def test_delete_other_file_enqueues_sync_files_row(client, mock_smtp, mock_magic, upload_root):
     await _auth(client, mock_smtp)
     task = await _make_task(client)
     tid = task["id"]
+    await _set_task_crm_id(tid, 42)
     r_up = await client.post(
         f"/tasks/{tid}/files",
         files=_other_uploads((_pdf(), "a.pdf"), (_pdf(), "b.pdf")),
     )
     filename = r_up.json()["other_file_paths"][0].split("/")[-1]
-    mock_crm["task_mgr"].update_task.reset_mock()
+
     await client.delete(f"/tasks/{tid}/files/{filename}")
-    mock_crm["task_mgr"].update_task.assert_called_once()
-    kwargs = mock_crm["task_mgr"].update_task.call_args.kwargs
-    assert len(kwargs["other_file_abs_paths"]) == 1
+
+    rows = await _outbox_rows_for_task(tid)
+    sync_rows = [r for r in rows if r.operation == "sync_files"]
+    assert len(sync_rows) == 2  # upload, затем delete
+    assert len(sync_rows[-1].payload["other_file_paths"]) == 1
 
 
 # ── WS-рассылка событий (broadcast_task_event) ───────────────────────────────
