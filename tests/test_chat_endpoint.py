@@ -1,5 +1,5 @@
 """HTTP-тесты GET /chat/history (src/realtime/router.py) — постраничная
-подгрузка истории WS-чата (docs/chat_history_redis_list_guide.md).
+подгрузка истории WS-чата.
 
 mock_chat_history_redis (tests/conftest.py, autouse) уже патчит
 src.realtime.chat_history._get_redis для ВСЕГО файла — здесь он запрашивается
@@ -75,7 +75,7 @@ async def test_chat_history_returns_stored_task_event_entries(
 ):
     """Персистированные CRUD-события задач/подзадач (task_created и т.п.,
     src/realtime/events.py) отдаются через тот же эндпоинт, что и чат —
-    единая история панели WS (docs/chat_history_redis_list_guide.md)."""
+    единая история панели WS."""
     await _register_login(client, mock_smtp)
     entry = {
         "id": 2,

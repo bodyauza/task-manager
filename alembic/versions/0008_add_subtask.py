@@ -39,8 +39,8 @@ def upgrade() -> None:
         # task_id — обязательный FK на родительскую задачу. ondelete="CASCADE"
         # выполняет удаление строк subtask СИЛАМИ PostgreSQL при DELETE FROM task,
         # а не кодом приложения — src/services/tasks.py::delete_task полагается
-        # именно на этот каскад (см. docs/task-manager-documentation.md, раздел
-        # про delete_task и снимок subtask_ids до commit).
+        # именно на этот каскад (см. докстринг delete_task про снимок
+        # subtask_ids до commit).
         sa.Column(
             "task_id",
             sa.Integer(),

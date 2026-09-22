@@ -88,8 +88,7 @@ async def lifespan(app: FastAPI):
     # процесса.
     await create_initial_roles()
     # Фоновая подписка на Redis Pub/Sub для WebSocket-рассылки между
-    # несколькими uvicorn-воркерами (docs/task-manager-documentation.md,
-    # «Векторы развития проекта», п. 7) — см. src/realtime/connection_manager.py.
+    # несколькими uvicorn-воркерами — см. src/realtime/connection_manager.py.
     connection_manager.start_listening()
     yield
     await connection_manager.stop_listening()

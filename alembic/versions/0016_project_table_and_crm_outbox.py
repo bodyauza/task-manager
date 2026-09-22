@@ -4,8 +4,7 @@ Revision ID: 0016
 Revises: 0015
 Create Date: 2026-09-10
 
-Две независимые, но реализуемые в одной миграции сущности —
-docs/project_field_crm_implementation_guide.md:
+Две независимые, но реализуемые в одной миграции сущности:
 
 1. `project` — локальное зеркало глобального списка «Проект» CRM
    (list_id=11, поле сущности «Задачи» field_id=327), наполняется Celery-
@@ -14,10 +13,9 @@ docs/project_field_crm_implementation_guide.md:
    значения, бэкофилл не требуется).
 
 2. `crm_outbox` — durable retry для CRM-вызовов, выполняемых после основного
-   db.commit() (docs/task-manager-documentation.md, «Векторы развития
-   проекта», п. 14 — то же обоснование, применённое здесь в масштабе одного
-   call-site вместо полного sharded outbox). Таблица новая, строк нет,
-   бэкофилл не требуется.
+   db.commit() (то же обоснование, что и для durable-outbox остальных
+   CRM-вызовов, применённое здесь в масштабе одного call-site вместо полного
+   sharded outbox). Таблица новая, строк нет, бэкофилл не требуется.
 """
 from typing import Sequence, Union
 

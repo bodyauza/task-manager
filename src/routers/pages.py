@@ -22,8 +22,7 @@ _admin_only = require_role("admin")
 
 async def _project_options(db: AsyncSession = Depends(get_async_session)) -> dict:
     """{crm_id: label} по активным строкам project — прямой запрос к локальной
-    таблице, без похода в CRM (см. docs/project_field_crm_implementation_guide.md,
-    §1.2/§3.11/§3.13) — таблица наполняется отдельно, Celery Beat
+    таблице, без похода в CRM — таблица наполняется отдельно, Celery Beat
     (src/tasks/global_lists_tasks.py::sync_project_table).
     """
     rows = (

@@ -2,8 +2,7 @@
 
 RPUSH добавляет новую запись в конец списка "chat:history", LTRIM
 обрезает список до settings.CHAT_HISTORY_MAX_LEN самых свежих записей —
-история заведомо ограничена, не бесконечный архив (docs/
-chat_history_redis_list_guide.md, §1.4, решение №3).
+история заведомо ограничена, не бесконечный архив.
 
 Персистируются два рода событий: сообщения чата (тип "chat", из
 src.realtime.router::_publish_chat_message; запись несёт внутренний
@@ -35,8 +34,7 @@ _HISTORY_KEY = "chat:history"
 _SEQ_KEY = "chat:history:next_id"
 
 # Константы запроса, не Settings — защита от чрезмерного limit в самом
-# запросе (docs/chat_history_redis_list_guide.md §1.4, решение №8), не
-# параметр деплоя.
+# запросе, не параметр деплоя.
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
 
@@ -58,9 +56,9 @@ async def append_event(payload: dict[str, Any]) -> dict[str, Any]:
     использует её, чтобы подмешать те же id/created_at в payload live-рассылки.
 
     INCR + RPUSH + LTRIM — три отдельные команды, не атомарный Lua-скрипт:
-    осознанный компромисс, см. docs/chat_history_redis_list_guide.md §1.4,
-    решение №4 (крайне редкая гонка порядка двух записей при конкурентной
-    отправке с разных uvicorn-воркеров — приемлемо для этой истории).
+    осознанный компромисс (крайне редкая гонка порядка двух записей при
+    конкурентной отправке с разных uvicorn-воркеров — приемлемо для этой
+    истории).
     """
     message_id = await _get_redis().incr(_SEQ_KEY)
     entry: dict[str, Any] = {
@@ -84,8 +82,7 @@ async def get_history_page(before_id: int | None, limit: int) -> list[dict[str, 
 
     before_id, указывающий на сообщение, которое уже вытеснено LTRIM в
     append_event, — не ошибка: возвращается [] или укороченная страница,
-    клиент трактует это как «дальше истории нет» (docs/
-    chat_history_redis_list_guide.md §1.4, решение №3).
+    клиент трактует это как «дальше истории нет».
     """
     limit = max(1, min(limit, MAX_PAGE_SIZE))
     r = _get_redis()

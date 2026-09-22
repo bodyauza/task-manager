@@ -922,3 +922,47 @@ async def test_successful_retry_restores_failed_sync_status():
     async with async_session_maker() as session:
         assert (await session.get(CrmOutbox, outbox_id)).status == "done"
         assert (await session.get(Task, task_id)).sync_status == "synced"
+
+
+async def test_concurrent_pending_events_do_not_mark_synced_prematurely():
+    """Два параллельных update одной задачи, оба pending: если #1 завершается
+    первым, sync_status НЕ должен стать 'synced', пока #2 ещё не выполнено —
+    иначе индикатор соврал бы, что синхронизация полностью завершена."""
+    from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        task = Task(
+            title="T", description="d", owner_id=user.id, crm_task_id=42,
+            crm_shard="shard_0", sync_status="pending",
+        )
+        session.add(task)
+        await session.commit()
+        payload = {"crm_task_id": 42, "title": "X", "description": None, "completed": None, "project": None}
+        row1 = CrmOutbox(
+            aggregate_type="task", aggregate_id=task.id, operation="update", status="pending",
+            attempts=0, shard="shard_0", payload=payload,
+        )
+        row2 = CrmOutbox(
+            aggregate_type="task", aggregate_id=task.id, operation="update", status="pending",
+            attempts=0, shard="shard_0", payload=payload,
+        )
+        session.add_all([row1, row2])
+        await session.commit()
+        task_id, row1_id, row2_id = task.id, row1.id, row2.id
+
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=AsyncMock()):
+        await _process_outbox_row_async(row1_id)
+
+    async with async_session_maker() as session:
+        assert (await session.get(CrmOutbox, row1_id)).status == "done"
+        # row2 всё ещё pending — sync_status НЕ должен стать synced раньше времени.
+        assert (await session.get(Task, task_id)).sync_status == "pending"
+
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=AsyncMock()):
+        await _process_outbox_row_async(row2_id)
+
+    async with async_session_maker() as session:
+        assert (await session.get(CrmOutbox, row2_id)).status == "done"
+        # Оба события выполнены — теперь можно.
+        assert (await session.get(Task, task_id)).sync_status == "synced"

@@ -40,8 +40,7 @@ _admin_only = require_role("admin")
 )
 async def refresh_crm_options(admin: User = Depends(_admin_only)) -> dict:
     """Ставит задачу немедленной синхронизации таблицы project с CRM в очередь
-    Celery — не выполняет её сама в веб-процессе (см.
-    docs/project_field_crm_implementation_guide.md, §3.13). 202 Accepted, не 204:
+    Celery — не выполняет её сама в веб-процессе. 202 Accepted, не 204:
     работа принята к исполнению, но не гарантированно завершена к моменту
     ответа — Celery-воркер выполнит её асинхронно.
 

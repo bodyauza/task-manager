@@ -200,9 +200,8 @@ def mock_realtime_redis():
 @pytest.fixture(autouse=True)
 def mock_chat_history_redis():
     """src.realtime.chat_history (append_event/get_history_page — история
-    панели WS: чат + CRUD-события задач/подзадач, docs/
-    chat_history_redis_list_guide.md) использует отдельный module-level
-    singleton _get_redis(), как и connection_manager.py (см. mock_realtime_redis
+    панели WS: чат + CRUD-события задач/подзадач) использует отдельный
+    module-level singleton _get_redis(), как и connection_manager.py (см. mock_realtime_redis
     выше) — свой клиент на каждый модуль. Без мока любой HTTP/WS-тест,
     трогающий GET /chat/history, WS-чат или create/update/delete задачи/
     подзадачи (broadcast_task_event теперь тоже вызывает append_event для

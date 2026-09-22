@@ -1,4 +1,4 @@
-"""Тесты поля «Проект» (docs/project_field_crm_implementation_guide.md):
+"""Тесты поля «Проект»:
 резолвинг CRM-ID → project_id через локальную таблицу project (без похода в
 CRM, см. src/services/tasks.py::_resolve_project), и сквозной HTTP-флоу
 create/update/list/search/get с этим полем.

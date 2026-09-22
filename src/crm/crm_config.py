@@ -87,7 +87,7 @@ class CRMSettings:
     SUBTASK_FIELD_SPECIFICATION: int = _required_int_env("CRM_SUBTASK_FIELD_SPECIFICATION")
     SUBTASK_FIELD_OTHER_FILES:   int = _required_int_env("CRM_SUBTASK_FIELD_OTHER_FILES")
 
-    # ── Глобальный список «Проект» (см. docs/project_field_crm_implementation_guide.md) ──
+    # ── Глобальный список «Проект» ──
     # ID самого справочника (не ID опций внутри него) — используется
     # GlobalListsManager.get_choices() (src/crm/global_lists_service.py).
     LIST_PROJECT: int = _required_int_env("CRM_LIST_PROJECT")
@@ -110,7 +110,7 @@ class CRMSettings:
     # для этого справочника в веб-процессе нет, он читает таблицу project напрямую.
     PROJECT_SYNC_INTERVAL_SECONDS: int = int(os.getenv("CRM_PROJECT_SYNC_INTERVAL_SECONDS", "180"))
 
-    # ── Шардирование outbox-очереди (docs/task-manager-documentation.md, п. 14) ──
+    # ── Шардирование outbox-очереди ──
     # Число шардов M шины crm_sync.shard_0..shard_{M-1} — читается
     # src/tasks/sharding.py (shard_for_id: id % N) и src/docker-compose.yml
     # (по одному сервису celery-worker-shard-N на шард, --pool=solo -Q
@@ -126,6 +126,17 @@ class CRMSettings:
     # простоя CRM (reconcile_pending_outbox может разом вернуть в очередь
     # сотни накопившихся pending-строк).
     RATE_LIMIT_PER_SECOND: int = int(os.getenv("CRM_RATE_LIMIT_PER_SECOND", "5"))
+
+    # Сколько дней хранить обработанные ('done') строки crm_outbox, прежде чем
+    # cleanup_done_outbox (src/tasks/crm_outbox_tasks.py, Celery Beat, раз в
+    # сутки) их удалит. Таблица иначе растёт бесконечно — каждое изменение
+    # задачи/подзадачи добавляет строку, и 'done'-строки никогда не удаляются
+    # сами по себе. failed/blocked/pending не затрагиваются никогда — только
+    # успешно обработанные и старше этого срока. Читается на каждый вызов
+    # cleanup-задачи через crm_settings (не кэшируется в отдельную module-level
+    # константу) — тот же приём, что и OUTBOX_SHARD_COUNT в src/tasks/sharding.py,
+    # для тестируемости через monkeypatch без перезапуска процесса.
+    OUTBOX_RETENTION_DAYS: int = int(os.getenv("CRM_OUTBOX_RETENTION_DAYS", "30"))
 
 
 crm_settings = CRMSettings()

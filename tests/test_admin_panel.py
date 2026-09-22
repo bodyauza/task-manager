@@ -154,19 +154,23 @@ async def test_other_admin_routes_not_shadowed_by_sqladmin(client: AsyncClient, 
 
 
 async def test_retry_action_requeues_only_failed_rows(admin_client: AsyncClient):
+    """failed-строка требуется вернуть в очередь; done-строка ДРУГОЙ задачи —
+    просто чужое событие в выборке pks, не имеет отношения к порядку той же
+    сущности (это отдельно проверяют test_retry_*_stale_* ниже)."""
     from unittest.mock import patch
 
     async with async_session_maker() as session:
         task = Task(title="t", description="d", owner_id=1, crm_task_id=42, sync_status="failed")
-        session.add(task)
+        other_task = Task(title="o", description="d", owner_id=1, crm_task_id=43, sync_status="synced")
+        session.add_all([task, other_task])
         await session.flush()
         failed = CrmOutbox(
             aggregate_type="task", aggregate_id=task.id, operation="update", status="failed",
             attempts=5, shard="shard_0", payload={"crm_task_id": 42}, last_error="RuntimeError: x",
         )
         done = CrmOutbox(
-            aggregate_type="task", aggregate_id=task.id, operation="update", status="done",
-            attempts=1, shard="shard_0", payload={"crm_task_id": 42},
+            aggregate_type="task", aggregate_id=other_task.id, operation="update", status="done",
+            attempts=1, shard="shard_0", payload={"crm_task_id": 43},
         )
         session.add_all([failed, done])
         await session.commit()
@@ -187,17 +191,101 @@ async def test_retry_action_requeues_only_failed_rows(admin_client: AsyncClient)
         assert (await session.get(Task, task_id)).sync_status == "pending"
 
 
-async def _make_outbox_rows(statuses: list[str]) -> list[int]:
+async def test_retry_action_skips_failed_row_with_newer_done_sibling(admin_client: AsyncClient):
+    """failed-строка ТОЙ ЖЕ задачи, у которой уже есть более новое (больший id)
+    успешно синхронизированное событие, — устарела: повтор применил бы старые
+    данные поверх свежих. Не переставляется в очередь, статус не меняется."""
+    from unittest.mock import patch
+
+    async with async_session_maker() as session:
+        task = Task(title="t", description="d", owner_id=1, crm_task_id=42, sync_status="synced")
+        session.add(task)
+        await session.flush()
+        failed = CrmOutbox(
+            aggregate_type="task", aggregate_id=task.id, operation="update", status="failed",
+            attempts=5, shard="shard_0", payload={"crm_task_id": 42}, last_error="RuntimeError: x",
+        )
+        session.add(failed)
+        await session.commit()
+        newer_done = CrmOutbox(  # добавлена ПОСЛЕ failed → гарантированно больший id
+            aggregate_type="task", aggregate_id=task.id, operation="update", status="done",
+            attempts=1, shard="shard_0", payload={"crm_task_id": 42},
+        )
+        session.add(newer_done)
+        await session.commit()
+        task_id, failed_id, newer_done_id = task.id, failed.id, newer_done.id
+
+    with patch("src.admin.outbox_admin.dispatch_outbox_row") as dispatch:
+        r = await admin_client.get(f"/admin/crm-outbox/action/retry?pks={failed_id}", follow_redirects=False)
+    assert r.status_code == 302
+    assert dispatch.call_args_list == []  # ничего не диспетчеризовано
+
+    async with async_session_maker() as session:
+        f = await session.get(CrmOutbox, failed_id)
+        assert (f.status, f.attempts) == ("failed", 5)  # не тронуто
+        d = await session.get(CrmOutbox, newer_done_id)
+        assert d.status == "done"
+        assert (await session.get(Task, task_id)).sync_status == "synced"  # не тронуто
+
+    page = await admin_client.get(r.headers["location"])
+    assert "более новое успешно синхронизированное событие" in page.text
+    assert "alert-warning" in page.text
+
+
+async def test_retry_action_requeues_failed_row_when_done_sibling_is_older(admin_client: AsyncClient):
+    """done-строка ТОЙ ЖЕ задачи, но СТАРШЕ (меньший id, произошла раньше) —
+    не мешает повтору: failed-строка новее и представляет более позднее
+    событие, её и нужно вернуть в очередь."""
+    from unittest.mock import patch
+
     async with async_session_maker() as session:
         task = Task(title="t", description="d", owner_id=1, crm_task_id=42, sync_status="failed")
         session.add(task)
         await session.flush()
-        rows = [
-            CrmOutbox(aggregate_type="task", aggregate_id=task.id, operation="update", status=st,
-                      attempts=5 if st == "failed" else 1, shard="shard_0", payload={"crm_task_id": 42})
-            for st in statuses
-        ]
-        session.add_all(rows)
+        older_done = CrmOutbox(
+            aggregate_type="task", aggregate_id=task.id, operation="update", status="done",
+            attempts=1, shard="shard_0", payload={"crm_task_id": 42},
+        )
+        session.add(older_done)
+        await session.commit()
+        failed = CrmOutbox(  # добавлена ПОСЛЕ older_done → гарантированно больший id
+            aggregate_type="task", aggregate_id=task.id, operation="update", status="failed",
+            attempts=5, shard="shard_0", payload={"crm_task_id": 42}, last_error="RuntimeError: x",
+        )
+        session.add(failed)
+        await session.commit()
+        failed_id = failed.id
+
+    with patch("src.admin.outbox_admin.dispatch_outbox_row") as dispatch:
+        r = await admin_client.get(f"/admin/crm-outbox/action/retry?pks={failed_id}", follow_redirects=False)
+    assert r.status_code == 302
+    assert [c.args[0].id for c in dispatch.call_args_list] == [failed_id]
+
+    async with async_session_maker() as session:
+        f = await session.get(CrmOutbox, failed_id)
+        assert (f.status, f.attempts) == ("pending", 0)
+
+
+async def _make_outbox_rows(statuses: list[str], *, same_task: bool = True) -> list[int]:
+    async with async_session_maker() as session:
+        rows: list[CrmOutbox] = []
+        shared_task_id: int | None = None
+        for i, st in enumerate(statuses):
+            if same_task and shared_task_id is not None:
+                task_id = shared_task_id
+            else:
+                # title уникален на (title, owner_id) — uq_task_title_owner:
+                # каждая НЕ-shared задача должна иметь своё название.
+                task = Task(title=f"t{i}", description="d", owner_id=1, crm_task_id=42, sync_status="failed")
+                session.add(task)
+                await session.flush()
+                task_id = task.id
+                if same_task:
+                    shared_task_id = task_id
+            row = CrmOutbox(aggregate_type="task", aggregate_id=task_id, operation="update", status=st,
+                             attempts=5 if st == "failed" else 1, shard="shard_0", payload={"crm_task_id": 42})
+            session.add(row)
+            rows.append(row)
         await session.commit()
         return [r.id for r in rows]
 
@@ -221,10 +309,23 @@ async def test_retry_flash_success_when_all_failed(admin_client: AsyncClient):
 
 
 async def test_retry_flash_reports_skipped_rows(admin_client: AsyncClient):
-    failed_id, done_id = await _make_outbox_rows(["failed", "done"])
+    # same_task=False: done-строка ДРУГОЙ задачи — проверяем именно категорию
+    # «статус не failed», без пересечения с защитой порядка (см. отдельные
+    # test_retry_action_*_stale_* / *_newer_done_sibling* для неё).
+    failed_id, done_id = await _make_outbox_rows(["failed", "done"], same_task=False)
     html = await _retry_and_read_flash(admin_client, f"{failed_id},{done_id}")
     assert "Возвращено в очередь: 1." in html
     assert "Пропущено (статус не failed или не найдено): 1" in html
+    assert "alert-warning" in html
+
+
+async def test_retry_flash_reports_stale_rows(admin_client: AsyncClient):
+    # same_task=True (по умолчанию): done создаётся ПОСЛЕ failed → больший id →
+    # failed считается устаревшей относительно уже синхронизированного done.
+    failed_id, _done_id = await _make_outbox_rows(["failed", "done"])
+    html = await _retry_and_read_flash(admin_client, str(failed_id))
+    assert "Ничего не возвращено в очередь" in html
+    assert "более новое успешно синхронизированное событие" in html
     assert "alert-warning" in html
 
 

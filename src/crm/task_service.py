@@ -28,7 +28,7 @@ class TaskManager(CRMClient):
     FIELD_DONE  = crm_settings.TASK_FIELD_COMPLETED     # ID поля «Статус» (чекбокс: "true" / "false")
     FIELD_SPEC    = crm_settings.TASK_FIELD_SPECIFICATION  # ID поля «Техническое задание» (одиночный файл)
     FIELD_OTHER   = crm_settings.TASK_FIELD_OTHER_FILES    # ID поля «Иные документы» (множественные файлы)
-    FIELD_PROJECT = crm_settings.TASK_FIELD_PROJECT        # ID поля «Проект» (выпадающий список, см. docs/project_field_crm_implementation_guide.md)
+    FIELD_PROJECT = crm_settings.TASK_FIELD_PROJECT        # ID поля «Проект» (выпадающий список, ссылка на глобальный справочник CRM)
 
     async def create_task(
         self,
@@ -75,8 +75,9 @@ class TaskManager(CRMClient):
         (entity_id=29) нет поля-владельца — совпадение title+description между
         разными пользователями (shared board допускает разные owner_id с
         похожими названиями) сузит, но не исключит коллизию полностью.
-        Принятый риск — см. docs/task-manager-documentation.md, п. 14,
-        «Идемпотентность: чего не хватает в текущем коде CRM-клиентов».
+        Принятый риск, не техническое упущение — более надёжное решение
+        (служебное поле «Local ID» в самой CRM) не реализовано из-за
+        отсутствия административного доступа к demo-CRM для его создания.
 
         :return: Словарь первой найденной записи или None.
         """
@@ -153,7 +154,7 @@ class TaskManager(CRMClient):
             # expect_id: если задачу удалили в CRM напрямую (не через это приложение),
             # CRM отвечает "success" с пустым data.id вместо ошибки — expect_id превращает
             # это в Exception, чтобы вызывающий код (services/tasks.py::update_task) выставил
-            # crm_synced=False, а не ошибочный True. См. docs/crm_issue.md.
+            # crm_synced=False, а не ошибочный True.
             expect_id=True,
         )
 

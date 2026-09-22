@@ -60,8 +60,7 @@ class CRMRecordNotFoundError(Exception):
     """update/delete с expect_id=True над записью, которой в CRM уже нет
     (удалена вручную через веб-интерфейс CRM, либо предыдущая попытка retry
     этой же outbox-строки уже успешно её удалила) — CRM отвечает "success" с
-    пустым data.id, а не явной ошибкой (см. проверку expect_id в _call() ниже
-    и docs/crm_issue.md).
+    пустым data.id, а не явной ошибкой (см. проверку expect_id в _call() ниже).
 
     Отдельный класс (не голый Exception, как раньше) специально для того,
     чтобы src/tasks/crm_outbox_tasks.py::_do_delete мог отличить «запись уже
@@ -395,7 +394,7 @@ class CRMClient:
         # этой проверки такой ответ считался бы успешной синхронизацией
         # (crm_synced=True в TaskResponse/SubtaskResponse), хотя CRM на самом деле
         # не нашла и не изменила запись — проверено эмпирически на demo-инстансе
-        # CRM (см. docs/crm_issue.md). Проверяется только когда вызывающий код явно
+        # CRM. Проверяется только когда вызывающий код явно
         # об этом просит (update/delete над существующей записью) — на insert
         # "data.id" пустым не бывает, поэтому там expect_id не используется.
         if expect_id:
