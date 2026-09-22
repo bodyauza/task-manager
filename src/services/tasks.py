@@ -43,8 +43,7 @@ async def _resolve_project(
     внутри HTTP-запроса. Актуальность таблицы — на совести Celery Beat
     (src/tasks/global_lists_tasks.py::sync_project_table, раз в
     crm_settings.PROJECT_SYNC_INTERVAL_SECONDS) или ручного admin-триггера
-    (POST /admin/crm-options/refresh), не этого запроса — см.
-    docs/project_field_crm_implementation_guide.md, §1.4/§3.11.1.
+    (POST /admin/crm-options/refresh), не этого запроса.
     """
     if not project_crm_id:  # покрывает и None, и ""
         return None
@@ -155,10 +154,9 @@ async def create_task(
         await db.rollback()
         raise HTTPException(status_code=409, detail=f"Task with title '{task.title}' already exists")
 
-    # Sticky-присвоение шарда — РОВНО ОДИН РАЗ, на первом outbox-событии задачи
-    # (docs/task-manager-documentation.md, п. 14, «Маршрутизация события в
-    # шард») — все последующие события этой задачи и её подзадач читают уже
-    # сохранённое значение, кольцо больше не консультируется.
+    # Sticky-присвоение шарда — РОВНО ОДИН РАЗ, на первом outbox-событии задачи —
+    # все последующие события этой задачи и её подзадач читают уже сохранённое
+    # значение, формула больше не пересчитывается.
     shard = ensure_task_shard(db_task)
 
     # Сущность гарантированно существует (в рамках открытой транзакции) — сохранение
@@ -198,9 +196,10 @@ async def create_task(
     if spec_path is not None or other_paths:
         outbox_files = CrmOutbox(
             aggregate_type="task", aggregate_id=db_task.id, operation="sync_files", shard=shard,
-            # Зависит от 'create' ТОГО ЖЕ агрегата (внутриагрегатная зависимость,
-            # docs/task-manager-documentation.md, «Два вида depends_on_event_id») —
-            # crm_task_id пока не известен (create ещё не выполнялся), поэтому в
+            # Зависит от 'create' ТОГО ЖЕ агрегата (внутриагрегатная зависимость —
+            # один из двух видов depends_on_event_id, см. докстринг CrmOutbox в
+            # src/task_logic/models.py) — crm_task_id пока не известен (create
+            # ещё не выполнялся), поэтому в
             # payload "crm_task_id": None; исполнитель (src/tasks/crm_outbox_tasks.py::
             # _do_sync_files_task) прочитает актуальное значение из уже обновлённой
             # записи Task, когда до него дойдёт очередь (после того как зависимость done).

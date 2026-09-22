@@ -27,9 +27,9 @@ dispatch_outbox_row(row) (см. ниже), чтобы Celery-воркер под
   reconcile_pending_outbox подхватит разблокированную строку как обычную
   pending (её created_at уже старше грейс-периода к этому моменту).
 
-Два вида зависимости depends_on_event_id (docs/task-manager-documentation.md,
-п. 14): межагрегатная (create подзадачи зависит от create родительской
-задачи) и внутриагрегатная (sync_files зависит от create того же агрегата —
+Два вида зависимости depends_on_event_id: межагрегатная (create подзадачи
+зависит от create родительской задачи) и внутриагрегатная (sync_files
+зависит от create того же агрегата —
 на момент вставки sync_files, если create ещё не выполнялся синхронно,
 CRM-ID агрегата не известен, payload несёт crm_task_id=None; обработчик в
 этом случае читает уже актуальное значение из БД, а не из своего payload —
@@ -73,11 +73,13 @@ import datetime
 import logging
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from src.celery_app import celery_app, run_celery_task
 from src.crm.client import CRMRecordNotFoundError
+from src.crm.crm_config import crm_settings
 from src.crm.subtask_service import SubtaskManager
 from src.crm.task_service import TaskManager
 from src.database import async_session_maker
@@ -141,6 +143,33 @@ async def set_aggregate_sync_status(
     if only_from is not None and entity.sync_status not in only_from:
         return
     entity.sync_status = status
+
+
+async def _other_unfinished_events_exist(db: AsyncSession, row: CrmOutbox) -> bool:
+    """True, если у той же сущности (aggregate_type, aggregate_id) есть ДРУГАЯ
+    строка crm_outbox (id != row.id) со статусом 'pending' или 'blocked'.
+
+    Защита от преждевременного 'synced': два параллельных события одной
+    сущности (например, update #10 и update #11, оба pending) — если #10
+    завершится первым, set_aggregate_sync_status(..., only_from=("failed",
+    "pending")) сам по себе безусловно поставил бы 'synced', хотя #11 ещё не
+    выполнено. Эта проверка вызывается ПЕРЕД таким вызовом и не даёт пометить
+    сущность синхронизированной, пока остаются незавершённые события. 'done'
+    здесь не считается 'unfinished' — своё же событие row тоже не в счёт
+    (исключено через id != row.id)."""
+    other = (
+        await db.execute(
+            select(CrmOutbox.id)
+            .where(
+                CrmOutbox.aggregate_type == row.aggregate_type,
+                CrmOutbox.aggregate_id == row.aggregate_id,
+                CrmOutbox.id != row.id,
+                CrmOutbox.status.in_(("pending", "blocked")),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return other is not None
 
 
 async def _lock_entity(db: AsyncSession, model, entity_id: int):
@@ -536,8 +565,12 @@ async def _process_outbox_row_async(outbox_id: int) -> None:
         if row.status == "done" and row.operation in ("update", "sync_files"):
             # create сам ставит 'synced' в обработчике; update/sync_files
             # восстанавливают статус после ранее исчерпанных попыток
-            # ('failed') или повтора из админки ('pending').
-            await set_aggregate_sync_status(db, row, "synced", only_from=("failed", "pending"))
+            # ('failed') или повтора из админки ('pending'). Но только если у
+            # сущности не осталось ДРУГИХ незавершённых событий — иначе более
+            # раннее из двух параллельных update/sync_files преждевременно
+            # пометило бы сущность 'synced', пока более позднее ещё pending.
+            if not await _other_unfinished_events_exist(db, row):
+                await set_aggregate_sync_status(db, row, "synced", only_from=("failed", "pending"))
         await db.commit()
 
 
@@ -617,3 +650,72 @@ async def _reconcile_blocked_outbox_async() -> list[int]:
 @celery_app.task(name="src.tasks.crm_outbox_tasks.reconcile_blocked_outbox")
 def reconcile_blocked_outbox() -> None:
     run_celery_task(_reconcile_blocked_outbox_async())
+
+
+_CLEANUP_BATCH = 1000  # строк за одну транзакцию — не держит долгую блокировку
+                       # таблицы, пока веб-процесс параллельно вставляет новые строки
+
+
+async def _cleanup_done_outbox_async(retention_days: Optional[int] = None) -> int:
+    """Удаляет старые 'done'-строки crm_outbox — иначе таблица растёт
+    бесконечно: каждое изменение задачи/подзадачи добавляет строку, а
+    'done'-строки сами по себе никогда не удаляются. failed/blocked/pending
+    не трогаются НИКОГДА — это активные записи или требующие внимания.
+
+    retention_days=None читает актуальное crm_settings.OUTBOX_RETENTION_DAYS —
+    не кэшируется в module-level константу, тот же приём, что и
+    src/tasks/sharding.py::shard_names(count) — тесты передают своё значение
+    без monkeypatch/reload.
+
+    Исключение по зависимости: depends_on_event_id — self-FK
+    (fk_crm_outbox_depends_on_event_id, alembic 0017, ON DELETE не указан →
+    Postgres RESTRICT). Строка, на которую ещё ссылается depends_on_event_id
+    какой-то другой (ещё не удалённой) строки, из выборки исключается явно —
+    без этого DELETE упал бы с IntegrityError на уровне БД (сама по себе
+    защита FK не даёт испортить целостность, но заранее исключать такие строки
+    дешевле, чем ловить ошибку транзакции). Цепочка «create → update»
+    съедается с конца: пока потомок (например, update, ссылающийся на своё же
+    create) не удалён, родитель остаётся занят чужой ссылкой и не попадёт в
+    выборку; на следующем прогоне, когда потомка уже нет, родитель удалится
+    тоже.
+
+    Батчами по _CLEANUP_BATCH, каждая пачка — отдельная транзакция (свой
+    async with async_session_maker()); последняя пачка меньше _CLEANUP_BATCH —
+    сигнал остановиться. Возвращает суммарное число удалённых строк.
+    """
+    days = retention_days if retention_days is not None else crm_settings.OUTBOX_RETENTION_DAYS
+    threshold = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+    dependent = aliased(CrmOutbox)
+    total_deleted = 0
+    while True:
+        async with async_session_maker() as db:
+            ids = (
+                await db.execute(
+                    select(CrmOutbox.id)
+                    .where(
+                        CrmOutbox.status == "done",
+                        CrmOutbox.updated_at < threshold,
+                        ~(
+                            select(dependent.id)
+                            .where(dependent.depends_on_event_id == CrmOutbox.id)
+                            .exists()
+                        ),
+                    )
+                    .limit(_CLEANUP_BATCH)
+                )
+            ).scalars().all()
+            if not ids:
+                break
+            await db.execute(delete(CrmOutbox).where(CrmOutbox.id.in_(ids)))
+            await db.commit()
+        total_deleted += len(ids)
+        if len(ids) < _CLEANUP_BATCH:
+            break
+    if total_deleted:
+        logger.info("cleanup_done_outbox: удалено %d строк старше %d дн.", total_deleted, days)
+    return total_deleted
+
+
+@celery_app.task(name="src.tasks.crm_outbox_tasks.cleanup_done_outbox")
+def cleanup_done_outbox() -> int:
+    return run_celery_task(_cleanup_done_outbox_async())

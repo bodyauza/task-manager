@@ -132,7 +132,7 @@ class SubtaskManager(CRMClient):
             # expect_id: если подзадачу удалили в CRM напрямую, CRM отвечает "success"
             # с пустым data.id вместо ошибки — expect_id превращает это в Exception, чтобы
             # вызывающий код (services/subtasks.py::update_subtask) выставил crm_synced=False.
-            # См. task_service.py::update_task и docs/crm_issue.md.
+            # См. task_service.py::update_task (тот же паттерн для задач).
             expect_id=True,
         )
 

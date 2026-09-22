@@ -1,18 +1,15 @@
 """Celery-приложение проекта — единственный инстанс на весь деплой.
 
-Три независимые причины, по которым в проект введена связка Celery + Redis
-(подробное обоснование — docs/project_field_crm_implementation_guide.md, §1.4):
+Три независимые причины, по которым в проект введена связка Celery + Redis:
 
-1. Outbox-очередь для синхронизации задач/подзадач с CRM «Руководитель»
-   (docs/task-manager-documentation.md, «Векторы развития проекта», п. 14) —
+1. Outbox-очередь для синхронизации задач/подзадач с CRM «Руководитель» —
    durable retry для CRM-вызовов, теряющихся при падении процесса между
    db.commit() и вызовом CRM (src/tasks/crm_outbox_tasks.py).
 2. Периодическая синхронизация локальной таблицы project со списком «Проект»
    CRM (src/tasks/global_lists_tasks.py) — один запуск на весь деплой,
    независимо от числа UVICORN_WORKERS.
-3. WebSocket — горизонтальное масштабирование через Redis Pub/Sub
-   (docs/task-manager-documentation.md, «Векторы развития проекта», п. 7;
-   см. также комментарий к UVICORN_WORKERS в src/Dockerfile).
+3. WebSocket — горизонтальное масштабирование через Redis Pub/Sub (см. также
+   комментарий к UVICORN_WORKERS в src/Dockerfile).
 
 Все три пункта используют один и тот же Redis-инстанс (settings.REDIS_URL,
 src/config.py) и один и тот же celery_app — второй Celery()-инстанс не
@@ -26,6 +23,7 @@ Redis происходит только при первой реальной о�
 from typing import Awaitable, TypeVar
 
 from celery import Celery
+from celery.schedules import crontab
 
 from src.config import settings
 from src.crm.client import aclose_http_client
@@ -160,6 +158,14 @@ celery_app.conf.beat_schedule = {
         # нет смысла проверять чаще, чем реалистичный срок жизни зависимости.
         "schedule": 300,
     },
+    "cleanup-done-crm-outbox": {
+        "task": "src.tasks.crm_outbox_tasks.cleanup_done_outbox",
+        # Раз в сутки, в 03:00 UTC — вне пиковых часов; таблица crm_outbox иначе
+        # растёт бесконечно (см. докстринг _cleanup_done_outbox_async). Крон, а
+        # не интервал в секундах (как остальные задачи выше): фиксированное
+        # время суток, а не «раз в N секунд от момента старта Beat».
+        "schedule": crontab(hour=3, minute=0),
+    },
 }
 # НЕ autodiscover_tasks(["src.tasks"]): с дефолтным related_name="tasks" оно
 # ищет подмодуль src.tasks.tasks, которого нет — наши модули называются
@@ -174,8 +180,8 @@ celery_app.conf.beat_schedule = {
 import src.tasks.crm_outbox_tasks  # noqa: F401,E402
 import src.tasks.global_lists_tasks  # noqa: F401,E402
 
-# ВАЖНО про шардированные очереди crm_sync.shard_0..shard_{M-1} (docs/
-# task-manager-documentation.md, п. 14): маршрут НЕ задаётся статическим
+# ВАЖНО про шардированные очереди crm_sync.shard_0..shard_{M-1}: маршрут НЕ
+# задаётся статическим
 # task_routes, потому что шард — не свойство самой задачи process_outbox_row,
 # а свойство конкретного аргумента (task.crm_shard конкретного агрегата),
 # вычисляемое продюсером в рантайме. Продюсер (src/tasks/crm_outbox_tasks.py,

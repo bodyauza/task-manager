@@ -51,6 +51,10 @@
 ![Users entity in CRM](src/screenshots/crm_user.png)
 ![Users entity in CRM](src/screenshots/crm_user_1.png)
 
+### CRM synchronization status visibility — administrator only
+
+![CRM synchronization status visibility — administrator only](src/screenshots/CRM_synchronization_status_visibility.png)
+
 ### SQLAdmin pages
 
 ![SQLAdmin page](src/screenshots/SQLAdmin_page_1.png)
@@ -62,6 +66,8 @@
 ![SQLAdmin page](src/screenshots/SQLAdmin_page_4.png)
 
 ![SQLAdmin page](src/screenshots/SQLAdmin_page_5.png)
+
+![SQLAdmin page](src/screenshots/SQLAdmin_page_6.png)
 
 ### Flower Monitoring Pages
 
@@ -799,9 +805,16 @@ Task Manager интегрирован с CRM-системой [«Руковод�
 Администратор видит CRM-id и историю попыток на странице `/admin/crm-sync` (`GET /admin/crm-sync-status/tasks`/`subtasks`)
 и в sqladmin (раздел «CRM outbox»: статус, попытки, шард, зависимость, причина сбоя `last_error`); упавшее событие
 возвращается в очередь действием «Повторить» после устранения причины. Повторы идут с экспоненциальной паузой
-(60 → 120 → 240 → 480 с, потолок 900 с).
+(60 → 120 → 240 → 480 с, потолок 900 с). «Повторить» пропускает (и явно помечает как устаревшие) `failed`-строки,
+для которых у той же задачи/подзадачи уже есть более новое успешно синхронизированное событие — иначе повтор
+применил бы устаревшие данные поверх уже отправленных в CRM свежих.
 
 Retry шардирован по `id % N` (`task.crm_shard`, sticky-присвоение) — все события одной задачи и её подзадач гарантированно обрабатываются в одной очереди и в порядке создания. Повтор `create` идемпотентен: `TaskManager.find_task`/`SubtaskManager.find_subtask` ищут уже созданную запись по совпадению `title`+`description` перед повторной вставкой, чтобы не задублировать запись в CRM.
+
+Таблица `crm_outbox` не растёт бесконечно: Celery Beat-задача `cleanup_done_outbox` раз в сутки (03:00 UTC)
+удаляет обработанные (`done`) строки старше `CRM_OUTBOX_RETENTION_DAYS` дней (по умолчанию 30); `failed`/`blocked`/`pending`
+не трогаются никогда, а строка, на которую ещё ссылается `depends_on_event_id` другой, ещё не удалённой строки, не удаляется,
+пока эта ссылка не исчезнет.
 
 ### Поле «Проект»
 
@@ -860,6 +873,7 @@ CRM_PROJECT_SYNC_INTERVAL_SECONDS=180  # интервал Celery Beat для syn
 # Шардирование и rate-limit CRM-outbox-очереди (см. «Celery + Redis» ниже)
 CRM_OUTBOX_SHARD_COUNT=4       # число шардов crm_sync.shard_0..shard_{N-1}
 CRM_RATE_LIMIT_PER_SECOND=5    # лимит запросов к CRM в секунду (token-bucket)
+CRM_OUTBOX_RETENTION_DAYS=30   # сколько дней хранить обработанные ('done') строки crm_outbox
 ```
 
 ### Структура модуля
@@ -1397,7 +1411,9 @@ celery -A src.celery_app call src.tasks.global_lists_tasks.sync_project_table
 
 ## Docker Deployment
 
-Приложение запускается в девяти контейнерах Docker Compose (проект `task-manager`): `web` (FastAPI + uvicorn, 2 воркера — WebSocket-события рассылаются между ними через Redis Pub/Sub), `redis` (брокер Celery, Pub/Sub, история чата), `celery-worker` (дефолтная очередь — синхронизация справочника «Проект», разбор зависших/заблокированных outbox-строк), `celery-beat` (планировщик периодических задач), `celery-worker-shard-0`..`celery-worker-shard-3` (по одному на шард CRM-outbox-очереди — гарантия строгого порядка обработки событий одной задачи внутри шарда) и `flower` (мониторинг Celery). **PostgreSQL в Docker не запускается** — это нативная служба на хосте, контейнеры обращаются к ней по `host.docker.internal`.
+Приложение запускается в девяти контейнерах Docker Compose (проект `task-manager`): `web` (FastAPI + uvicorn, 2 воркера — WebSocket-события рассылаются между ними через Redis Pub/Sub), `redis` (брокер Celery, Pub/Sub, история чата), `celery-worker` (дефолтная очередь — синхронизация справочника «Проект», разбор зависших/заблокированных outbox-строк), `celery-beat` (планировщик периодических задач), `celery-worker-shard-0`..`celery-worker-shard-3` (по одному на шард CRM-outbox-очереди — гарантия строгого порядка обработки событий одной задачи внутри шарда) и `flower` (мониторинг Celery). **PostgreSQL в Docker не запускается** — это нативная служба на хосте, контейнеры обращаются к ней по `host.docker.internal`. Порт `redis` опубликован только на loopback хоста (`127.0.0.1:6379`, тот же принцип, что и у `flower`); у сервиса есть `healthcheck` (`redis-cli ping`), и все зависящие от него сервисы стартуют только после того, как он его пройдёт (`depends_on: condition: service_healthy`).
+
+![9 Docker Compose containers](src\screenshots\9_Docker_Compose_containers.png)
 
 ### Структура файлов
 
@@ -1651,7 +1667,7 @@ docker compose --env-file src/.dev.env -f src/docker-compose.yml exec web alembi
 | sqladmin (только роль `admin`) | http://localhost:8000/admin |
 | Flower (только с этого хоста) | http://localhost:5555 |
 | PostgreSQL (нативная служба хоста) | localhost:5432 |
-| Redis | localhost:6379 |
+| Redis (только с этого хоста) | localhost:6379 |
 
 `celery-worker`/`celery-beat`/`celery-worker-shard-0..3` — фоновые процессы без открытого сетевого порта; их состояние проверяется через логи (`docker compose ... logs -f celery-worker`), не через прямое подключение.
 
@@ -1778,14 +1794,14 @@ docker exec task-manager-web-1 python -m pytest tests/ -v
 | `test_realtime.py` | `ConnectionManager`: несколько соединений на пользователя, регистрация/снятие, `broadcast` (в т.ч. `exclude_user_id`, мёртвые соединения, публикация в Redis Pub/Sub, сообщения других воркеров), персистентность событий действий, `is_own` для каждого получателя без утечки `sender_user_id` |
 | `test_project_field.py` | Поле «Проект»: `_resolve_project` (None / "" / неизвестный CRM-ID → 422 / найден / неактивная опция → 422), `create_task`/`update_task` с полем `project`, `list_tasks`/`search_tasks`/`get_task` возвращают `project`/`project_option_id`, сквозной HTTP-флоу create/patch |
 | `test_global_lists_tasks.py` | Celery-задача `sync_project_table`: upsert новых опций, обновление изменившегося `label`, деактивация опций, пропавших из ответа CRM |
-| `test_crm_outbox.py` | Durable-retry outbox (`Task`+`Subtask`, все операции `create`/`sync_files`/`update`/`delete`): продюсер — шардирование `id % N` и `depends_on_event_id` между `create` подзадачи и `create` родителя (остальное покрытие продюсера — `test_task_service.py`/`test_subtask_service.py`), `dispatch_outbox_row` не должна пробрасывать исключение `apply_async` наверх (брокер Celery/Redis временно недоступен), консьюмер (`_do_create_*` с идемпотентным `find_task`/`find_subtask`, `_do_delete_*` — идемпотентность при уже отсутствующей записи, `MAX_ATTEMPTS`), `depends_on_event_id` (ожидание/`blocked`/разблокировка), `reconcile_pending_outbox`/`reconcile_blocked_outbox`. Redis (Redlock, token-bucket) не поднимается — патчится в самом файле |
+| `test_crm_outbox.py` | Durable-retry outbox (`Task`+`Subtask`, все операции `create`/`sync_files`/`update`/`delete`): продюсер — шардирование `id % N` и `depends_on_event_id` между `create` подзадачи и `create` родителя (остальное покрытие продюсера — `test_task_service.py`/`test_subtask_service.py`), `dispatch_outbox_row` не должна пробрасывать исключение `apply_async` наверх (брокер Celery/Redis временно недоступен), консьюмер (`_do_create_*` с идемпотентным `find_task`/`find_subtask`, `_do_delete_*` — идемпотентность при уже отсутствующей записи, `MAX_ATTEMPTS`), `depends_on_event_id` (ожидание/`blocked`/разблокировка), `reconcile_pending_outbox`/`reconcile_blocked_outbox`, два параллельных `pending`-события одной сущности не помечают её `synced` раньше, чем оба выполнены. Redis (Redlock, token-bucket) не поднимается — патчится в самом файле |
 | `test_sharding.py` | `id % N`: точная равномерность на последовательных id, sticky-присвоение, границы |
 | `test_uploads.py` | `GET /uploads/{path}`: 401 без входа, отдача файла, 404, каталог, path-traversal (закодированные `..%2f`, абсолютный путь, symlink) |
 | `test_websocket.py` | Сам эндпоинт `/ws/tasks/{client_id}` через `TestClient.websocket_connect`: закрытие 1008 без куки / с неверным токеном / для неактивного пользователя, регистрация и снятие соединения, личность из куки (не из `client_id`), рассылка чата с `is_own` всем вкладкам автора, запись в историю |
 | `test_shard_lock.py` | Redlock `shard_lock` на самодельном FakeRedis: имя, TTL и `blocking_timeout` лока, освобождение и закрытие клиента при сбое в блоке, `TimeoutError` при занятом шарде (тело не выполняется, чужой лок не трогается), новый клиент на каждый вызов; обработчик outbox идёт под локом шарда строки. Семантика настоящего redis-py Lock (SET NX PX) не проверяется — нужен живой Redis |
 | `test_celery_runner.py` | Жизненный цикл запуска Celery-задач (синхронные тесты): `run_celery_task`/`run_isolated` — два запуска подряд, закрытие CRM-клиента и `engine.dispose()` в том числе при исключении; синхронные обёртки задач; реестр задач и соответствие расписания Beat зарегистрированным задачам; `acks_late` и события для Flower |
 | `test_lifespan.py` | `create_initial_roles` (пустая таблица, идемпотентность, недостающая роль, чужие имена не перезаписываются, ошибка БД не роняет запуск), порядок шагов `lifespan` и его подключение к приложению (`TestClient` как контекст), подписка `ConnectionManager` на Redis Pub/Sub: `start_listening`/`stop_listening`/отписка |
-| `test_admin_panel.py` | sqladmin: вход только `admin`, списки всех разделов, скрытые поля (`hashed_password`, `code_hash`), read-only разделы, действие «Повторить» для `crm_outbox` (только `failed`-строки; flash-сообщение о результате: сколько возвращено в очередь / пропущено / ничего не выбрано, показывается один раз), ссылки на файлы |
+| `test_admin_panel.py` | sqladmin: вход только `admin`, списки всех разделов, скрытые поля (`hashed_password`, `code_hash`), read-only разделы, действие «Повторить» для `crm_outbox` (только `failed`-строки; пропускает и явно помечает устаревшими строки, для которых у той же сущности уже есть более новое `done`-событие; flash-сообщение о результате: сколько возвращено в очередь / пропущено / устарело / ничего не выбрано, показывается один раз), ссылки на файлы |
 | `test_admin_sync.py` | Страница и JSON-эндпоинты статуса CRM-синхронизации: доступ только `admin`, данные всех владельцев, последняя outbox-строка |
 | `test_chat_endpoint.py` | `GET /chat/history`: аутентификация, пагинация (`before_id`, `limit`), `is_own` (в т.ч. для записей без `sender_user_id`), события действий без изменений |
 | `test_chat_history.py` | Redis-список истории (`append_event`/`get_history_page`) на самодельном FakeRedis: возрастающие id, обрезка до `CHAT_HISTORY_MAX_LEN`, курсоры |
@@ -1795,3 +1811,4 @@ docker exec task-manager-web-1 python -m pytest tests/ -v
 | `test_task_create_files.py` | Атомарное создание задачи с файлами (`POST /create-task/`, multipart): ТЗ и «иные документы» сохраняются вместе с задачей, недопустимый файл → `422` и ничего не создаётся, сбой записи файла → задача создана + `file_upload_errors` |
 | `test_subtask_create_files.py` | То же для подзадач (`POST /create-subtask/`) |
 | `test_search_sql_injection.py` | `GET /tasks/search`: SQL-payload'ы (tautology, UNION, DROP/DELETE, `pg_sleep`) не дают 500 и не меняют таблицу; `%`, `_`, `\` ищутся буквально; невалидные `skip`/`limit` → `422` |
+| `test_cleanup_outbox.py` | Celery Beat-задача `cleanup_done_outbox`: удаление старых `done`-строк, сохранение свежих `done` и всех `pending`/`failed`/`blocked` независимо от возраста, защита по `depends_on_event_id` (цепочка «съедается» с конца, держится и при `retention_days=0`), батчевое удаление за несколько итераций, гонка `SELECT`/`DELETE` (строка получает нового «должника» между выборкой и удалением) — `DELETE` падает `IntegrityError`, ничего не портит |

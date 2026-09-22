@@ -46,9 +46,9 @@ async def create_subtask(
         raise HTTPException(status_code=404, detail="Task not found")
     # Namespace-проверка владельца намеренно не выполняется — Shared board: любой
     # аутентифицированный пользователь может создавать подзадачи в любой задаче,
-    # это не забытая доработка. См. docs/task-manager-documentation.md и
-    # tests/test_subtasks.py::test_update_subtask_other_user_allowed, который
-    # фиксирует это поведение как ожидаемое.
+    # это не забытая доработка. См. tests/test_subtasks.py::
+    # test_update_subtask_other_user_allowed, который фиксирует это поведение
+    # как ожидаемое.
 
     # CRM-создание теперь идёт через durable outbox (см. ниже), а не синхронно
     # ДО INSERT — тот же принцип, что и в services/tasks.py::create_task,
@@ -89,8 +89,7 @@ async def create_subtask(
             detail=f"Subtask with title '{subtask.title}' already exists in this task",
         )
 
-    # Шард всегда родительский — у Subtask своего crm_shard нет (docs/task-
-    # manager-documentation.md, п. 14, «Формула для Subtask»); ensure_task_shard
+    # Шард всегда родительский — у Subtask своего crm_shard нет; ensure_task_shard
     # присваивает task.crm_shard лениво, если задача старше этой фичи.
     shard = ensure_task_shard(task)
 
@@ -104,8 +103,9 @@ async def create_subtask(
     if other_paths:
         db_subtask.other_file_paths = other_paths
 
-    # Межагрегатная зависимость (docs/task-manager-documentation.md, «Два вида
-    # depends_on_event_id»): если родительская задача сама ещё не синхронизирована
+    # Межагрегатная зависимость (один из двух видов depends_on_event_id в
+    # проекте — см. докстринг CrmOutbox в src/task_logic/models.py): если
+    # родительская задача сама ещё не синхронизирована
     # с CRM, а её собственное 'create'-событие ещё не done — привязываем create
     # подзадачи к нему, чтобы воркер не пытался создать подзадачу в CRM раньше
     # родителя (parent_item_id иначе не на что было бы ссылаться).
@@ -241,7 +241,7 @@ async def update_subtask(
 
     task = await db.get(Task, db_subtask.task_id)   # SELECT FROM task WHERE id=?; гарантированно не None (FK)
     # Namespace-проверка владельца намеренно не выполняется — см. create_subtask() выше
-    # и docs/task-manager-documentation.md про Shared board.
+    # про Shared board.
 
     task_title = task.title                          # захватить до commit (объект будет expired)
     update_data = subtask_update.model_dump(exclude_unset=True)
@@ -324,7 +324,7 @@ async def delete_subtask(
 
     task = await db.get(Task, subtask.task_id)      # SELECT FROM task WHERE id=?
     # Namespace-проверка владельца намеренно не выполняется — см. create_subtask() выше
-    # и docs/task-manager-documentation.md про Shared board.
+    # про Shared board.
 
     task_title = task.title                          # захватить до commit (объект будет expired)
     parent_task_id = subtask.task_id                 # захватить до commit — для payload task_id

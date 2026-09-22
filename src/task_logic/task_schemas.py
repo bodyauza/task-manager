@@ -37,8 +37,7 @@ class TaskUpdate(BaseModel):
     description: Optional[str] = Field(None, max_length=2000)
     completed: Optional[bool] = None
     # None здесь — «поле не передано, не трогать» (exclude_unset=True в update_task);
-    # "" (пустая строка) — явная очистка выбранного проекта. См. §3.9.1
-    # docs/project_field_crm_implementation_guide.md.
+    # "" (пустая строка) — явная очистка выбранного проекта.
     project: Optional[str] = Field(None, max_length=20)
 
     @field_validator("title", mode="before")
@@ -93,7 +92,6 @@ class TaskResponse(BaseModel):
     # см. services/tasks.py::_attach_project_option_id). None — проект не выбран.
     project: Optional[str] = None
     # Текущий CRM-ID выбранного проекта (task.project.crm_id) — только для
-    # предзаполнения <select> в режиме редактирования, см.
-    # docs/project_field_crm_implementation_guide.md §3.11.2. Вычисляемое поле,
+    # предзаполнения <select> в режиме редактирования. Вычисляемое поле,
     # как crm_synced — в БД не хранится.
     project_option_id: Optional[str] = None

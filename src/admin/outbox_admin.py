@@ -13,6 +13,7 @@ failed-событие в очередь после устранения прич
 
 from sqladmin import ModelView, action
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
 from starlette.responses import RedirectResponse
 
@@ -26,6 +27,26 @@ def flash(request: Request, text: str, level: str = "success") -> None:
     """Одноразовое сообщение для следующей страницы: sqladmin не имеет flash-
     механизма, поэтому кладём его в сессию, а layout.html показывает и удаляет."""
     request.session["admin_flash"] = {"text": text, "level": level}
+
+
+async def _has_newer_done_sibling(session: AsyncSession, row: CrmOutbox) -> bool:
+    """True, если у той же сущности (aggregate_type, aggregate_id) есть ДРУГАЯ
+    строка с БОЛЬШИМ id и статусом 'done' — то есть более позднее событие уже
+    успешно синхронизировалось с CRM после того, как row провалилась. Возврат
+    row в очередь в этом случае применил бы устаревшие данные поверх свежих."""
+    newer = (
+        await session.execute(
+            select(CrmOutbox.id)
+            .where(
+                CrmOutbox.aggregate_type == row.aggregate_type,
+                CrmOutbox.aggregate_id == row.aggregate_id,
+                CrmOutbox.id > row.id,
+                CrmOutbox.status == "done",
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return newer is not None
 
 
 class CrmOutboxAdmin(ModelView, model=CrmOutbox):
@@ -57,7 +78,8 @@ class CrmOutboxAdmin(ModelView, model=CrmOutbox):
         confirmation_message=(
             "Вернуть выбранные failed-события в очередь? Сначала устраните причину сбоя "
             "(см. last_error на карточке события) — иначе через 5 попыток они снова станут failed. "
-            "События в других статусах будут пропущены."
+            "События в других статусах, а также устаревшие относительно более нового успешно "
+            "синхронизированного события той же сущности, будут пропущены."
         ),
         add_in_list=True,
         add_in_detail=True,
@@ -68,34 +90,59 @@ class CrmOutboxAdmin(ModelView, model=CrmOutbox):
         очередь её шарда. Зависимые blocked-строки разблокирует
         reconcile_blocked_outbox (раз в 5 минут), когда эта станет done.
         Затрагиваются только failed — pending/done/blocked пропускаются
-        (blocked разблокируется сам, когда выполнится его зависимость)."""
+        (blocked разблокируется сам, когда выполнится его зависимость).
+
+        Защита порядка: failed-строка, для которой у той же сущности
+        (aggregate_type, aggregate_id) уже есть более новое (больший id) 'done'
+        событие, НЕ переставляется в очередь — иначе повтор применил бы
+        устаревшие данные ПОВЕРХ уже синхронизированных свежих (например,
+        failed update #10 после того, как update #11 той же задачи уже успешно
+        применился). Такая строка считается устаревшей и попадает в отдельную
+        категорию flash-сообщения, а не в «возвращено в очередь»."""
         pks = [int(p) for p in request.query_params.get("pks", "").split(",") if p.strip().isdigit()]
         requeued: list[CrmOutbox] = []
+        stale: list[CrmOutbox] = []
         if pks:
             async with async_session_maker() as session:
-                requeued = list((
+                candidates = list((
                     await session.execute(
                         select(CrmOutbox).where(CrmOutbox.id.in_(pks), CrmOutbox.status == "failed")
                     )
                 ).scalars().all())
-                for row in requeued:
+                for row in candidates:
+                    if await _has_newer_done_sibling(session, row):
+                        stale.append(row)
+                        continue
                     row.status = "pending"
                     row.attempts = 0
                     if row.operation != "delete":
                         await set_aggregate_sync_status(session, row, "pending", only_from=("failed",))
+                    requeued.append(row)
                 await session.commit()
             # После commit: диспатч — оптимизация задержки, не механизм
             # надёжности (сбой брокера проглатывается, строку подберёт reconcile).
             for row in requeued:
                 dispatch_outbox_row(row)
 
-        skipped = len(set(pks)) - len(requeued)
+        not_failed = len(set(pks)) - len(requeued) - len(stale)
         if not pks:
             flash(request, "Ничего не выбрано: отметьте события со статусом failed.", "warning")
-        elif not requeued:
-            flash(request, f"Ничего не возвращено в очередь: выбранные события ({skipped}) не в статусе failed.", "warning")
-        elif skipped:
-            flash(request, f"Возвращено в очередь: {len(requeued)}. Пропущено (статус не failed или не найдено): {skipped}.", "warning")
+        elif not requeued and not stale:
+            flash(request, f"Ничего не возвращено в очередь: выбранные события ({not_failed}) не в статусе failed.", "warning")
+        elif not requeued and stale:
+            flash(
+                request,
+                f"Ничего не возвращено в очередь: для всех выбранных событий ({len(stale)}) уже есть "
+                "более новое успешно синхронизированное событие той же сущности.",
+                "warning",
+            )
+        elif stale or not_failed:
+            parts = [f"Возвращено в очередь: {len(requeued)}."]
+            if stale:
+                parts.append(f"Пропущено как устаревшие (есть более новое done): {len(stale)}.")
+            if not_failed:
+                parts.append(f"Пропущено (статус не failed или не найдено): {not_failed}.")
+            flash(request, " ".join(parts), "warning")
         else:
             flash(request, f"Возвращено в очередь: {len(requeued)}.")
 

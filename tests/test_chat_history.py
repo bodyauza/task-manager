@@ -168,7 +168,7 @@ async def test_get_history_page_cursor_at_beginning_returns_empty_list(fake_redi
 
 async def test_get_history_page_cursor_beyond_trimmed_history_returns_empty_list(fake_redis):
     """before_id, указывающий на сообщение, которое LTRIM уже вытеснил из
-    списка, — не ошибка (docs/chat_history_redis_list_guide.md §1.4, решение №3)."""
+    списка, — не ошибка."""
     with patch.object(settings, "CHAT_HISTORY_MAX_LEN", 2):
         for i in range(5):
             await _append_chat(1, "alice@example.com", f"msg{i}")

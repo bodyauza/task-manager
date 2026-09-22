@@ -9,7 +9,7 @@ Create Date: 2026-06-18
 или трёхшаговую регистрацию — все они появляются позже, миграциями 0003-0012).
 Начальные данные (роли "user"/"admin") сюда не входят: Alembic управляет
 схемой, а не данными — они вставляются идемпотентно в `create_initial_roles()`
-при старте приложения (`src/main.py::lifespan`), см. `docs/task-manager-documentation.md`.
+при старте приложения (`src/main.py::lifespan`).
 """
 from typing import Sequence, Union
 

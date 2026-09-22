@@ -4,10 +4,9 @@ Revision ID: 0017
 Revises: 0016
 Create Date: 2026-09-10
 
-Схема для полной реализации docs/task-manager-documentation.md, «Векторы
-развития проекта», п. 14 (шардирование через consistent hashing,
+Схема для полной реализации шардирования outbox-очереди (id % N,
 depends_on_event_id, идемпотентность, Redlock, token-bucket — код в
-src/tasks/hash_ring.py, src/tasks/crm_shard_lock.py, src/tasks/crm_rate_limit.py,
+src/tasks/sharding.py, src/tasks/crm_shard_lock.py, src/tasks/crm_rate_limit.py,
 src/tasks/crm_outbox_tasks.py) — распространяя durable outbox (0016) на
 `Subtask` и на операцию `create` (не только `update`/`delete`/`sync_files`).
 

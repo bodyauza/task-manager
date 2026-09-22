@@ -105,8 +105,7 @@ class Settings(BaseSettings):
 
     # Брокер Celery (src/celery_app.py) — общий Redis-инстанс для фоновой синхронизации
     # CRM-справочников (src/tasks/global_lists_tasks.py) и durable-retry очереди
-    # CRM-синхронизации задач (src/tasks/crm_outbox_tasks.py), см.
-    # docs/project_field_crm_implementation_guide.md §1.4. Дефолт — для запуска без
+    # CRM-синхронизации задач (src/tasks/crm_outbox_tasks.py). Дефолт — для запуска без
     # Docker (Redis на localhost); docker-compose.yml переопределяет на redis://redis:6379/0.
     REDIS_URL: str = "redis://localhost:6379/0"
 
@@ -115,9 +114,8 @@ class Settings(BaseSettings):
     ADMIN_TIMEZONE: str = "Europe/Moscow"
 
     # Сколько последних сообщений WS-чата держать в Redis List "chat:history"
-    # (src/realtime/chat_history.py) — список ограничен, не бесконечный архив;
-    # см. docs/chat_history_redis_list_guide.md §1.4, решение №3. Дефолт 500 —
-    # ориентировочный, переопределяется через .env без изменения кода.
+    # (src/realtime/chat_history.py) — список ограничен, не бесконечный архив.
+    # Дефолт 500 — ориентировочный, переопределяется через .env без изменения кода.
     CHAT_HISTORY_MAX_LEN: int = 500
 
     # Документация API (/docs, /redoc, /openapi.json). None — включена везде, кроме

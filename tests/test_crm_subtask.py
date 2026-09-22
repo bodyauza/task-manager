@@ -185,7 +185,7 @@ async def test_update_subtask_success():
 
 @pytest.mark.asyncio
 async def test_update_subtask_empty_id_raises():
-    """Регрессия (docs/crm_issue.md): если подзадачу удалили в CRM напрямую, CRM отвечает
+    """Регрессия: если подзадачу удалили в CRM напрямую, CRM отвечает
     "success" с пустым data.id — expect_id должен превратить это в Exception, чтобы
     _do_update_subtask (src/tasks/crm_outbox_tasks.py) не принял это за успех и
     оставил строку crm_outbox на повторную попытку, а не пометил её 'done'."""
@@ -248,7 +248,7 @@ async def test_delete_subtask_success():
 
 @pytest.mark.asyncio
 async def test_delete_subtask_empty_id_raises():
-    """Регрессия (docs/crm_issue.md): та же дыра, что и в test_update_subtask_empty_id_raises,
+    """Регрессия: та же дыра, что и в test_update_subtask_empty_id_raises,
     но для delete_subtask()."""
     patcher, _ = _patch_httpx(_resp({"id": ""}))
     try:

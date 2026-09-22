@@ -368,7 +368,6 @@ async def test_broadcast_task_event_uses_connection_manager_by_default():
 
 
 # ── broadcast_task_event: персистентность CRUD-событий, не файловых ────────
-# (docs/chat_history_redis_list_guide.md, §1.4, обновлённое решение №2)
 
 async def test_broadcast_task_event_persists_all_crud_and_file_types(mock_chat_history_redis):
     fake = FakeBroadcaster()
@@ -396,8 +395,7 @@ async def test_broadcast_task_event_does_not_persist_unknown_event(mock_chat_his
         assert "id" not in payload  # не персистировано — id/created_at не добавляются
 
 
-# ── _publish_chat_message: персист в chat_history + broadcast (docs/ ────────
-# chat_history_redis_list_guide.md) ──────────────────────────────────────────
+# ── _publish_chat_message: персист в chat_history + broadcast ──────────────
 #
 # chat_history.append_event мокается напрямую (не Redis-уровень) — сама
 # логика Redis List/пагинации тестируется отдельно, в tests/test_chat_history.py.

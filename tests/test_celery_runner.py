@@ -144,6 +144,7 @@ EXPECTED_TASKS = {
     "src.tasks.crm_outbox_tasks.process_outbox_row",
     "src.tasks.crm_outbox_tasks.reconcile_pending_outbox",
     "src.tasks.crm_outbox_tasks.reconcile_blocked_outbox",
+    "src.tasks.crm_outbox_tasks.cleanup_done_outbox",
     "src.tasks.global_lists_tasks.sync_project_table",
 }
 
@@ -155,10 +156,17 @@ def test_all_project_tasks_are_registered():
 
 
 def test_every_beat_schedule_entry_points_to_a_registered_task():
+    from celery.schedules import crontab
+
     schedule = celery_app.conf.beat_schedule
     assert schedule, "расписание Beat пусто"
     for name, entry in schedule.items():
         assert entry["task"] in celery_app.tasks, f"{name}: задача {entry['task']} не зарегистрирована"
+        # Числовой интервал (секунды) — просто > 0; crontab — валиден сам по себе
+        # ("> 0" для него не определено, но его же наличие в CrontabSchedule
+        # достаточно: конструктор celery.schedules.crontab уже проверяет диапазоны).
+        if isinstance(entry["schedule"], crontab):
+            continue
         assert entry["schedule"] > 0
 
 

@@ -15,8 +15,7 @@ class Project(Base):
     её значения для формы задачи. Наполняется/обновляется исключительно
     Celery-задачей sync_project_table (src/tasks/global_lists_tasks.py) по
     расписанию Celery Beat — веб-процесс никогда не пишет сюда напрямую и не
-    обращается к CRM за этим списком (см. docs/project_field_crm_implementation_guide.md,
-    §1.2/§1.4).
+    обращается к CRM за этим списком напрямую при каждом запросе.
     """
     __tablename__ = "project"
 
@@ -44,11 +43,10 @@ class CrmOutbox(Base):
     """Durable outbox для CRM-операций, выполняемых ПОСЛЕ основного db.commit()
     (создание/обновление полей/синхронизация файлов/удаление — для Task И
     Subtask) — см. подробный разбор риска и решения в services/tasks.py и
-    services/subtasks.py (докстринги create_*/update_*/delete_*) и
-    docs/task-manager-documentation.md, «Векторы развития проекта», п. 14
-    (полный план: шардирование id % N со sticky-присвоением, depends_on_event_id,
+    services/subtasks.py (докстринги create_*/update_*/delete_*). Полный план:
+    шардирование id % N со sticky-присвоением, depends_on_event_id,
     идемпотентность, Redlock, token-bucket — см. src/tasks/sharding.py,
-    src/tasks/crm_shard_lock.py, src/tasks/crm_rate_limit.py).
+    src/tasks/crm_shard_lock.py, src/tasks/crm_rate_limit.py.
 
     Строка вставляется В ТОЙ ЖЕ транзакции, что и основное изменение
     Task/Subtask — если процесс упадёт в любой момент после этого commit (в
@@ -99,8 +97,7 @@ class CrmOutbox(Base):
     # без чтения логов воркера. Текст ответа CRM может содержать фрагменты
     # данных задачи — поэтому обрезка, и поле не попадает ни в один API-ответ.
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    # Событие, от которого зависит эта строка (два вида зависимости — см.
-    # docs/task-manager-documentation.md, «Два вида depends_on_event_id»):
+    # Событие, от которого зависит эта строка (два вида зависимости):
     # межагрегатная (Subtask.create зависит от Task.create) и внутриагрегатная
     # (sync_files зависит от create того же агрегата). NULL — нет зависимости.
     depends_on_event_id: Mapped[Optional[int]] = mapped_column(
@@ -155,7 +152,7 @@ class Task(Base):
 
     # Проект из глобального справочника CRM (см. класс Project выше). Только у
     # Task — Subtask такого поля не получает ни в локальной БД, ни в CRM
-    # (entity_id=30), см. docs/project_field_crm_implementation_guide.md, §1.3.
+    # (entity_id=30, у неё поля «Проект» нет вовсе).
     # Единственная FK-колонка на project у Task — foreign_keys= в relationship
     # не требуется (не путать с многими FK на общую generic-таблицу).
     project_id: Mapped[Optional[int]] = mapped_column(
