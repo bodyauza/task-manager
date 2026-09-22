@@ -34,6 +34,22 @@
         .task-item.completed { background-color: #e8f5e9; border-left-color: #198754; border-color: #c8e6c9; }
         .task-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; gap: 8px; }
         .task-title-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+        .subtask-count { display: inline-block; background-color: #37474f; color: white; padding: 2px 8px; border-radius: 2px; font-size: 11px; font-weight: 700; white-space: nowrap; letter-spacing: 0.3px; }
+        /* Бейдж статуса CRM-синхронизации (syncStatusTag в common.js) — базовый вид даёт
+           .subtask-count, здесь цвет и особые состояния; двойной селектор перекрывает фон .subtask-count. */
+        .subtask-count.sync-status-unsynced { background-color: #6c757d; }
+        .subtask-count.sync-status-pending  { background-color: #ffc107; color: #212529; }
+        .subtask-count.sync-status-stalled  { background-color: #c05e00; color: #fff; }
+        .subtask-count.sync-status-failed   { background-color: #b71c1c; }
+        /* synced — только галочка без плашки. */
+        .subtask-count.sync-status-synced   { background: transparent; color: #198754; padding: 0 2px; font-size: 15px; cursor: default; }
+        .sync-spinner {
+            display: inline-block; width: 9px; height: 9px; margin-right: 5px; vertical-align: -1px;
+            border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+            animation: sync-spin 0.8s linear infinite;
+        }
+        @keyframes sync-spin { to { transform: rotate(360deg); } }
+        @media (prefers-reduced-motion: reduce) { .sync-spinner { animation: none; } }
         .task-title { font-weight: 700; font-size: 15px; color: #003f6b; }
         .task-status { padding: 2px 8px; border-radius: 2px; font-size: 11px; font-weight: 700; letter-spacing: 0.3px; white-space: nowrap; }
         .status-completed { background-color: #198754; color: white; }
@@ -41,7 +57,6 @@
         .task-description { font-size: 13px; color: #495057; margin-bottom: 8px; line-height: 1.5; }
         .task-actions { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
         .task-actions button { padding: 5px 12px; font-size: 12px; }
-        .crm-badge { display: inline-block; background-color: #b71c1c; color: white; padding: 2px 8px; border-radius: 2px; font-size: 11px; font-weight: 700; white-space: nowrap; letter-spacing: 0.3px; }
         .pagination { display: flex; justify-content: center; margin-top: 14px; gap: 4px; }
         .pagination button { padding: 5px 12px; font-size: 13px; background-color: #546e7a; }
         .pagination button.active { background-color: #003f6b; }
@@ -58,6 +73,22 @@
         .char-counter { text-align: right; font-size: 11px; color: #6c757d; margin-top: 3px; }
         .char-counter.limit-near { color: #e65100; }
         .char-counter.limit-reached { color: #b71c1c; font-weight: 700; }
+
+        /* ── Секция файлов (модалка создания подзадачи) — см. subtask-detail.html ── */
+        .file-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid #dee2e6; }
+        .file-upload-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+        .file-upload-row input[type="file"] { flex: 1; min-width: 0; font-size: 13px; }
+        .btn-upload { background-color: #546e7a; }
+        .btn-upload:hover { background-color: #37474f; }
+        .file-current { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+        .file-link { font-size: 13px; color: #003f6b; word-break: break-all; }
+        .btn-delete-file { background-color: #b71c1c; padding: 4px 10px; font-size: 12px; }
+        .btn-delete-file:hover { background-color: #961515; }
+        .file-list { list-style: none; padding: 0; margin: 6px 0 0; }
+        .file-list li { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+        .files-counter { font-size: 11px; color: #6c757d; margin-left: 4px; }
+        .pending-caption { font-size: 11px; font-weight: 700; color: #e65100; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 8px; }
+        .file-pending-name { font-size: 13px; color: #6c757d; font-style: italic; word-break: break-all; }
     </style>
 </head>
 <body>
@@ -74,18 +105,7 @@
         <div class="board-grid">
             <div class="card">
                 <h2>Создать подзадачу</h2>
-                <form id="createSubtaskForm">
-                    <div class="form-group">
-                        <label for="title">Название</label>
-                        <input type="text" id="title" required maxlength="100">
-                        <div class="char-counter"><span id="titleCounter">0</span> / 100</div>
-                    </div>
-                    <div class="form-group">
-                        <label for="description">Описание</label>
-                        <textarea id="description" maxlength="2000"></textarea>
-                    </div>
-                    <button type="submit">Создать подзадачу</button>
-                </form>
+                <button id="openCreateSubtaskModalBtn">Добавить подзадачу</button>
             </div>
 
             <div class="card">
@@ -121,7 +141,53 @@
         </div>
     </div>
 
-    <script src="/static/js/common.js?v=2" defer></script>
-    <script src="/static/js/subtask-board.js?v=4" defer></script>
+    <div id="createSubtaskModal" class="modal-overlay">
+        <div class="modal-box">
+            <h3>Добавить подзадачу</h3>
+            <div class="form-group">
+                <label for="createTitle">Название</label>
+                <input type="text" id="createTitle" maxlength="100">
+                <div class="char-counter"><span id="createTitleCounter">0</span> / 100</div>
+            </div>
+            <div class="form-group">
+                <label for="createDescription">Описание</label>
+                <textarea id="createDescription" maxlength="2000"></textarea>
+            </div>
+
+            <!-- ── Техническое задание ─────────────────────────────────────── -->
+            <div class="file-section">
+                <span class="field-label">Техническое задание</span>
+                <div class="file-current" id="createSpecPendingRow" style="display:none;">
+                    <span class="file-pending-name" id="createSpecPendingName"></span>
+                    <button class="btn-delete-file" id="createSpecRemoveBtn">✕ Убрать</button>
+                </div>
+                <div class="file-upload-row">
+                    <input type="file" id="createSpecInput"
+                           accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png,.txt">
+                </div>
+            </div>
+
+            <!-- ── Иные документы ──────────────────────────────────────────── -->
+            <div class="file-section">
+                <span class="field-label">
+                    Иные документы
+                    <span class="files-counter" id="createOtherCount">(0 / 10)</span>
+                </span>
+                <ul class="file-list" id="createOtherPendingList"></ul>
+                <div class="file-upload-row">
+                    <input type="file" id="createOtherInput" multiple
+                           accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png,.txt">
+                </div>
+            </div>
+
+            <div class="modal-actions">
+                <button id="createSubtaskSubmitBtn">Создать</button>
+                <button class="delete" id="createSubtaskCancelBtn">Отмена</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/common.js?v=6" defer></script>
+    <script src="/static/js/subtask-board.js?v=7" defer></script>
 </body>
 </html>

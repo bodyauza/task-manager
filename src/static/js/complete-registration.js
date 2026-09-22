@@ -9,7 +9,6 @@ function formatError(detail) {
         return 'Сессия регистрации истекла. Начните регистрацию заново';
     }
     if (detail === 'EMAIL_ALREADY_REGISTERED') return 'Пользователь с таким email уже зарегистрирован';
-    if (detail === 'CRM_UNAVAILABLE') return 'CRM недоступна. Обратитесь в техподдержку';
     if (Array.isArray(detail)) return detail.map(e => e.msg).join('; ');
     return detail;
 }

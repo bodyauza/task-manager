@@ -1,9 +1,12 @@
-from typing import AsyncGenerator
+import asyncio
+from typing import Awaitable, AsyncGenerator, TypeVar
 from sqlalchemy import MetaData, NullPool
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
 from src.config import settings
+
+_T = TypeVar("_T")
 
 
 metadata = MetaData()
@@ -55,3 +58,33 @@ async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
     # обработки запроса и закрывается автоматически при выходе из контекста.
     async with async_session_maker() as session:
         yield session
+
+
+def run_isolated(coro: Awaitable[_T]) -> _T:
+    """Выполняет одну async-корутину в СВОЁМ event loop (asyncio.run) и
+    гарантированно освобождает пул соединений `engine` сразу после — иначе
+    следующий вызов asyncio.run() в этом же процессе (Celery-воркер выполняет
+    много задач за время жизни процесса, каждая — отдельный asyncio.run(), см.
+    src/tasks/crm_outbox_tasks.py/global_lists_tasks.py) попытался бы
+    переиспользовать asyncpg-соединение из QueuePool, физически привязанное к
+    уже закрытому event loop предыдущего вызова, и упал бы
+    `RuntimeError: ... got Future <...> attached to a different loop` —
+    обнаружено живым прогоном `docker compose up` (юнит-тесты этого не ловят:
+    один процесс pytest = один event loop на тест, но никогда не выполняет
+    ДВА отдельных asyncio.run() подряд в одном процессе поверх одного и того
+    же engine).
+
+    Тот же класс проблемы, из-за которого src/database.py включает NullPool
+    для тестового режима (см. комментарий у engine_kwargs выше) — здесь
+    источник множественных event loop не pytest-asyncio, а повторные вызовы
+    Celery-задач, поэтому чинится не сменой poolclass (engine общий с
+    веб-процессом, где QueuePool наоборот нужен), а явным dispose() после
+    каждого изолированного запуска.
+    """
+    async def _wrapper() -> _T:
+        try:
+            return await coro
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_wrapper())

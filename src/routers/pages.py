@@ -7,15 +7,49 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.auth.auth_config import current_user
+from src.auth.auth_config import current_user, require_role
 from src.auth.user_models import Role, User, user_role
 from src.database import get_async_session
-from src.task_logic.models import Subtask, Task
+from src.task_logic.models import Project, Subtask, Task
 
 router = APIRouter(tags=["Pages"])
 
 _TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "..", "templates")
 templates = Jinja2Templates(directory=_TEMPLATES_DIR)
+
+_admin_only = require_role("admin")
+
+
+async def _project_options(db: AsyncSession = Depends(get_async_session)) -> dict:
+    """{crm_id: label} по активным строкам project — прямой запрос к локальной
+    таблице, без похода в CRM (см. docs/project_field_crm_implementation_guide.md,
+    §1.2/§3.11/§3.13) — таблица наполняется отдельно, Celery Beat
+    (src/tasks/global_lists_tasks.py::sync_project_table).
+    """
+    rows = (
+        await db.execute(select(Project.crm_id, Project.label).where(Project.is_active.is_(True)))
+    ).all()
+    return dict(rows)
+
+
+async def _is_admin(
+    user: User = Depends(current_user), db: AsyncSession = Depends(get_async_session),
+) -> bool:
+    """Только для решения «показывать ли ссылку на admin-страницу в навбаре»
+    (_navbar.html) — НЕ заменяет require_role("admin") как защиту самого
+    admin-эндпоинта (тот использует _admin_only отдельно). Явный select(),
+    а не user.roles: связь не lazy="selectin" — синхронное обращение к ней в
+    Jinja2 упало бы MissingGreenlet (тот же приём, что и в require_role() и
+    profile_page ниже).
+    """
+    role = (
+        await db.execute(
+            select(Role.id).join(user_role).where(
+                user_role.c.person_id == user.id, Role.name == "admin",
+            )
+        )
+    ).scalar_one_or_none()
+    return role is not None
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -46,10 +80,16 @@ async def complete_registration_page(
 
 
 @router.get("/task-board", response_class=HTMLResponse)
-async def task_board(request: Request, user: User = Depends(current_user)):
+async def task_board(
+    request: Request,
+    user: User = Depends(current_user),
+    project_options: dict = Depends(_project_options),
+    is_admin: bool = Depends(_is_admin),
+):
     # current_page передаётся в _navbar.html для выделения активной ссылки меню.
     return templates.TemplateResponse(
-        request, "task-board.html", {"user": user.id, "current_page": "tasks"}
+        request, "task-board.html",
+        {"user": user.id, "current_page": "tasks", "project_options": project_options, "is_admin": is_admin},
     )
 
 
@@ -59,6 +99,7 @@ async def subtask_board(
     task_id: int,
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
+    is_admin: bool = Depends(_is_admin),
 ):
     task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
     if task is None:
@@ -69,6 +110,7 @@ async def subtask_board(
             "task_id": task_id,
             "task_title": task.title,
             "current_page": "tasks",
+            "is_admin": is_admin,
         }
     )
 
@@ -79,6 +121,8 @@ async def task_detail(
     task_id: int,
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
+    project_options: dict = Depends(_project_options),
+    is_admin: bool = Depends(_is_admin),
 ):
     task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
     if task is None:
@@ -88,6 +132,8 @@ async def task_detail(
             "user": user.id,
             "task_id": task_id,
             "current_page": "tasks",
+            "project_options": project_options,
+            "is_admin": is_admin,
         }
     )
 
@@ -98,6 +144,7 @@ async def subtask_detail(
     subtask_id: int,
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
+    is_admin: bool = Depends(_is_admin),
 ):
     subtask = (
         await db.execute(select(Subtask).where(Subtask.id == subtask_id))
@@ -110,6 +157,7 @@ async def subtask_detail(
             "subtask_id": subtask_id,
             "task_id": subtask.task_id,
             "current_page": "tasks",
+            "is_admin": is_admin,
         }
     )
 
@@ -128,6 +176,7 @@ async def profile_page(
     roles = (await db.execute(
         select(Role).join(user_role).where(user_role.c.person_id == user.id)
     )).scalars().all()
+    is_admin = any(role.name == "admin" for role in roles)  # уже загружено выше — без доп. запроса
 
     # Jinja2 рендерит шаблон синхронно. Если передать ORM-объект напрямую,
     # обращение к «ленивым» атрибутам внутри шаблона вызовет MissingGreenlet:
@@ -149,6 +198,7 @@ async def profile_page(
                 user.registered_at.strftime("%d.%m.%Y") if user.registered_at else "—"
             ),
             "is_active": user.is_active,
+            "is_admin": is_admin,
         },
     )
     response.headers["Cache-Control"] = "no-store"

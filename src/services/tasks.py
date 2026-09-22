@@ -6,25 +6,74 @@
 одном месте, не завязанном на Request/Response FastAPI.
 """
 
-import asyncio
 import logging
 from typing import List, Optional
 
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.exc import StaleDataError
 
 from src.auth.user_models import User
-from src.crm.subtask_service import SubtaskCRMSync
-from src.crm.task_service import TaskCRMSync
 from src.realtime import broadcast_task_event
 from src.services import attachments
-from src.task_logic.models import Subtask, Task
+from src.task_logic.models import CrmOutbox, Project, Subtask, Task
 from src.task_logic.task_schemas import TaskCreate, TaskResponse, TaskUpdate
+from src.tasks.crm_outbox_tasks import dispatch_outbox_row
+from src.tasks.sharding import ensure_task_shard
 
 logger = logging.getLogger(__name__)
+
+
+async def _resolve_project(
+    project_crm_id: Optional[str], db: AsyncSession,
+) -> Optional[Project]:
+    """CRM-ID опции списка "Проект" (то, что прислал клиент) → строка Project.
+
+    None → «не передано»/«не выбрано» (create) или «не трогать» (update).
+    "" (пустая строка) → явная очистка поля — возвращается None без похода в БД
+    (пустая строка не может совпасть ни с одним настоящим crm_id).
+
+    Возвращает саму строку (id + label), не только id: вызывающему коду нужен
+    и id (для project_id FK), и label (для TaskResponse.project — в create/update
+    task.project_ref ещё не подгружен без db.refresh(), см. _attach_project_option_id).
+
+    Читает ТОЛЬКО локальную таблицу project — никакого живого запроса к CRM
+    внутри HTTP-запроса. Актуальность таблицы — на совести Celery Beat
+    (src/tasks/global_lists_tasks.py::sync_project_table, раз в
+    crm_settings.PROJECT_SYNC_INTERVAL_SECONDS) или ручного admin-триггера
+    (POST /admin/crm-options/refresh), не этого запроса — см.
+    docs/project_field_crm_implementation_guide.md, §1.4/§3.11.1.
+    """
+    if not project_crm_id:  # покрывает и None, и ""
+        return None
+    project_row = (
+        await db.execute(
+            select(Project).where(Project.crm_id == project_crm_id, Project.is_active.is_(True))
+        )
+    ).scalar_one_or_none()
+    if project_row is None:
+        raise HTTPException(422, f"Значение {project_crm_id!r} не найдено в списке «Проект» CRM")
+    return project_row
+
+
+def _attach_project_option_id(response: TaskResponse, task: Task) -> None:
+    """Заполняет response.project/project_option_id из уже загруженной связи
+    task.project_ref (lazy="selectin" — без дополнительного запроса).
+
+    Вызывается для get_task/list_tasks/search_tasks (перечитывание уже
+    сохранённой задачи) — НЕ для create_task/update_task, где эти поля
+    выставляются напрямую из входных данных запроса (project_ref к этому
+    моменту в текущей транзакции ещё не подгружен без db.refresh(), см.
+    вызывающий код).
+    """
+    if task.project_ref is not None:
+        response.project = task.project_ref.label
+        response.project_option_id = task.project_ref.crm_id
+    else:
+        response.project = None
+        response.project_option_id = None
 
 
 def _subtask_count_subquery():
@@ -41,8 +90,32 @@ def _subtask_count_subquery():
 
 
 async def create_task(
-    db: AsyncSession, user: User, task: TaskCreate, crm: TaskCRMSync,
+    db: AsyncSession,
+    user: User,
+    task: TaskCreate,
+    specification: Optional[UploadFile] = None,
+    other_files: Optional[list[UploadFile]] = None,
 ) -> TaskResponse:
+    # Захватываются здесь, а не читаются из user.* в конце функции — простая
+    # предосторожность на случай будущего rollback где-то по ходу функции
+    # (rollback() экспирует ВСЕ объекты сессии, включая user; синхронное
+    # чтение user.email/user.id после этого упало бы MissingGreenlet — лениво
+    # подгрузить expired-атрибут можно только через await). Простые
+    # Python-переменные этой проблемы не имеют — тот же приём, что и для
+    # db_task/db_subtask ниже по функции.
+    user_id, user_email = user.id, user.email
+
+    # Резолвинг project — первой строкой, до файлов/CRM/БД: дешёвый локальный SELECT
+    # (не поход в CRM, см. _resolve_project), должен блокировать создание задачи
+    # целиком (422), если CRM-ID не найден в локальной таблице project.
+    project_row = await _resolve_project(task.project, db)
+
+    # Валидация файлов — до CRM/БД: единственный невалидный файл
+    # должен блокировать создание задачи целиком (422), ничего не должно быть тронуто.
+    spec_validated, other_validated = await attachments.validate_files_for_create(
+        specification, other_files
+    )
+
     # Проверяем уникальность title+owner ДО вызова CRM, чтобы не создавать
     # дубликаты в CRM при повторном запросе с тем же названием.
     existing = (
@@ -63,41 +136,110 @@ async def create_task(
             detail=f"Задача с названием '{task.title}' уже существует",
         )
 
-    # Пробуем создать задачу в CRM до INSERT в БД (best-effort).
-    # crm_task_id=None означает, что синхронизация не выполнена.
-    crm_task_id: Optional[int] = None
-    try:
-        crm_result = await crm.create_task(
-            title=task.title,
-            description=task.description,
-            completed=False,
-        )
-        crm_task_id = crm_result.get("id")
-        logger.info("CRM: task '%s' created, crm_id=%s", task.title, crm_task_id)
-    except Exception as exc:
-        logger.error("CRM create_task failed for '%s': %s", task.title, exc)
-
-    db_task = Task(**task.model_dump(), owner_id=user.id, crm_task_id=crm_task_id)
+    # CRM-создание теперь идёт через durable outbox (см. ниже), а не синхронно
+    # ДО INSERT, как раньше — устраняет прежнюю необходимость в компенсирующем
+    # удалении из CRM при гонке IntegrityError: CRM ещё не тронута к моменту
+    # flush(), поэтому дубликат под гонкой просто ничего не оставляет в CRM.
+    db_task = Task(
+        **task.model_dump(exclude={"project"}), project_id=(project_row.id if project_row else None),
+        owner_id=user.id, crm_task_id=None,
+    )
     db.add(db_task)
     try:
-        await db.commit()
+        # flush() (не commit()): нужен db_task.id для путей файлов и для ключа
+        # присвоения шарда ниже, но файлы ещё не должны быть записаны на диск, если
+        # сама вставка задачи упадёт (дубликат title под гонкой — UNIQUE(title,
+        # owner_id) проверяется PostgreSQL уже здесь, на INSERT).
+        await db.flush()
     except IntegrityError:
         await db.rollback()
-        # Компенсирующая транзакция: CRM-запись создана, но commit упал →
-        # удаляем запись из CRM, чтобы не оставить сироту.
-        if crm_task_id is not None:
-            try:
-                await crm.delete_task(crm_task_id)
-            except Exception as crm_exc:
-                logger.error("CRM compensating delete failed for crm_id=%s: %s", crm_task_id, crm_exc)
         raise HTTPException(status_code=409, detail=f"Task with title '{task.title}' already exists")
+
+    # Sticky-присвоение шарда — РОВНО ОДИН РАЗ, на первом outbox-событии задачи
+    # (docs/task-manager-documentation.md, п. 14, «Маршрутизация события в
+    # шард») — все последующие события этой задачи и её подзадач читают уже
+    # сохранённое значение, кольцо больше не консультируется.
+    shard = ensure_task_shard(db_task)
+
+    # Сущность гарантированно существует (в рамках открытой транзакции) — сохранение
+    # файлов на диск теперь best-effort: сбой одного файла не откатывает задачу.
+    spec_path, other_paths, file_upload_errors = await attachments.save_files_for_create(
+        db_task.id, attachments.TASK_ATTACHMENTS, spec_validated, other_validated,
+    )
+    if spec_path is not None:
+        db_task.specification_path = spec_path
+    if other_paths:
+        db_task.other_file_paths = other_paths
+
+    # Durable outbox — ВСТАВЛЯЕТСЯ В ТОЙ ЖЕ ТРАНЗАКЦИИ, что и создание задачи
+    # (db.add ниже, до db.commit()): если процесс упадёт в любой момент ПОСЛЕ
+    # этого commit — в том числе до того, как код дойдёт до dispatch_outbox_row
+    # ниже, — строка всё равно останется в PostgreSQL со status='pending', и её
+    # найдёт и повторно обработает reconcile_pending_outbox (Celery Beat,
+    # src/tasks/crm_outbox_tasks.py). CRM-вызов выполняется ИСКЛЮЧИТЕЛЬНО в
+    # Celery-воркере (см. dispatch_outbox_row) — веб-процесс сам его никогда не
+    # делает, именно это убирает риск потери запроса и его латентность из
+    # ответа пользователю — см. основную документацию, «Векторы развития
+    # проекта», п. 14.
+    outbox_create = CrmOutbox(
+        aggregate_type="task", aggregate_id=db_task.id, operation="create", shard=shard,
+        payload={
+            "title": task.title, "description": task.description,
+            "completed": False, "project": task.project,
+        },
+    )
+    db.add(outbox_create)
+    # 'pending' в той же транзакции, что и строка outbox: пользователь видит бейдж
+    # «В очереди», пока воркер не выставит 'synced' (или 'failed' при исчерпании попыток).
+    db_task.sync_status = "pending"
+    await db.flush()  # нужен outbox_create.id для depends_on_event_id строки ниже
+
+    outbox_files: Optional[CrmOutbox] = None
+    if spec_path is not None or other_paths:
+        outbox_files = CrmOutbox(
+            aggregate_type="task", aggregate_id=db_task.id, operation="sync_files", shard=shard,
+            # Зависит от 'create' ТОГО ЖЕ агрегата (внутриагрегатная зависимость,
+            # docs/task-manager-documentation.md, «Два вида depends_on_event_id») —
+            # crm_task_id пока не известен (create ещё не выполнялся), поэтому в
+            # payload "crm_task_id": None; исполнитель (src/tasks/crm_outbox_tasks.py::
+            # _do_sync_files_task) прочитает актуальное значение из уже обновлённой
+            # записи Task, когда до него дойдёт очередь (после того как зависимость done).
+            depends_on_event_id=outbox_create.id,
+            payload={
+                "crm_task_id": None,
+                "specification_path": spec_path,
+                "other_file_paths": other_paths or None,
+            },
+        )
+        db.add(outbox_files)
+
+    await db.commit()
     # db.refresh() здесь не нужен: async_session_maker сконфигурирован с
     # expire_on_commit=False (src/database.py) — атрибуты db_task не инвалидируются
     # после commit(), а id уже заполнен через INSERT ... RETURNING id, который
     # SQLAlchemy 2.0 + asyncpg используют автоматически при flush.
-    await broadcast_task_event("task_created", db_task.title, exclude_user_id=user.id, sender_email=user.email)
+
+    # CRM-вызов веб-процесс больше не делает вообще — только вставленные выше
+    # outbox-строки + немедленный диспатч в Celery (см. dispatch_outbox_row):
+    # сам HTTP-ответ не ждёт CRM ни при каком исходе (успех/сбой/недоступность).
+    # Если apply_async ниже не успеет выполниться (падение процесса) — строка
+    # всё равно останется 'pending' и будет подхвачена reconcile_pending_outbox.
+    dispatch_outbox_row(outbox_create)
+    if outbox_files is not None:
+        dispatch_outbox_row(outbox_files)
+
     result = TaskResponse.model_validate(db_task)
-    result.crm_synced = crm_task_id is not None
+    result.file_upload_errors = file_upload_errors or None
+    # Из входных данных, не через _attach_project_option_id: project_ref для
+    # db_task в этой же транзакции без db.refresh() ещё не подгружен.
+    result.project = project_row.label if project_row else None
+    result.project_option_id = project_row.crm_id if project_row else None
+
+    # actor_id (не exclude_user_id — событие теперь персистируется и должно
+    # прийти актору тоже, чтобы «Вы: Создана задача: ...» появилось и после
+    # перезагрузки страницы; на клиенте selfOrOther-логика решает по actor_id,
+    # свой это рендер или чужой, см. task-board.js::buildEventMessage).
+    await broadcast_task_event("task_created", task.title, sender_email=user_email, actor_id=user_id)
     return result
 
 
@@ -116,6 +258,10 @@ async def list_tasks(db: AsyncSession, skip: int, limit: int) -> tuple[List[Task
                 func.count().over().label("total"),
             )
             .outerjoin(count_sq, Task.id == count_sq.c.task_id)
+            # ORDER BY обязателен для стабильной пагинации: без него порядок строк не
+            # определён, а UPDATE в PostgreSQL физически перемещает версию строки —
+            # обновлённая задача «переезжала» бы между страницами (повтор/пропуск).
+            .order_by(Task.id)
             .offset(skip)
             .limit(limit)
         )
@@ -132,13 +278,14 @@ async def list_tasks(db: AsyncSession, skip: int, limit: int) -> tuple[List[Task
     for task, cnt, _total in rows:
         r = TaskResponse.model_validate(task)
         r.subtask_count = cnt
+        _attach_project_option_id(r, task)
         results.append(r)
     return results, total
 
 
 async def search_tasks(
     db: AsyncSession, title: str, skip: int, limit: int,
-) -> tuple[List[Task], int]:
+) -> tuple[List[TaskResponse], int]:
     if not title.strip():
         raise HTTPException(status_code=400, detail="Title query parameter must not be empty")
 
@@ -152,6 +299,7 @@ async def search_tasks(
         await db.execute(
             select(Task, func.count().over().label("total"))
             .where(Task.title.ilike(pattern, escape="\\"))
+            .order_by(Task.id)   # см. пояснение в list_tasks(): стабильный порядок страниц
             .offset(skip)
             .limit(limit)
         )
@@ -164,7 +312,15 @@ async def search_tasks(
             select(func.count()).select_from(Task).where(Task.title.ilike(pattern, escape="\\"))
         )).scalar_one()
         tasks = []
-    return tasks, total
+    # Построение TaskResponse явно (не возврат ORM-объектов, как раньше) — иначе
+    # project/project_option_id остались бы None: у Task нет одноимённого атрибута
+    # project (см. Task.project_ref), from_attributes подставил бы дефолт схемы.
+    results = []
+    for task in tasks:
+        r = TaskResponse.model_validate(task)
+        _attach_project_option_id(r, task)
+        results.append(r)
+    return results, total
 
 
 async def get_task(db: AsyncSession, task_id: int) -> TaskResponse:
@@ -181,6 +337,7 @@ async def get_task(db: AsyncSession, task_id: int) -> TaskResponse:
     task, cnt = row
     result = TaskResponse.model_validate(task)
     result.subtask_count = cnt
+    _attach_project_option_id(result, task)
     return result
 
 
@@ -189,7 +346,6 @@ async def update_task(
     user: User,
     task_id: int,
     task_update: TaskUpdate,
-    crm: TaskCRMSync,
 ) -> TaskResponse:
     # FOR NO KEY UPDATE (key_share=True, не FOR UPDATE): блокирует строку задачи на
     # время обновления, но не конфликтует с FOR KEY SHARE, которую PostgreSQL берёт на
@@ -222,8 +378,41 @@ async def update_task(
     # crm_task_id читается до commit — после expire объект недоступен
     crm_task_id = db_task.crm_task_id
 
+    # Резолвинг project — до setattr: невалидный CRM-ID должен дать 422, не
+    # затрагивая db_task (см. _resolve_project). project_crm_id_for_crm сохраняется
+    # отдельно от update_data["project_id"] — CRM получает исходный CRM-ID, БД —
+    # локальный project.id (та же асимметрия, что и в create_task).
+    project_crm_id_for_crm: Optional[str] = None
+    project_row: Optional[Project] = None
+    if "project" in update_data:
+        project_crm_id_for_crm = update_data.pop("project")
+        project_row = await _resolve_project(project_crm_id_for_crm, db)
+        update_data["project_id"] = project_row.id if project_row else None
+
     for key, value in update_data.items():
         setattr(db_task, key, value)
+
+    # Durable outbox — та же схема, что в create_task (см. её докстринг выше):
+    # вставляется в ОДНОЙ транзакции с самим UPDATE, поэтому переживает падение
+    # процесса в любой момент после commit, включая до dispatch_outbox_row ниже.
+    outbox_row: Optional[CrmOutbox] = None
+    if crm_task_id is not None:
+        db_task.sync_status = "pending"   # вернётся в 'synced' после успешного update в воркере
+        outbox_row = CrmOutbox(
+            aggregate_type="task",
+            aggregate_id=task_id,
+            operation="update",
+            shard=ensure_task_shard(db_task),
+            payload={
+                "crm_task_id": crm_task_id,
+                "title": update_data.get("title"),
+                "description": update_data.get("description"),
+                "completed": update_data.get("completed"),
+                "project": project_crm_id_for_crm,
+            },
+        )
+        db.add(outbox_row)
+
     try:
         await db.commit()
     except IntegrityError:
@@ -239,34 +428,33 @@ async def update_task(
         raise HTTPException(status_code=404, detail="Task not found")
     # db.refresh() не нужен — см. пояснение в create_task() выше (expire_on_commit=False).
 
-    crm_synced: Optional[bool] = None
-    if crm_task_id is not None:
-        try:
-            await crm.update_task(
-                task_id=crm_task_id,
-                title=update_data.get("title"),
-                description=update_data.get("description"),
-                completed=update_data.get("completed"),
-            )
-            crm_synced = True
-            logger.info("CRM: task id=%s updated (crm_id=%s)", task_id, crm_task_id)
-        except Exception as exc:
-            crm_synced = False
-            logger.error("CRM update_task failed for task id=%s: %s", task_id, exc)
+    if outbox_row is not None:
+        # CRM-вызов веб-процесс не делает — только диспатч в Celery (см.
+        # dispatch_outbox_row в create_task). Результат клиенту не сообщается
+        # (см. TaskResponse) — статус синхронизации виден только администратору.
+        dispatch_outbox_row(outbox_row)
     else:
-        # Задача не числится в CRM — синхронизация невозможна.
-        # False (не None): фронтенд показывает уведомление при crm_synced === false.
-        crm_synced = False
+        # Задача не числится в CRM — синхронизировать нечего, outbox-строка не создавалась.
         logger.warning("Task id=%s has no crm_task_id — CRM update skipped", task_id)
 
     # task_id в payload: детальная страница задачи (task-detail.js) сравнивает его со своим
     # taskId и перечитывает задачу через loadTask(), если её отредактировал другой пользователь.
+    # actor_id (не exclude_user_id — см. комментарий в create_task выше): task-detail.js
+    # теперь сам различает своё/чужое редактирование по actor_id (см. его WS-обработчик).
     await broadcast_task_event(
         "task_updated", db_task.title,
-        exclude_user_id=user.id, sender_email=user.email, task_id=task_id,
+        sender_email=user.email, task_id=task_id, actor_id=user.id,
     )
     result = TaskResponse.model_validate(db_task)
-    result.crm_synced = crm_synced
+    if "project" in task_update.model_fields_set:
+        # Поле передавалось в запросе — отражаем результат резолвинга явно
+        # (project_ref для db_task в этой же транзакции не подгружен без db.refresh()).
+        result.project = project_row.label if project_row else None
+        result.project_option_id = project_row.crm_id if project_row else None
+    else:
+        # Поле не передавалось — читаем как есть, через уже загруженную связь
+        # (title/description/completed могли поменяться, project — не трогали).
+        _attach_project_option_id(result, db_task)
     return result
 
 
@@ -274,8 +462,6 @@ async def delete_task(
     db: AsyncSession,
     user: User,
     task_id: int,
-    crm: TaskCRMSync,
-    subtask_crm: SubtaskCRMSync,
 ) -> TaskResponse:
     # FOR UPDATE (не FOR NO KEY UPDATE — эта строка будет удалена, а не просто изменена)
     # берётся до чтения subtask_rows: между этим SELECT и db.delete(task)+commit ниже
@@ -322,6 +508,24 @@ async def delete_task(
     subtask_ids: list[int] = [row[0] for row in subtask_rows]
     crm_subtask_ids: list[int] = [row[1] for row in subtask_rows if row[1] is not None]
 
+    # Durable outbox — та же схема, что в create_task/update_task (см. их докстринги
+    # выше): вставляется в ОДНОЙ транзакции с самим удалением задачи, поэтому строка
+    # переживает падение процесса в любой момент после commit. payload несёт весь
+    # снимок, нужный для CRM-очистки (в т.ч. подзадач — см. _do_delete_task в
+    # crm_outbox_tasks.py, обрабатывает и task, и все crm_subtask_ids одной
+    # операцией), — после commit локальной строки task уже нет (CASCADE),
+    # обратиться к ней за crm_task_id/crm_subtask_ids снова нельзя.
+    outbox_row: Optional[CrmOutbox] = None
+    if crm_task_id is not None or crm_subtask_ids:
+        outbox_row = CrmOutbox(
+            aggregate_type="task",
+            aggregate_id=task_id,
+            operation="delete",
+            shard=ensure_task_shard(task),
+            payload={"crm_task_id": crm_task_id, "crm_subtask_ids": crm_subtask_ids},
+        )
+        db.add(outbox_row)
+
     await db.delete(task)
     await db.commit()
 
@@ -333,44 +537,24 @@ async def delete_task(
         for sub_id in subtask_ids:
             await attachments.cleanup(sub_id, attachments.SUBTASK_ATTACHMENTS)
 
-    # Удаляем подзадачи из CRM: CASCADE удалил их в локальной БД,
-    # но CRM не знает об этом — подзадачи (entity_id=30) остались бы orphan-записями.
-    # asyncio.gather: конкурентные запросы к CRM вместо последовательных (N×RTT → 1×RTT).
-    # Не параллелизм — subtask_crm.delete_subtask() это httpx.AsyncClient.post(), чистый
-    # async-I/O без asyncio.to_thread; один поток ОС, конкурентное ожидание сетевых
-    # ответов через event loop, а не выполнение на нескольких потоках/ядрах.
-    if crm_subtask_ids:
-        results = await asyncio.gather(
-            *[subtask_crm.delete_subtask(cid) for cid in crm_subtask_ids],
-            return_exceptions=True,
-        )
-        for cid, result in zip(crm_subtask_ids, results):
-            if isinstance(result, Exception):
-                logger.error("CRM: cascade delete subtask crm_id=%s failed: %s", cid, result)
-            else:
-                logger.info("CRM: subtask crm_id=%s deleted (cascade from task %s)", cid, task_id)
-
-    if crm_task_id is not None:
-        try:
-            await crm.delete_task(crm_task_id)
-            snapshot.crm_synced = True
-            logger.info("CRM: task id=%s deleted (crm_id=%s)", task_id, crm_task_id)
-        except Exception as exc:
-            snapshot.crm_synced = False
-            logger.error(
-                "CRM delete_task failed for task id=%s (crm_id=%s): %s",
-                task_id, crm_task_id, exc,
-            )
+    # CRM-очистка (и задачи, и каскадно удалённых подзадач) — целиком в фоне,
+    # через уже вставленную outbox-строку (см. её payload выше и обработчик
+    # _do_delete_task); веб-процесс сам в CRM не обращается. Результат клиенту
+    # не сообщается (см. TaskResponse) — статус синхронизации виден только администратору.
+    if outbox_row is not None:
+        dispatch_outbox_row(outbox_row)
     else:
-        # Задача не числится в CRM — синхронизация невозможна.
-        # False (не None): фронтенд показывает уведомление при crm_synced === false.
-        snapshot.crm_synced = False
+        # Задача не числится в CRM и не было синхронизированных подзадач —
+        # синхронизировать нечего, outbox-строка не создавалась (см. условие выше).
         logger.warning("Task id=%s has no crm_task_id — CRM delete skipped", task_id)
 
     # task_id в payload: детальная страница удалённой задачи (task-detail.js) сравнивает его
     # со своим taskId и делает автоматический редирект на /task-board, если совпало.
+    # actor_id (не exclude_user_id — см. комментарий в create_task выше): страницы,
+    # слушающие task_deleted (task-detail.js/subtask-board.js), сами различают
+    # своё/чужое удаление по actor_id, где это нужно.
     await broadcast_task_event(
         "task_deleted", snapshot.title,
-        exclude_user_id=user.id, sender_email=user.email, task_id=task_id,
+        sender_email=user.email, task_id=task_id, actor_id=user.id,
     )
     return snapshot

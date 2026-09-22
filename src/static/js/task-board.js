@@ -28,10 +28,6 @@ let currentPage   = 1;
 // Math.max(1, ...) исключает totalPages = 0 при пустом списке задач.
 let totalPages    = 1;
 
-// Ключ для localStorage. Вынесен в константу: опечатку в строке компилятор не поймает,
-// но опечатку в имени переменной — поймает.
-const CHAT_HISTORY_KEY = 'websocket_chat_history';
-
 // escapeHtml, _updateCharCounter, showToast, fetchWithAuth, subtaskLabel — общие функции,
 // вынесены в common.js (подключён в task-board.html до этого скрипта).
 
@@ -58,37 +54,110 @@ document.addEventListener('click', function(e) {
     if (deleteBtn) { deleteTask(parseInt(deleteBtn.dataset.id, 10)); return; }
 });
 
-// ── Chat history ──────────────────────────────────────────────────────────────
+// ── Chat history (Redis List на сервере, GET /chat/history) ────────────────
+// Единственный источник истории — сервер (src/realtime/chat_history.py):
+// общая для всех пользователей и вкладок, переживает перезагрузку страницы
+// и переподключение WS. localStorage не используется вовсе — см.
+// docs/chat_history_redis_list_guide.md.
 
-function saveChatHistory() {
-    const messages = Array.from(messagesDiv.querySelectorAll('.message')).map(el => el.textContent);
-    localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(messages));
+const CHAT_HISTORY_PAGE_SIZE = 50;
+let oldestLoadedChatId = null;    // курсор для подгрузки более старых сообщений — id самого старого отрисованного
+let hasMoreChatHistory  = true;   // false — сервер вернул страницу короче CHAT_HISTORY_PAGE_SIZE, дальше листать некуда
+let isLoadingChatHistory = false; // защита от повторного запроса, пока предыдущий не завершился
+
+// Подпись собственных сообщений и действий в панели — единая для чата, CRUD- и
+// файловых событий, вживую и в восстановленной истории.
+const SELF_LABEL = 'You';
+
+// Своя ли запись. Чат-сообщения несут is_own (его для каждого получателя
+// выставляет сервер — ConnectionManager._deliver_local для живой рассылки и
+// GET /chat/history для истории; внутренний id отправителя клиенту не
+// отдаётся). События действий несут actor_id (его же используют страницы
+// деталей, см. task-detail.js) — сравниваем с id текущего пользователя.
+// Работает одинаково во всех вкладках одного пользователя.
+function isOwnEntry(data) {
+    if (data.is_own !== undefined) return data.is_own === true;
+    return data.actor_id !== undefined && String(data.actor_id) === userId;
 }
 
-function loadChatHistory() {
-    try {
-        const saved = localStorage.getItem(CHAT_HISTORY_KEY);
-        if (saved) {
-            JSON.parse(saved).forEach(msg => {
-                const el = document.createElement('div');
-                el.className = 'message';
-                el.textContent = msg;
-                messagesDiv.appendChild(el);
-            });
-            // scrollTop = scrollHeight прокручивает к последнему сообщению.
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
-        }
-    } catch (e) {
-        // Если localStorage содержит невалидный JSON (ручная правка, битые данные),
-        // очищаем его и начинаем с чистого листа вместо падения в цикле.
-        localStorage.removeItem(CHAT_HISTORY_KEY);
+// Строит текст одной записи панели — общая логика для живых WS-событий
+// (MESSAGE_HANDLERS ниже) И для восстановленной из Redis истории
+// (loadInitialChatHistory/loadOlderChatHistory) — один и тот же вид что при
+// первом получении, что после перезагрузки страницы: "You: ..." для своих,
+// "email: ..." для чужих.
+function buildEventMessage(data) {
+    const who = isOwnEntry(data) ? SELF_LABEL : data.sender;
+    const filesVerb = data.action === 'deleted' ? 'Удалены файлы у' : 'Добавлены файлы к';
+    switch (data.type) {
+        case 'chat':            return `${who}: ${data.text}`;
+        case 'task_created':    return `${who}: Создана задача: ${data.title}`;
+        case 'task_updated':    return `${who}: Обновлена задача: ${data.title}`;
+        case 'task_deleted':    return `${who}: Удалена задача: ${data.title}`;
+        case 'task_files_updated':
+            return `${who}: ${filesVerb} ${data.action === 'deleted' ? 'задачи' : 'задаче'} «${data.title}»`;
+        case 'subtask_created': return `${who}: Создана подзадача «${data.title}» [${data.task_title}]`;
+        case 'subtask_updated': return `${who}: Обновлена подзадача «${data.title}» [${data.task_title}]`;
+        case 'subtask_deleted': return `${who}: Удалена подзадача «${data.title}» [${data.task_title}]`;
+        case 'subtask_files_updated':
+            return `${who}: ${filesVerb} ${data.action === 'deleted' ? 'подзадачи' : 'подзадаче'} «${data.title}» [${data.task_title}]`;
+        default: return null;   // неизвестный тип — не должен сюда попасть
     }
 }
 
-function clearChatHistory() {
-    localStorage.removeItem(CHAT_HISTORY_KEY);
-    messagesDiv.innerHTML = '';
+function renderChatMessage(entry, prepend) {
+    const text = buildEventMessage(entry);
+    if (text === null) return;
+    const el = document.createElement('div');
+    el.className = 'message';
+    el.textContent = text;
+    if (prepend) {
+        messagesDiv.insertBefore(el, messagesDiv.firstChild);
+    } else {
+        messagesDiv.appendChild(el);
+    }
 }
+
+async function loadInitialChatHistory() {
+    // Вызывается один раз при загрузке страницы (см. блок Init ниже) — НЕ из
+    // socket.onopen: в отличие от loadTasks(currentPage), которая должна
+    // повторяться при каждом реконнекте, повторный вызов этой функции
+    // добавил бы дубликаты сообщений в начало уже заполненного #messages.
+    const response = await fetchWithAuth(`/chat/history?limit=${CHAT_HISTORY_PAGE_SIZE}`);
+    if (!response || !response.ok) return;
+    const rows = await response.json();
+    rows.forEach(entry => renderChatMessage(entry, false));
+    if (rows.length > 0) oldestLoadedChatId = rows[0].id;
+    hasMoreChatHistory = rows.length === CHAT_HISTORY_PAGE_SIZE;
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+async function loadOlderChatHistory() {
+    if (isLoadingChatHistory || !hasMoreChatHistory || oldestLoadedChatId === null) return;
+    isLoadingChatHistory = true;
+    try {
+        const response = await fetchWithAuth(
+            `/chat/history?before_id=${oldestLoadedChatId}&limit=${CHAT_HISTORY_PAGE_SIZE}`
+        );
+        if (!response || !response.ok) return;
+        const rows = await response.json();
+        // Сообщения вставляются В НАЧАЛО — scrollHeight контейнера вырастет;
+        // без компенсации ниже браузер визуально "дёрнул" бы видимую область
+        // вниз на высоту вставки в момент подгрузки.
+        const scrollHeightBefore = messagesDiv.scrollHeight;
+        rows.forEach(entry => renderChatMessage(entry, true));
+        messagesDiv.scrollTop += messagesDiv.scrollHeight - scrollHeightBefore;
+        if (rows.length > 0) oldestLoadedChatId = rows[0].id;
+        hasMoreChatHistory = rows.length === CHAT_HISTORY_PAGE_SIZE;
+    } finally {
+        isLoadingChatHistory = false;
+    }
+}
+
+// Порог 20px, не строго scrollTop === 0 — пользователь обычно не докручивает
+// ровно до пикселя перед тем, как продолжить листать дальше вверх.
+messagesDiv.addEventListener('scroll', () => {
+    if (messagesDiv.scrollTop <= 20) loadOlderChatHistory();
+});
 
 function addMessage(message) {
     const el = document.createElement('div');
@@ -96,16 +165,16 @@ function addMessage(message) {
     el.textContent = message;
     messagesDiv.appendChild(el);
     messagesDiv.scrollTop = messagesDiv.scrollHeight;
-    saveChatHistory();
 }
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
 
-// selfOrOther: общий паттерн для событий, где текст сообщения зависит от того,
-// кто их инициировал — сам текущий пользователь (actor) или кто-то другой.
-// Раньше был отдельный if/else с этой же проверкой в каждой из 5 веток обработчика.
-function selfOrOther(data, selfMsg, otherMsg) {
-    addMessage(String(data.actor_id) === userId ? selfMsg : otherMsg);
+// Живая запись панели: рисуется как и историческая (renderChatMessage) и
+// прокручивает панель вниз — собственное сообщение автора теперь тоже
+// приходит эхом с сервера, а не рисуется сразу.
+function renderLiveMessage(data) {
+    renderChatMessage(data, false);
+    messagesDiv.scrollTop = messagesDiv.scrollHeight;
 }
 
 // Диспетчер по data.type — замена цепочки if/else if. Объект-поиск по ключу
@@ -113,62 +182,46 @@ function selfOrOther(data, selfMsg, otherMsg) {
 // и делает добавление нового типа события локальным изменением (один новый ключ),
 // а не правкой середины длинной цепочки условий.
 const MESSAGE_HANDLERS = {
-    chat: (data) => addMessage(`${data.sender}: ${data.text}`),
+    // renderChatMessage — единая функция рендера и для живых WS-событий, и
+    // для восстановленной истории (buildEventMessage внутри неё); персистируются
+    // "chat" и 6 CRUD-типов ниже (src/realtime/events.py::_PERSISTED_EVENT_TYPES) —
+    // переживают перезагрузку страницы, см. docs/chat_history_redis_list_guide.md.
+    chat: (data) => renderLiveMessage(data),
 
     task_created: (data) => {
-        addMessage(`${data.sender}: Создана задача: ${data.title}`);
+        renderLiveMessage(data);
         // При событиях от других пользователей перезагружаем текущую страницу,
         // а не страницу 1: пользователь не теряет своё местоположение в списке.
         loadTasks(currentPage);
     },
     task_updated: (data) => {
-        addMessage(`${data.sender}: Обновлена задача: ${data.title}`);
+        renderLiveMessage(data);
         loadTasks(currentPage);
     },
     task_deleted: (data) => {
-        addMessage(`${data.sender}: Удалена задача: ${data.title}`);
+        renderLiveMessage(data);
         loadTasks(currentPage);
     },
 
     subtask_created: (data) => {
-        selfOrOther(data,
-            `Subtask for task '${data.task_title}' created: '${data.title}'`,
-            `${data.sender}: Создана подзадача «${data.title}» [${data.task_title}]`);
+        renderLiveMessage(data);
         loadTasks(currentPage);
     },
     subtask_updated: (data) => {
-        selfOrOther(data,
-            `Subtask for task '${data.task_title}' updated: '${data.title}'`,
-            `${data.sender}: Обновлена подзадача «${data.title}» [${data.task_title}]`);
+        renderLiveMessage(data);
         loadTasks(currentPage);
     },
     subtask_deleted: (data) => {
-        selfOrOther(data,
-            `Subtask for task '${data.task_title}' deleted: '${data.title}'`,
-            `${data.sender}: Удалена подзадача «${data.title}» [${data.task_title}]`);
+        renderLiveMessage(data);
         loadTasks(currentPage);
     },
 
-    // Список задач не показывает файлы — loadTasks() здесь не нужен ни в одном из двух
-    // обработчиков ниже, событие влияет только на открытую страницу деталей (task-detail.js).
-    task_files_updated: (data) => {
-        selfOrOther(data,
-            data.action === 'deleted'
-                ? `Files removed from task "${data.title}"`
-                : `Files added to task "${data.title}"`,
-            data.action === 'deleted'
-                ? `${data.sender}: Удалены файлы у задачи «${data.title}»`
-                : `${data.sender}: Добавлены файлы к задаче «${data.title}»`);
-    },
-    subtask_files_updated: (data) => {
-        selfOrOther(data,
-            data.action === 'deleted'
-                ? `Files removed from subtask "${data.title}" [${data.task_title}]`
-                : `Files added to subtask "${data.title}" [${data.task_title}]`,
-            data.action === 'deleted'
-                ? `${data.sender}: Удалены файлы у подзадачи «${data.title}» [${data.task_title}]`
-                : `${data.sender}: Добавлены файлы к подзадаче «${data.title}» [${data.task_title}]`);
-    },
+    // Файловые события — такие же записи чата, как и остальные действия
+    // ("You: ..." / "email: ..."), персистируются в истории. Список задач не
+    // показывает файлы — loadTasks() здесь не нужен: событие влияет только на
+    // открытые страницы деталей (task-detail.js/subtask-detail.js).
+    task_files_updated: (data) => renderLiveMessage(data),
+    subtask_files_updated: (data) => renderLiveMessage(data),
 };
 
 function connectWebSocket() {
@@ -232,7 +285,9 @@ function sendMessage() {
     const message = messageInput.value.trim();
     if (message && socket && socket.readyState === WebSocket.OPEN) {
         socket.send(message);
-        addMessage('You: ' + message);
+        // Своё сообщение здесь НЕ рисуется: сервер рассылает его всем, включая
+        // отправителя и все его вкладки (с is_own=true), и оно появится как
+        // «You: ...» по эху — единый путь для всех вкладок автора.
         messageInput.value = '';
     } else if (!message) {
         alert('Please enter a message');
@@ -245,74 +300,245 @@ function sendMessage() {
 
 // ── Modal ─────────────────────────────────────────────────────────────────────
 
+// Снимок полей editModal на момент открытия — editTitle/editDescription/editCompleted
+// изначально ПРЕДЗАПОЛНЕНЫ данными редактируемой задачи (не пусты), поэтому здесь
+// нельзя использовать hasUnsavedFormData (проверка "пусто/не пусто"); нужен именно
+// снимок + сравнение с текущим состоянием на момент закрытия.
+let _editModalSnapshot = null;
+
+function _readEditModalFields() {
+    return {
+        title: document.getElementById('editTitle').value,
+        description: document.getElementById('editDescription').value,
+        project: document.getElementById('editProject').value,
+        completed: document.getElementById('editCompleted').checked,
+    };
+}
+
+function _editModalHasUnsavedChanges() {
+    if (!_editModalSnapshot) return false;
+    const current = _readEditModalFields();
+    return current.title !== _editModalSnapshot.title
+        || current.description !== _editModalSnapshot.description
+        || current.project !== _editModalSnapshot.project
+        || current.completed !== _editModalSnapshot.completed;
+}
+
+registerModalCloseGuard(
+    'editModal', _editModalHasUnsavedChanges,
+    'Отменить редактирование? Несохранённые данные будут потеряны.',
+);
+
 function openEditModal(id) {
     // Поиск в кэше currentTasks: избегает дополнительного GET-запроса при открытии модала.
+    // task.project_option_id (не task.project — та же лейбл-строка, а не CRM-ID) —
+    // именно поэтому list_tasks/search_tasks обязаны отдавать это поле, не только
+    // get_task (см. src/services/tasks.py::_attach_project_option_id).
     const task = currentTasks.find(t => t.id === id);
     if (!task) { alert('Task not found'); return; }
     document.getElementById('editTaskId').value = id;
     const editTitleEl = document.getElementById('editTitle');
     editTitleEl.value = task.title;
     document.getElementById('editDescription').value = task.description;
+    document.getElementById('editProject').value = task.project_option_id || '';
     document.getElementById('editCompleted').checked = task.completed;
     _updateCharCounter(editTitleEl, document.getElementById('editTitleCounter'), TITLE_MAX_LENGTH);
-    document.getElementById('editModal').style.display = 'flex';
+    _editModalSnapshot = _readEditModalFields();
+    openModal('editModal');
 }
 
 function closeEditModal() {
-    document.getElementById('editModal').style.display = 'none';
+    closeModal('editModal');
 }
 
 async function submitEdit() {
     const id          = parseInt(document.getElementById('editTaskId').value, 10);
     const title       = document.getElementById('editTitle').value.trim();
     const description = document.getElementById('editDescription').value;
+    const project      = document.getElementById('editProject').value;
     const completed   = document.getElementById('editCompleted').checked;
     if (!title) { alert('Title cannot be empty'); return; }
+    // Прямой closeEditModal(), не requestCloseModal: сохранение — осознанное действие,
+    // подтверждение не нужно (см. общий принцип в common.js::requestCloseModal).
     closeEditModal();
-    await updateTask(id, title, description, completed);
+    await updateTask(id, title, description, completed, project);
 }
 
-// Клик вне модального окна (на затемнённый оверлей) — закрывает окно.
+// Клик вне модального окна (на затемнённый оверлей) — запрашивает закрытие через guard.
 document.getElementById('editModal').addEventListener('click', function(e) {
-    if (e.target === this) closeEditModal();
+    if (e.target === this) requestCloseModal('editModal');
 });
 
 // ── Task CRUD ─────────────────────────────────────────────────────────────────
 
-document.getElementById('createTaskForm').addEventListener('submit', async function(e) {
-    e.preventDefault();
-    const title       = document.getElementById('title').value;
-    const description = document.getElementById('description').value;
+// ── Create task modal (атомарное создание задачи + файлов одним запросом) ──────
+
+// Файлы, выбранные в модалке, но ещё не отправленные на сервер — отправляются
+// одним запросом вместе с текстовыми полями при клике на "Создать", а не сразу
+// при выборе (в отличие от specInput/otherInput на task-detail.html, которые
+// оперируют уже существующей задачей и грузят файл немедленно).
+let createPendingSpecFile = null;
+let createPendingOtherFiles = [];
+
+// createSpecInput — обычный input[type=file], его выбранный файл уже виден
+// hasUnsavedFormData() через сам DOM-элемент. createOtherInput — не виден: его
+// value сбрасывается сразу после выбора (см. обработчик change ниже), а сами файлы
+// живут в отдельном JS-массиве createPendingOtherFiles — общий чекер формы этого
+// не увидит, поэтому очередь проверяется здесь отдельно, явно.
+registerModalCloseGuard(
+    'createTaskModal',
+    // createProject — <select>, hasUnsavedFormData() его не проверяет (общий чекер
+    // смотрит только на input[type=text]/textarea/input[type=file]) — выбранный
+    // проект без единого другого изменения иначе не считался бы "есть что терять".
+    () => hasUnsavedFormData(document.getElementById('createTaskModal'))
+        || createPendingOtherFiles.length > 0
+        || document.getElementById('createProject').value !== '',
+    'Отменить создание? Несохранённые данные будут потеряны.',
+);
+
+function _resetCreateTaskModal() {
+    document.getElementById('createTitle').value = '';
+    document.getElementById('createDescription').value = '';
+    document.getElementById('createProject').value = '';
+    _updateCharCounter(
+        document.getElementById('createTitle'),
+        document.getElementById('createTitleCounter'),
+        TITLE_MAX_LENGTH,
+    );
+    createPendingSpecFile = null;
+    createPendingOtherFiles = [];
+    document.getElementById('createSpecInput').value = '';
+    document.getElementById('createOtherInput').value = '';
+    _renderCreateSpecPending();
+    _renderCreateOtherPending();
+}
+
+function openCreateTaskModal() {
+    _resetCreateTaskModal();
+    openModal('createTaskModal');
+}
+
+function _renderCreateSpecPending() {
+    const row = document.getElementById('createSpecPendingRow');
+    const name = document.getElementById('createSpecPendingName');
+    if (createPendingSpecFile) {
+        name.textContent = createPendingSpecFile.name;
+        row.style.display = 'flex';
+    } else {
+        row.style.display = 'none';
+    }
+}
+
+function _renderCreateOtherPending() {
+    const list = document.getElementById('createOtherPendingList');
+    const counter = document.getElementById('createOtherCount');
+    counter.textContent = `(${createPendingOtherFiles.length} / ${MAX_OTHER_FILES})`;
+    list.innerHTML = '';
+    createPendingOtherFiles.forEach((file, index) => {
+        const li = document.createElement('li');
+        li.innerHTML = `
+            <span class="file-pending-name">${escapeHtml(file.name)}</span>
+            <button class="btn-delete-file" data-remove-pending="${index}">✕</button>
+        `;
+        list.appendChild(li);
+    });
+}
+
+// validateOtherFileClientSide — то же правило, что и на task-detail.js (расширение +
+// размер, до отправки на сервер): дублируется здесь, а не выносится в common.js,
+// т.к. там же не вынесено на момент этой доработки (не расширяем область правки).
+function _validateOtherFileClientSide(file) {
+    const dotIndex = file.name.lastIndexOf('.');
+    const ext = dotIndex >= 0 ? file.name.slice(dotIndex).toLowerCase() : '';
+    const allowed = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.jpg', '.jpeg', '.png', '.txt'];
+    if (!allowed.includes(ext)) return `расширение «${ext || '(нет)'}» не поддерживается`;
+    if (file.size > OTHER_FILES_MAX_SIZE) return `размер превышает лимит ${OTHER_FILES_MAX_SIZE / (1024 * 1024)} МБ`;
+    return null;
+}
+
+document.getElementById('openCreateTaskModalBtn').addEventListener('click', openCreateTaskModal);
+document.getElementById('createTaskCancelBtn').addEventListener('click', function() { requestCloseModal('createTaskModal'); });
+document.getElementById('createTaskModal').addEventListener('click', function(e) {
+    if (e.target === this) requestCloseModal('createTaskModal');
+});
+
+document.getElementById('createSpecInput').addEventListener('change', function(e) {
+    createPendingSpecFile = e.target.files[0] || null;
+    _renderCreateSpecPending();
+});
+
+document.getElementById('createSpecRemoveBtn').addEventListener('click', function() {
+    createPendingSpecFile = null;
+    document.getElementById('createSpecInput').value = '';
+    _renderCreateSpecPending();
+});
+
+document.getElementById('createOtherInput').addEventListener('change', function(e) {
+    const chosen = Array.from(e.target.files);
+    e.target.value = ''; // диалог можно открыть заново без потери уже выбранных файлов
+    for (const file of chosen) {
+        const err = _validateOtherFileClientSide(file);
+        if (err) { showToast(`«${file.name}»: ${err}`, 'warning'); continue; }
+        if (createPendingOtherFiles.length >= MAX_OTHER_FILES) {
+            showToast(`Превышен лимит файлов (${MAX_OTHER_FILES} штук)`, 'warning');
+            break;
+        }
+        createPendingOtherFiles.push(file);
+    }
+    _renderCreateOtherPending();
+});
+
+document.getElementById('createOtherPendingList').addEventListener('click', function(e) {
+    const btn = e.target.closest('[data-remove-pending]');
+    if (!btn) return;
+    createPendingOtherFiles.splice(parseInt(btn.dataset.removePending, 10), 1);
+    _renderCreateOtherPending();
+});
+
+document.getElementById('createTaskSubmitBtn').addEventListener('click', async function() {
+    const title = document.getElementById('createTitle').value;
+    const description = document.getElementById('createDescription').value;
+    const project = document.getElementById('createProject').value;
+
+    const fd = new FormData();
+    // project || null: пустая строка ("— не выбран —") превращается в null, а не
+    // отправляется как "" — на create "" резолвилась бы иначе, чем "не выбрано"
+    // (см. src/services/tasks.py::_resolve_project — "" зарезервирована для явной
+    // очистки при PATCH, здесь такого смысла нет, т.к. задача только создаётся).
+    fd.append('data', JSON.stringify({ title, description, project: project || null }));
+    if (createPendingSpecFile) fd.append('specification', createPendingSpecFile);
+    for (const file of createPendingOtherFiles) fd.append('other_files', file);
 
     try {
-        const response = await fetchWithAuth('/create-task/', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title, description }),
-        });
+        // Content-Type не выставляется вручную — браузер сам проставит multipart
+        // boundary при теле FormData; явный 'application/json' здесь сломал бы запрос.
+        const response = await fetchWithAuth('/create-task/', { method: 'POST', body: fd });
         if (!response) return;
 
         if (response.ok) {
             const task = await response.json();
-            if (task.crm_synced === false) {
-                showToast('Задача создана без синхронизации с CRM', 'warning');
+            if (task.file_upload_errors) {
+                for (const [name, msg] of Object.entries(task.file_upload_errors)) {
+                    showToast(`«${name}»: ${msg}`, 'warning');
+                }
             }
-            addMessage(`Task created: ${task.title}`);
-            document.getElementById('createTaskForm').reset();
+            // Сообщение "Вы: Создана задача: ..." теперь приходит через сам живой
+            // WS-broadcast (task_created больше не исключает актора, см.
+            // services/tasks.py::create_task) — отдельное локальное эхо здесь
+            // убрано, чтобы не дублировать одно и то же сообщение дважды.
+            closeModal('createTaskModal'); // без confirm — данные уже успешно отправлены
             loadTasks();
-        } else if (response.status === 422) {
+        } else {
             const error = await response.json();
             const msg = Array.isArray(error.detail)
                 ? error.detail.map(e => e.msg).join('; ')
-                : (error.detail || 'Ошибка валидации');
-            alert(`Ошибка валидации: ${msg}`);
-        } else {
-            const error = await response.json();
-            alert(`Error creating task: ${error.detail}`);
+                : (error.detail || 'Ошибка создания задачи');
+            // Модалка остаётся открытой: пользователь не теряет введённые данные/файлы.
+            showToast(msg, 'warning');
         }
     } catch (error) {
         console.error('Error:', error);
-        alert('Failed to create task');
+        showToast('Не удалось создать задачу', 'warning');
     }
 });
 
@@ -361,12 +587,10 @@ function displaySearchResults(tasks) {
     tasks.forEach(task => {
         const taskItem = document.createElement('li');
         taskItem.className = `task-item ${task.completed ? 'completed' : ''}`;
-        const crmBadge = task.crm_task_id == null
-            ? '<span class="crm-badge">Отсутствует в CRM</span>'
-            : '';
         const countBadge = task.subtask_count != null
             ? `<span class="subtask-count">${subtaskLabel(task.subtask_count)}</span>`
             : '';
+        const syncBadge = syncStatusTag(task.sync_status);
         // Описание обрезается до 20 символов. escapeHtml применяется к фрагменту:
         // HTML-сущности (например, &amp;) длиннее одного символа, поэтому обрезать
         // надо до экранирования, иначе сущность может разорваться посередине.
@@ -377,8 +601,8 @@ function displaySearchResults(tasks) {
             <div class="task-header">
                 <div class="task-title-row">
                     <div class="task-title">${escapeHtml(task.title)}</div>
-                    ${crmBadge}
                     ${countBadge}
+                    ${syncBadge}
                 </div>
                 <span class="task-status ${task.completed ? 'status-completed' : 'status-pending'}">
                     ${task.completed ? 'Выполнено' : 'В работе'}
@@ -398,7 +622,11 @@ function displaySearchResults(tasks) {
     container.appendChild(resultList);
 }
 
-async function loadTasks(page = 1) {
+// Автообновление, пока у какой-либо задачи sync_status = 'pending' (см. createSyncPoller
+// в common.js). isPoll — вызов из самого опроса: ошибки в нём не показываются alert'ом.
+const syncPoller = createSyncPoller(() => loadTasks(currentPage, true));
+
+async function loadTasks(page = 1, isPoll = false) {
     currentPage = page;
     // skip — SQL OFFSET: сколько строк пропустить с начала таблицы.
     // Формула (page - 1) * TASKS_PAGE_SIZE переводит номер страницы (с 1) в смещение (с 0):
@@ -424,13 +652,14 @@ async function loadTasks(page = 1) {
             totalPages = Math.max(1, Math.ceil(total / TASKS_PAGE_SIZE));
             displayTasks(tasks);
             updatePagination();
-        } else {
+            syncPoller(tasks, isPoll);
+        } else if (!isPoll) {
             const error = await response.json();
             alert(`Error loading tasks: ${error.detail}`);
         }
     } catch (error) {
         console.error('Error:', error);
-        alert('Failed to load tasks');
+        if (!isPoll) alert('Failed to load tasks');
     }
 }
 
@@ -452,11 +681,12 @@ function displayTasks(tasks) {
     tasks.forEach(task => {
         const taskItem = document.createElement('li');
         taskItem.className = `task-item ${task.completed ? 'completed' : ''}`;
-        const crmBadge = task.crm_task_id == null
-            ? '<span class="crm-badge">Отсутствует в CRM</span>'
-            : '';
         const countBadge = task.subtask_count != null
             ? `<span class="subtask-count">${subtaskLabel(task.subtask_count)}</span>`
+            : '';
+        const syncBadge = syncStatusTag(task.sync_status);
+        const projectBadge = task.project
+            ? `<span class="subtask-count">${escapeHtml(task.project)}</span>`
             : '';
         const shortDesc = task.description.length > 20
             ? escapeHtml(task.description.slice(0, 20)) + '…'
@@ -465,8 +695,9 @@ function displayTasks(tasks) {
             <div class="task-header">
                 <div class="task-title-row">
                     <div class="task-title">${escapeHtml(task.title)}</div>
-                    ${crmBadge}
                     ${countBadge}
+                    ${syncBadge}
+                    ${projectBadge}
                 </div>
                 <span class="task-status ${task.completed ? 'status-completed' : 'status-pending'}">
                     ${task.completed ? 'Выполнено' : 'В работе'}
@@ -506,21 +737,18 @@ function updatePagination() {
     }
 }
 
-async function updateTask(id, title, description, completed) {
+async function updateTask(id, title, description, completed, project) {
     try {
         const response = await fetchWithAuth(`/tasks/${id}`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title, description, completed }),
+            body: JSON.stringify({ title, description, completed, project }),
         });
         if (!response) return;
 
         if (response.ok) {
-            const task = await response.json();
-            if (task.crm_synced === false) {
-                showToast('Задача обновлена без синхронизации с CRM', 'warning');
-            }
-            addMessage(`Task updated: ${task.title}`);
+            // "Вы: Обновлена задача: ..." приходит через живой WS-broadcast
+            // (task_updated актора больше не исключает) — см. createTaskSubmitBtn выше.
             loadTasks(currentPage);
             // Если в момент редактирования активен поиск — обновляем и его результаты.
             const searchInput = document.getElementById('taskTitleSearchInput');
@@ -549,11 +777,9 @@ async function deleteTask(id) {
         if (!response) return;
 
         if (response.ok) {
-            const task = await response.json();
-            if (task.crm_synced === false) {
-                showToast('Задача удалена без синхронизации с CRM', 'warning');
-            }
-            addMessage(`Task deleted: ${task.title}`);
+            // "Вы: Удалена задача: ..." приходит через живой WS-broadcast
+            // (task_deleted актора больше не исключает) — см. createTaskSubmitBtn выше.
+            //
             // currentTasks.length === 1: на странице была ровно одна запись — та, которую удалили.
             // Проверяем ДО loadTasks(), пока массив ещё содержит этот объект.
             // После перезагрузки страница была бы пустой; вместо этого переходим на предыдущую.
@@ -575,29 +801,48 @@ async function deleteTask(id) {
     }
 }
 
+// Уведомление после серверного редиректа с 404-страницы задачи/подзадачи
+// (src/errors_handlers.py): ?notice=<ключ>. Тексты живут здесь, в URL — только ключ.
+const REDIRECT_NOTICES = {
+    task_not_found: 'Задача не найдена — возможно, она была удалена',
+    subtask_not_found: 'Подзадача не найдена — возможно, она была удалена',
+    not_found: 'Страница не найдена — возможно, запись была удалена',
+};
+
+function showRedirectNotice() {
+    const params = new URLSearchParams(window.location.search);
+    const message = REDIRECT_NOTICES[params.get('notice')];
+    if (!message) return;
+    showToast(message, 'warning');
+    // Убираем параметр из адресной строки — иначе тост повторится при перезагрузке.
+    params.delete('notice');
+    const query = params.toString();
+    history.replaceState(null, '', window.location.pathname + (query ? `?${query}` : ''));
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 window.addEventListener('load', function() {
     // 'load' (не 'DOMContentLoaded') гарантирует полную загрузку страницы,
     // включая CSS и изображения; все getElementById вернут не null.
-    loadChatHistory();
+    showRedirectNotice();
+    loadInitialChatHistory();
     // connectWebSocket вызывает loadTasks(1) в обработчике socket.onopen.
     // Если WS не подключится, список задач не загрузится — намеренно:
     // без WS real-time обновления не работают, UI был бы частично функционален.
     connectWebSocket();
 
     document.getElementById('sendBtn').addEventListener('click', sendMessage);
-    document.getElementById('clearHistoryBtn').addEventListener('click', clearChatHistory);
     document.getElementById('searchBtn').addEventListener('click', searchTasksByTitle);
     document.getElementById('saveEditBtn').addEventListener('click', submitEdit);
-    document.getElementById('cancelEditBtn').addEventListener('click', closeEditModal);
+    document.getElementById('cancelEditBtn').addEventListener('click', function() { requestCloseModal('editModal'); });
 
-    const titleInput     = document.getElementById('title');
-    const titleCounter   = document.getElementById('titleCounter');
-    const editTitleInput = document.getElementById('editTitle');
-    const editCounter    = document.getElementById('editTitleCounter');
+    const createTitleInput = document.getElementById('createTitle');
+    const createCounter    = document.getElementById('createTitleCounter');
+    const editTitleInput   = document.getElementById('editTitle');
+    const editCounter      = document.getElementById('editTitleCounter');
 
-    titleInput.addEventListener('input', () => _updateCharCounter(titleInput, titleCounter, TITLE_MAX_LENGTH));
+    createTitleInput.addEventListener('input', () => _updateCharCounter(createTitleInput, createCounter, TITLE_MAX_LENGTH));
     editTitleInput.addEventListener('input', () => _updateCharCounter(editTitleInput, editCounter, TITLE_MAX_LENGTH));
 
     document.getElementById('messageInput').addEventListener('keypress', function(event) {
@@ -606,8 +851,4 @@ window.addEventListener('load', function() {
     document.getElementById('taskTitleSearchInput').addEventListener('keypress', function(event) {
         if (event.key === 'Enter') searchTasksByTitle();
     });
-
-    // beforeunload: последний момент перед уходом со страницы.
-    // Сохраняем историю чата синхронно — async-операции здесь не успевают выполниться.
-    window.addEventListener('beforeunload', saveChatHistory);
 });

@@ -48,6 +48,31 @@ document.addEventListener('click', function(e) {
     if (deleteBtn) { deleteSubtask(parseInt(deleteBtn.dataset.id, 10)); return; }
 });
 
+// Снимок полей editModal на момент открытия — см. пояснение к аналогичному коду
+// в task-board.js (поля предзаполнены, поэтому нужен снимок, а не hasUnsavedFormData).
+let _editModalSnapshot = null;
+
+function _readEditModalFields() {
+    return {
+        title: document.getElementById('editTitle').value,
+        description: document.getElementById('editDescription').value,
+        completed: document.getElementById('editCompleted').checked,
+    };
+}
+
+function _editModalHasUnsavedChanges() {
+    if (!_editModalSnapshot) return false;
+    const current = _readEditModalFields();
+    return current.title !== _editModalSnapshot.title
+        || current.description !== _editModalSnapshot.description
+        || current.completed !== _editModalSnapshot.completed;
+}
+
+registerModalCloseGuard(
+    'editModal', _editModalHasUnsavedChanges,
+    'Отменить редактирование? Несохранённые данные будут потеряны.',
+);
+
 function openEditModal(id) {
     // Данные берём из currentSubtasks (кэш текущей страницы), не из DOM и не из GET.
     // Это позволяет избежать лишнего сетевого запроса при открытии модального окна.
@@ -59,11 +84,12 @@ function openEditModal(id) {
     document.getElementById('editDescription').value = s.description;
     document.getElementById('editCompleted').checked = s.completed;
     _updateCharCounter(titleEl, document.getElementById('editTitleCounter'), TITLE_MAX_LENGTH);
-    document.getElementById('editModal').style.display = 'flex';
+    _editModalSnapshot = _readEditModalFields();
+    openModal('editModal');
 }
 
 function closeEditModal() {
-    document.getElementById('editModal').style.display = 'none';
+    closeModal('editModal');
 }
 
 async function submitEdit() {
@@ -72,17 +98,22 @@ async function submitEdit() {
     const description = document.getElementById('editDescription').value;
     const completed   = document.getElementById('editCompleted').checked;
     if (!title) { alert('Название не может быть пустым'); return; }
+    // Прямой closeEditModal(), не requestCloseModal: сохранение — осознанное действие.
     closeEditModal();
     await updateSubtask(id, title, description, completed);
 }
 
-// Клик вне модального окна (на затемнённый оверлей) — закрывает окно.
+// Клик вне модального окна (на затемнённый оверлей) — запрашивает закрытие через guard.
 // e.target === this: клик именно на оверлее, не на дочернем элементе (форме).
 document.getElementById('editModal').addEventListener('click', function(e) {
-    if (e.target === this) closeEditModal();
+    if (e.target === this) requestCloseModal('editModal');
 });
 
-async function loadSubtasks(page = 1) {
+// Автообновление, пока у какой-либо подзадачи sync_status = 'pending' (см. createSyncPoller
+// в common.js). isPoll — вызов из самого опроса: ошибки в нём не показываются alert'ом.
+const syncPoller = createSyncPoller(() => loadSubtasks(currentPage, true));
+
+async function loadSubtasks(page = 1, isPoll = false) {
     currentPage = page;
     // skip — SQL OFFSET; переводим номер страницы (с 1) в смещение строк (с 0).
     // page=1 → skip=0  (первые 5 строк таблицы: OFFSET 0 LIMIT 5)
@@ -105,12 +136,13 @@ async function loadSubtasks(page = 1) {
             totalPages = Math.max(1, Math.ceil(total / SUBTASKS_PAGE_SIZE));
             displaySubtasks(subtasks);
             updatePagination();
-        } else {
+            syncPoller(subtasks, isPoll);
+        } else if (!isPoll) {
             const err = await resp.json();
             alert(`Ошибка загрузки: ${err.detail}`);
         }
     } catch (e) {
-        alert('Не удалось загрузить подзадачи');
+        if (!isPoll) alert('Не удалось загрузить подзадачи');
     }
 }
 
@@ -126,9 +158,6 @@ function displaySubtasks(subtasks) {
     subtasks.forEach(s => {
         const li = document.createElement('li');
         li.className = `task-item ${s.completed ? 'completed' : ''}`;
-        const crmBadge = s.crm_subtask_id == null
-            ? '<span class="crm-badge">Отсутствует в CRM</span>'
-            : '';
         // Описание обрезается до 20 символов для компактности карточки.
         // slice(0, 20) не мутирует строку; '…' — типографское многоточие (U+2026), не три точки.
         // escapeHtml применяется к обрезанному фрагменту, а не к исходной строке:
@@ -140,7 +169,7 @@ function displaySubtasks(subtasks) {
             <div class="task-header">
                 <div class="task-title-row">
                     <div class="task-title">${escapeHtml(s.title)}</div>
-                    ${crmBadge}
+                    ${syncStatusTag(s.sync_status)}
                 </div>
                 <span class="task-status ${s.completed ? 'status-completed' : 'status-pending'}">
                     ${s.completed ? 'Выполнена' : 'В работе'}
@@ -174,39 +203,153 @@ function updatePagination() {
     }
 }
 
-document.getElementById('createSubtaskForm').addEventListener('submit', async function(e) {
-    e.preventDefault();
-    const title       = document.getElementById('title').value;
-    const description = document.getElementById('description').value;
+// ── Create subtask modal (атомарное создание подзадачи + файлов одним запросом) ─
+
+// См. подробные комментарии к аналогичной логике в task-board.js — здесь та же
+// схема (staging файлов на клиенте, единственный multipart-запрос на submit),
+// адаптированная под подзадачи (task_id обязателен, свой набор ID полей).
+let createPendingSpecFile = null;
+let createPendingOtherFiles = [];
+
+// См. пояснение к аналогичной регистрации в task-board.js: createOtherInput очищает
+// свой value сразу после выбора файлов (см. обработчик change ниже), поэтому очередь
+// createPendingOtherFiles не видна общему hasUnsavedFormData() и проверяется отдельно.
+registerModalCloseGuard(
+    'createSubtaskModal',
+    () => hasUnsavedFormData(document.getElementById('createSubtaskModal')) || createPendingOtherFiles.length > 0,
+    'Отменить создание? Несохранённые данные будут потеряны.',
+);
+
+function _resetCreateSubtaskModal() {
+    document.getElementById('createTitle').value = '';
+    document.getElementById('createDescription').value = '';
+    _updateCharCounter(
+        document.getElementById('createTitle'),
+        document.getElementById('createTitleCounter'),
+        TITLE_MAX_LENGTH,
+    );
+    createPendingSpecFile = null;
+    createPendingOtherFiles = [];
+    document.getElementById('createSpecInput').value = '';
+    document.getElementById('createOtherInput').value = '';
+    _renderCreateSpecPending();
+    _renderCreateOtherPending();
+}
+
+function openCreateSubtaskModal() {
+    _resetCreateSubtaskModal();
+    openModal('createSubtaskModal');
+}
+
+function _renderCreateSpecPending() {
+    const row = document.getElementById('createSpecPendingRow');
+    const name = document.getElementById('createSpecPendingName');
+    if (createPendingSpecFile) {
+        name.textContent = createPendingSpecFile.name;
+        row.style.display = 'flex';
+    } else {
+        row.style.display = 'none';
+    }
+}
+
+function _renderCreateOtherPending() {
+    const list = document.getElementById('createOtherPendingList');
+    const counter = document.getElementById('createOtherCount');
+    counter.textContent = `(${createPendingOtherFiles.length} / ${MAX_OTHER_FILES})`;
+    list.innerHTML = '';
+    createPendingOtherFiles.forEach((file, index) => {
+        const li = document.createElement('li');
+        li.innerHTML = `
+            <span class="file-pending-name">${escapeHtml(file.name)}</span>
+            <button class="btn-delete-file" data-remove-pending="${index}">✕</button>
+        `;
+        list.appendChild(li);
+    });
+}
+
+function _validateOtherFileClientSide(file) {
+    const dotIndex = file.name.lastIndexOf('.');
+    const ext = dotIndex >= 0 ? file.name.slice(dotIndex).toLowerCase() : '';
+    const allowed = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.jpg', '.jpeg', '.png', '.txt'];
+    if (!allowed.includes(ext)) return `расширение «${ext || '(нет)'}» не поддерживается`;
+    if (file.size > OTHER_FILES_MAX_SIZE) return `размер превышает лимит ${OTHER_FILES_MAX_SIZE / (1024 * 1024)} МБ`;
+    return null;
+}
+
+document.getElementById('openCreateSubtaskModalBtn').addEventListener('click', openCreateSubtaskModal);
+document.getElementById('createSubtaskCancelBtn').addEventListener('click', function() { requestCloseModal('createSubtaskModal'); });
+document.getElementById('createSubtaskModal').addEventListener('click', function(e) {
+    if (e.target === this) requestCloseModal('createSubtaskModal');
+});
+
+document.getElementById('createSpecInput').addEventListener('change', function(e) {
+    createPendingSpecFile = e.target.files[0] || null;
+    _renderCreateSpecPending();
+});
+
+document.getElementById('createSpecRemoveBtn').addEventListener('click', function() {
+    createPendingSpecFile = null;
+    document.getElementById('createSpecInput').value = '';
+    _renderCreateSpecPending();
+});
+
+document.getElementById('createOtherInput').addEventListener('change', function(e) {
+    const chosen = Array.from(e.target.files);
+    e.target.value = '';
+    for (const file of chosen) {
+        const err = _validateOtherFileClientSide(file);
+        if (err) { showToast(`«${file.name}»: ${err}`, 'warning'); continue; }
+        if (createPendingOtherFiles.length >= MAX_OTHER_FILES) {
+            showToast(`Превышен лимит файлов (${MAX_OTHER_FILES} штук)`, 'warning');
+            break;
+        }
+        createPendingOtherFiles.push(file);
+    }
+    _renderCreateOtherPending();
+});
+
+document.getElementById('createOtherPendingList').addEventListener('click', function(e) {
+    const btn = e.target.closest('[data-remove-pending]');
+    if (!btn) return;
+    createPendingOtherFiles.splice(parseInt(btn.dataset.removePending, 10), 1);
+    _renderCreateOtherPending();
+});
+
+document.getElementById('createSubtaskSubmitBtn').addEventListener('click', async function() {
+    const title = document.getElementById('createTitle').value;
+    const description = document.getElementById('createDescription').value;
+
+    const fd = new FormData();
+    // task_id обязателен для SubtaskCreate: бэкенд проверяет существование задачи
+    // перед созданием подзадачи (404, если задача не найдена).
+    fd.append('data', JSON.stringify({ task_id: taskId, title, description }));
+    if (createPendingSpecFile) fd.append('specification', createPendingSpecFile);
+    for (const file of createPendingOtherFiles) fd.append('other_files', file);
+
     try {
-        const resp = await fetchWithAuth('/create-subtask/', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            // task_id обязателен для SubtaskCreate: бэкенд проверяет существование задачи
-            // перед созданием подзадачи (404, если задача не найдена).
-            body: JSON.stringify({ task_id: taskId, title, description }),
-        });
+        const resp = await fetchWithAuth('/create-subtask/', { method: 'POST', body: fd });
         if (!resp) return;
+
         if (resp.ok) {
             const s = await resp.json();
-            if (s.crm_synced === false) showToast('Подзадача создана без синхронизации с CRM', 'warning');
-            document.getElementById('createSubtaskForm').reset();
+            if (s.file_upload_errors) {
+                for (const [name, msg] of Object.entries(s.file_upload_errors)) {
+                    showToast(`«${name}»: ${msg}`, 'warning');
+                }
+            }
+            closeModal('createSubtaskModal'); // без confirm — данные уже успешно отправлены
             // После создания остаёмся на текущей странице: новая запись может попасть
             // на другую страницу (сортировка по id ASC), но перезагрузка currentPage
             // обновляет счётчик и кнопки пагинации.
             loadSubtasks(currentPage);
-        // } else if (resp.status === 403) {
-        //     showToast('Нет доступа: вы не являетесь владельцем этой задачи', 'error');
-        } else if (resp.status === 422) {
-            const err = await resp.json();
-            const msg = Array.isArray(err.detail) ? err.detail.map(e => e.msg).join('; ') : err.detail;
-            alert(`Ошибка валидации: ${msg}`);
         } else {
             const err = await resp.json();
-            alert(`Ошибка: ${err.detail}`);
+            const msg = Array.isArray(err.detail) ? err.detail.map(e => e.msg).join('; ') : err.detail;
+            // Модалка остаётся открытой: пользователь не теряет введённые данные/файлы.
+            showToast(msg || 'Ошибка создания подзадачи', 'warning');
         }
     } catch (e) {
-        alert('Не удалось создать подзадачу');
+        showToast('Не удалось создать подзадачу', 'warning');
     }
 });
 
@@ -219,8 +362,6 @@ async function updateSubtask(id, title, description, completed) {
         });
         if (!resp) return;
         if (resp.ok) {
-            const s = await resp.json();
-            if (s.crm_synced === false) showToast('Подзадача обновлена без синхронизации с CRM', 'warning');
             loadSubtasks(currentPage);
         // } else if (resp.status === 403) {
         //     showToast('Нет доступа: вы не являетесь владельцем этой задачи', 'error');
@@ -239,8 +380,6 @@ async function deleteSubtask(id) {
         const resp = await fetchWithAuth(`/delete-subtask/${id}`, { method: 'DELETE' });
         if (!resp) return;
         if (resp.ok) {
-            const s = await resp.json();
-            if (s.crm_synced === false) showToast('Подзадача удалена без синхронизации с CRM', 'warning');
             // currentSubtasks.length === 1: на странице была ровно одна запись — только что удалённая.
             // После loadSubtasks(currentPage) страница вернулась бы пустой.
             // Проверяем длину ДО перезагрузки: именно сейчас массив содержит удалённый объект.
@@ -286,9 +425,11 @@ function connectWebSocket() {
                     loadSubtasks(currentPage);
                     showToast(`${data.sender}: список подзадач обновлён`, 'info');
                 } else if (data.type === 'task_deleted' && data.task_id === taskId) {
-                    // Задачу, чьи подзадачи мы просматриваем, удалил другой пользователь —
+                    // Задачу, чьи подзадачи мы просматриваем, удалили (возможно, из другой своей
+                    // же вкладки — task_deleted актора больше не исключает, см. services/tasks.py) —
                     // страница подзадач для неё больше не существует (404 при любом действии).
-                    alert('Задача была удалена другим пользователем');
+                    // Без уточнения "кем" — этой странице неважно, свой это был actor_id или чужой.
+                    alert('Задача была удалена — переход к списку задач');
                     window.location.href = '/task-board';
                 }
             } catch (e) { /* нераспознанное сообщение — игнорируем */ }
@@ -310,11 +451,11 @@ window.addEventListener('load', function() {
     connectWebSocket();
 
     document.getElementById('saveEditBtn').addEventListener('click', submitEdit);
-    document.getElementById('cancelEditBtn').addEventListener('click', closeEditModal);
+    document.getElementById('cancelEditBtn').addEventListener('click', function() { requestCloseModal('editModal'); });
 
-    const titleInput   = document.getElementById('title');
-    const titleCounter = document.getElementById('titleCounter');
-    titleInput.addEventListener('input', () => _updateCharCounter(titleInput, titleCounter, TITLE_MAX_LENGTH));
+    const createTitleInput   = document.getElementById('createTitle');
+    const createTitleCounter = document.getElementById('createTitleCounter');
+    createTitleInput.addEventListener('input', () => _updateCharCounter(createTitleInput, createTitleCounter, TITLE_MAX_LENGTH));
 
     const editTitleInput   = document.getElementById('editTitle');
     const editTitleCounter = document.getElementById('editTitleCounter');

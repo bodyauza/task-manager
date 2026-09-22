@@ -1,4 +1,3 @@
-import logging
 from typing import Optional
 
 from fastapi import Cookie, Depends, APIRouter, Response, status, HTTPException
@@ -10,9 +9,7 @@ from src.auth.auth_config import (auth_backend, get_access_strategy,
                                   refresh_cookie_transport)
 from src.auth.manager import UserManager, get_user_manager
 from src.auth.user_schemas import is_valid_email_format
-from src.crm.user_service import UserLookup, get_user_lookup
-
-logger = logging.getLogger(__name__)
+from src.openapi_responses import responses
 
 auth_router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -25,11 +22,15 @@ def _apply_transport_cookies(target_response: Response, transport_response: Resp
         target_response.headers.append("set-cookie", value)
 
 
-@auth_router.post("/login")
+@auth_router.post(
+    "/login",
+    summary="Вход",
+    description="`application/x-www-form-urlencoded`: `username` (email) и `password`. Выставляет куки `access_token` и `refresh_token`.",
+    responses=responses(400, c400="Invalid email format или LOGIN_BAD_CREDENTIALS"),
+)
 async def login(
         credentials: OAuth2PasswordRequestForm = Depends(),
         user_manager: UserManager = Depends(get_user_manager),
-        user_lookup: UserLookup = Depends(get_user_lookup),
 ):
     # Предварительная валидация формата email снижает нагрузку на БД при явно невалидных данных.
     # Формат пароля здесь намеренно НЕ проверяется: /auth/login верифицирует уже существующий
@@ -55,32 +56,6 @@ async def login(
             detail="LOGIN_BAD_CREDENTIALS",
         )
 
-    # Проверка наличия записи в CRM при каждом входе: регистрация в CRM предшествует
-    # INSERT в person, но в случае ручного добавления в БД или сбоя при регистрации
-    # запись в CRM может отсутствовать — вход блокируется с кодом 403.
-    try:
-        crm_user = await user_lookup.find_user_by_email(user.email)
-    except Exception as exc:
-        logger.error("CRM check failed for user %d (%s): %s", user.id, user.email, exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="CRM_UNAVAILABLE",
-        )
-
-    if crm_user is None:
-        logger.warning(
-            "Login blocked for user %d (%s): record not found in CRM",
-            user.id, user.email,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User is not registered in CRM. Contact administrator.",
-        )
-
-    logger.info(
-        "CRM check passed for user %d: crm_record_id=%s", user.id, crm_user.get("id")
-    )
-
     json_response = JSONResponse(
         status_code=status.HTTP_200_OK,
         content={"message": "Login successful"},
@@ -100,7 +75,11 @@ async def login(
     return json_response
 
 
-@auth_router.post("/access-token")
+@auth_router.post(
+    "/access-token",
+    summary="Обновить access_token по refresh_token",
+    responses=responses(401, c401="Missing refresh token или Invalid or expired refresh token"),
+)
 async def get_access_token(
         refresh_token: Optional[str] = Cookie(default=None),
         user_manager: UserManager = Depends(get_user_manager),
@@ -132,7 +111,11 @@ async def get_access_token(
     return json_response
 
 
-@auth_router.post("/do-logout")
+@auth_router.post(
+    "/do-logout",
+    summary="Выход (форм-вариант)",
+    description="Удаляет обе куки и отвечает `303` на `/`.",
+)
 async def do_logout():
     # Без Depends(current_user): логаут обязан очищать куки независимо от того,
     # валиден ли ещё access_token. access_token живёт всего 30 минут (settings.ACCESS_EXP);
@@ -162,7 +145,11 @@ async def do_logout():
     return redirect_response
 
 
-@auth_router.post("/logout")
+@auth_router.post(
+    "/logout",
+    summary="Выход (JS-вариант)",
+    description="Удаляет обе куки, возвращает JSON `200`.",
+)
 async def logout():
     # Без Depends(current_user) — та же причина, что и в do_logout() выше: логаут
     # обязан очищать куки независимо от того, валиден ли ещё access_token, иначе

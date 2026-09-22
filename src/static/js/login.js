@@ -14,7 +14,6 @@ document.getElementById('togglePassword').addEventListener('click', function () 
 function formatError(error) {
     if (!error) return 'Произошла ошибка';
     if (error.detail === 'LOGIN_BAD_CREDENTIALS') return 'Неверный email или пароль';
-    if (error.detail === 'CRM_UNAVAILABLE') return 'CRM недоступна, обратитесь в техподдержку Предприятия';
     if (Array.isArray(error.detail)) return error.detail.map(e => e.msg).join('; ');
     return error.detail || 'Произошла ошибка';
 }

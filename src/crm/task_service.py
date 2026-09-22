@@ -1,38 +1,12 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Dict, Optional
 
 from src.crm.client import CRMClient
 from src.crm.crm_config import crm_settings
 
 logger = logging.getLogger(__name__)
-
-
-class TaskCRMSync(Protocol):
-    """Абстракция CRM-синхронизации задач, на которую опираются роутеры/сервисы задач.
-
-    Роутеры зависят от этого протокола, а не от конкретного TaskManager (DIP) —
-    подмена в тестах происходит через FastAPI Depends-override, без патчинга
-    пути импорта.
-    """
-
-    async def create_task(
-        self, title: str, description: str, completed: bool = False,
-    ) -> Dict[str, Any]: ...
-
-    async def update_task(
-        self,
-        task_id: int,
-        title: Optional[str] = None,
-        description: Optional[str] = None,
-        completed: Optional[bool] = None,
-        specification_abs_path: Optional[Path] = None,
-        clear_specification: bool = False,
-        other_file_abs_paths: Optional[list[Path]] = None,
-    ) -> Dict[str, Any]: ...
-
-    async def delete_task(self, task_id: int) -> Dict[str, Any]: ...
 
 
 class TaskManager(CRMClient):
@@ -52,14 +26,16 @@ class TaskManager(CRMClient):
     FIELD_TITLE = crm_settings.TASK_FIELD_TITLE         # ID поля «Название»
     FIELD_DESCR = crm_settings.TASK_FIELD_DESCRIPTION   # ID поля «Описание»
     FIELD_DONE  = crm_settings.TASK_FIELD_COMPLETED     # ID поля «Статус» (чекбокс: "true" / "false")
-    FIELD_SPEC  = crm_settings.TASK_FIELD_SPECIFICATION  # ID поля «Техническое задание» (одиночный файл)
-    FIELD_OTHER = crm_settings.TASK_FIELD_OTHER_FILES   # ID поля «Иные документы» (множественные файлы)
+    FIELD_SPEC    = crm_settings.TASK_FIELD_SPECIFICATION  # ID поля «Техническое задание» (одиночный файл)
+    FIELD_OTHER   = crm_settings.TASK_FIELD_OTHER_FILES    # ID поля «Иные документы» (множественные файлы)
+    FIELD_PROJECT = crm_settings.TASK_FIELD_PROJECT        # ID поля «Проект» (выпадающий список, см. docs/project_field_crm_implementation_guide.md)
 
     async def create_task(
         self,
         title: str,
         description: str,
         completed: bool = False,
+        project: Optional[str] = None,  # CRM-ID опции списка "Проект"; None — поле не выбрано
     ) -> Dict[str, Any]:
         """Создаёт задачу в CRM; возвращает {'id': int|None, 'response': dict}."""
         record = {
@@ -67,6 +43,8 @@ class TaskManager(CRMClient):
             f"field_{self.FIELD_DESCR}": description,
             f"field_{self.FIELD_DONE}":  self._bool_to_crm(completed),
         }
+        if project is not None:
+            record[f"field_{self.FIELD_PROJECT}"] = project
         logger.info("CRM: insert task title='%s'", title)
         result = await self._call(action="insert", entity_id=self.ENTITY_ID, items=[record])
 
@@ -86,6 +64,37 @@ class TaskManager(CRMClient):
 
         return {"id": task_id, "response": result}
 
+    async def find_task(self, title: str, description: str) -> Optional[Dict[str, Any]]:
+        """Ищет задачу по совпадению title И description — используется ТОЛЬКО
+        для идемпотентности retry события 'create' в durable outbox
+        (src/tasks/crm_outbox_tasks.py::_do_create): если процесс упал между
+        успешной вставкой в CRM и записью crm_task_id в локальную БД, повторная
+        попытка сначала ищет уже созданную запись, а не вставляет дубликат.
+
+        Эвристика, не гарантия: у сущности «Задачи» в CRM «Руководитель»
+        (entity_id=29) нет поля-владельца — совпадение title+description между
+        разными пользователями (shared board допускает разные owner_id с
+        похожими названиями) сузит, но не исключит коллизию полностью.
+        Принятый риск — см. docs/task-manager-documentation.md, п. 14,
+        «Идемпотентность: чего не хватает в текущем коде CRM-клиентов».
+
+        :return: Словарь первой найденной записи или None.
+        """
+        select_fields = ",".join(str(f) for f in (self.FIELD_TITLE, self.FIELD_DESCR))
+        result = await self._call(
+            action="select",
+            entity_id=self.ENTITY_ID,
+            select_fields=select_fields,
+            filters={
+                str(self.FIELD_TITLE): {"value": title, "condition": "include"},
+                str(self.FIELD_DESCR): {"value": description, "condition": "include"},
+            },
+        )
+        data = result.get("data", [])
+        if not data:
+            return None
+        return data[0]
+
     async def update_task(
         self,
         task_id: int,
@@ -95,12 +104,15 @@ class TaskManager(CRMClient):
         specification_abs_path: Optional[Path] = None,
         clear_specification: bool = False,
         other_file_abs_paths: Optional[list[Path]] = None,
+        project: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Обновляет задачу по CRM-ID; передаёт только заполненные поля.
 
         clear_specification=True: field_320 = [] (CRM удаляет вложение ТЗ).
         other_file_abs_paths=[]: field_321 = [] (CRM очищает поле иных документов).
         other_file_abs_paths=[p1,p2]: field_321 = [file1, file2] (полная замена содержимого поля).
+        project="" (пустая строка): field_327 = "" (CRM очищает поле "Проект");
+        project=None: поле не трогать.
         """
         data: Dict[str, Any] = {}
         if title is not None:
@@ -109,6 +121,8 @@ class TaskManager(CRMClient):
             data[f"field_{self.FIELD_DESCR}"] = description
         if completed is not None:
             data[f"field_{self.FIELD_DONE}"] = self._bool_to_crm(completed)
+        if project is not None:
+            data[f"field_{self.FIELD_PROJECT}"] = project
 
         if clear_specification:
             # [] — CRM-формат для очистки файлового поля: запись обновляется без вложений.
@@ -152,10 +166,3 @@ class TaskManager(CRMClient):
             delete_by_field={"id": task_id},
             expect_id=True,  # см. update_task выше — та же проверка для уже отсутствующей в CRM записи
         )
-
-
-def get_task_crm_sync() -> TaskCRMSync:
-    """FastAPI-зависимость: единственная точка, которая знает, что TaskCRMSync
-    реализует именно TaskManager — роутеры/сервисы работают только с протоколом.
-    """
-    return TaskManager()

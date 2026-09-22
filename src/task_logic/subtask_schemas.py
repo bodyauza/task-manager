@@ -52,10 +52,10 @@ class SubtaskResponse(BaseModel):
     description: str
     completed: bool
     task_id: int
-    crm_subtask_id: Optional[int] = None
-    crm_synced: Optional[bool] = None
-    # crm_synced отсутствует в ORM-модели; Pydantic подставит None по умолчанию;
-    # роутер устанавливает вручную: result.crm_synced = crm_subtask_id is not None
+    # crm_subtask_id/crm_synced НЕ являются полями этого ответа (см. TaskResponse
+    # в task_schemas.py); sync_status — единственная отдаваемая деталь
+    # синхронизации, бейдж на subtask-board.
+    sync_status: str = "unsynced"
 
     # Путь к файлу ТЗ подзадачи относительно src/uploads/.
     # Пример: "subtasks/7/specification/e5f6_spec.pdf". None — файл не загружен.
@@ -65,3 +65,6 @@ class SubtaskResponse(BaseModel):
     # ORM-колонка JSONB: asyncpg десериализует JSONB → list[str] при чтении автоматически.
     # None/[] — документов нет.
     other_file_paths: Optional[list[str]] = None
+
+    # См. TaskResponse.file_upload_errors в task_schemas.py — то же самое для подзадач.
+    file_upload_errors: Optional[dict[str, str]] = None

@@ -103,6 +103,28 @@ class Settings(BaseSettings):
         "http://localhost:3000,http://127.0.0.1:3000"
     )
 
+    # Брокер Celery (src/celery_app.py) — общий Redis-инстанс для фоновой синхронизации
+    # CRM-справочников (src/tasks/global_lists_tasks.py) и durable-retry очереди
+    # CRM-синхронизации задач (src/tasks/crm_outbox_tasks.py), см.
+    # docs/project_field_crm_implementation_guide.md §1.4. Дефолт — для запуска без
+    # Docker (Redis на localhost); docker-compose.yml переопределяет на redis://redis:6379/0.
+    REDIS_URL: str = "redis://localhost:6379/0"
+
+    # Часовой пояс ТОЛЬКО для отображения дат в sqladmin (src/admin/formatters.py).
+    # Хранение в БД (TIMESTAMPTZ, UTC) и datetime.now(timezone.utc) в коде не меняются.
+    ADMIN_TIMEZONE: str = "Europe/Moscow"
+
+    # Сколько последних сообщений WS-чата держать в Redis List "chat:history"
+    # (src/realtime/chat_history.py) — список ограничен, не бесконечный архив;
+    # см. docs/chat_history_redis_list_guide.md §1.4, решение №3. Дефолт 500 —
+    # ориентировочный, переопределяется через .env без изменения кода.
+    CHAT_HISTORY_MAX_LEN: int = 500
+
+    # Документация API (/docs, /redoc, /openapi.json). None — включена везде, кроме
+    # production (там схема API и Swagger UI не нужны посторонним); True/False — явное
+    # переопределение через .env (например, DOCS_ENABLED=true на закрытом стенде).
+    DOCS_ENABLED: bool | None = None
+
     @property
     def cors_origins(self) -> list[str]:
         return [origin.strip() for origin in self.CORS_ORIGINS_CSV.split(",") if origin.strip()]
@@ -114,6 +136,12 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.api_mode in ("prod", "production")
+
+    @property
+    def docs_enabled(self) -> bool:
+        if self.DOCS_ENABLED is not None:
+            return self.DOCS_ENABLED
+        return not self.is_production
 
 
 class ProductionSettings(Settings):

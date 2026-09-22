@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Task Manager — CRM-синхронизация (admin)</title>
+    <link rel="stylesheet" href="{{ url_for("static", path="/css/bootstrap.min.css") }}">
+    <style>
+        body {
+            background-color: #eceff1;
+            font-family: 'Segoe UI', Arial, sans-serif;
+            color: #212529;
+        }
+
+        .board-wrapper {
+            max-width: 1280px;
+            margin: 28px auto;
+            padding: 0 16px;
+        }
+
+        .board-header {
+            color: #003f6b;
+            font-size: 20px;
+            font-weight: 700;
+            border-bottom: 2px solid #003f6b;
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .card {
+            background: white;
+            border-top: 4px solid #003f6b;
+            border-radius: 0 0 4px 4px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        h2 {
+            color: #003f6b;
+            font-weight: 700;
+            font-size: 15px;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            margin-bottom: 14px;
+        }
+
+        button {
+            background-color: #003f6b;
+            color: white;
+            border: none;
+            padding: 8px 14px;
+            border-radius: 2px;
+            cursor: pointer;
+            font-size: 13px;
+            font-family: inherit;
+            font-weight: 600;
+            letter-spacing: 0.3px;
+            transition: background-color 0.2s;
+        }
+        button:hover { background-color: #002b4e; }
+
+        .sync-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        .sync-table th {
+            text-align: left;
+            padding: 8px 10px;
+            background-color: #f1f3f5;
+            color: #495057;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+            border-bottom: 2px solid #dee2e6;
+            white-space: nowrap;
+        }
+        .sync-table td {
+            padding: 8px 10px;
+            border-bottom: 1px solid #eceff1;
+            vertical-align: top;
+        }
+        .sync-table tbody tr:hover { background-color: #f8f9fa; }
+        .sync-table a { color: #003f6b; }
+
+        .empty-note { color: #6c757d; font-size: 13px; }
+
+        .sync-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 2px;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.3px;
+            white-space: nowrap;
+        }
+        .sync-badge-unsynced { background-color: #6c757d; color: white; }
+        .sync-badge-pending  { background-color: #ffc107; color: #212529; }
+        .sync-badge-synced   { background-color: #198754; color: white; }
+        .sync-badge-failed   { background-color: #b71c1c; color: white; }
+
+        .table-scroll { overflow-x: auto; }
+    </style>
+</head>
+<body>
+    {% include '_navbar.html' %}
+
+    <div class="board-wrapper">
+        <h2 class="board-header">
+            CRM-синхронизация — статус (только для администратора)
+            <button id="refreshSyncBtn">Обновить</button>
+        </h2>
+
+        <div class="card">
+            <h2>Задачи</h2>
+            <div class="table-scroll" id="tasksSyncTable"><p class="empty-note">Загрузка…</p></div>
+        </div>
+
+        <div class="card">
+            <h2>Подзадачи</h2>
+            <div class="table-scroll" id="subtasksSyncTable"><p class="empty-note">Загрузка…</p></div>
+        </div>
+    </div>
+
+    <script src="/static/js/common.js?v=5" defer></script>
+    <script src="/static/js/admin-crm-sync.js?v=2" defer></script>
+</body>
+</html>

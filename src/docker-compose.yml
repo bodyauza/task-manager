@@ -1,3 +1,6 @@
+# Явное имя проекта
+name: task-manager
+
 services:
   web:
     build:
@@ -6,37 +9,189 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      db:
-        condition: service_healthy
+      redis:
+        condition: service_started
     volumes:
       - ..:/app
     restart: unless-stopped
-    # Загружаем переменные из .dev.env; DB_HOST переопределяется ниже,
-    # потому что внутри Docker сеть контейнеров: хост БД = имя сервиса "db",
-    # а не "localhost" из .dev.env.
+    # Загружаем переменные из .dev.env; DB_HOST/REDIS_URL переопределяются ниже.
+    # DB_HOST указывает на нативный PostgreSQL хост-машины (не контейнер —
+    # см. docs/local_postgres_dev_guide.md), REDIS_URL — на контейнер redis
+    # внутри docker-сети (хост Redis = имя сервиса "redis", а не "localhost"
+    # из .dev.env). REDIS_URL нужен веб-процессу не для брокера как такового,
+    # а для POST /admin/crm-options/refresh (routers/pages.py) — он вызывает
+    # sync_project_table.delay() прямо из запроса, то есть подключается к
+    # Redis как клиент Celery.
     env_file:
       - .dev.env
     environment:
-      DB_HOST: db
+      DB_HOST: host.docker.internal
+      REDIS_URL: redis://redis:6379/0
 
-  db:
-    image: postgres:18
-    # Переменные окружения для образа postgres должны быть
-    # под ключом `environment:`.
-    environment:
-      POSTGRES_USER: ${DB_USER}
-      POSTGRES_PASSWORD: ${DB_PASS}
-      POSTGRES_DB: ${DB_NAME}
+  # Redis — брокер Celery, три независимые причины (см. src/celery_app.py и
+  # docs/project_field_crm_implementation_guide.md §1.4): outbox-очередь CRM-
+  # синхронизации задач, периодическая синхронизация справочника "Проект",
+  # и (в перспективе) Redis Pub/Sub для WebSocket при UVICORN_WORKERS > 1.
+  redis:
+    image: redis:7-alpine
     ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql
+      - "6379:6379"
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
-volumes:
-  postgres_data:
+  # Обрабатывает ДЕФОЛТНУЮ очередь Redis (celery_app.py) — только несharded
+  # периодические задачи: sync_project_table, reconcile_pending_outbox,
+  # reconcile_blocked_outbox (src/tasks/global_lists_tasks.py,
+  # src/tasks/crm_outbox_tasks.py). НЕ обрабатывает crm_sync.shard_N — без
+  # флага -Q worker слушает только дефолтную очередь "celery", шардированные
+  # строки outbox обрабатывают отдельные celery-worker-shard-N ниже.
+  celery-worker:
+    build:
+      context: ..
+      dockerfile: src/Dockerfile
+    command: celery -A src.celery_app worker --loglevel=info
+    depends_on:
+      - redis
+    volumes:
+      - ..:/app
+    restart: unless-stopped
+    env_file:
+      - .dev.env
+    environment:
+      DB_HOST: host.docker.internal
+      REDIS_URL: redis://redis:6379/0
+
+  # По одному воркеру на шард outbox-очереди (docs/task-manager-
+  # documentation.md, п. 14) — concurrency=1 (--pool=solo) на процесс
+  # ГАРАНТИРУЕТ строгий порядок обработки событий одной задачи внутри её
+  # шарда: только один процесс физически может читать crm_sync.shard_N,
+  # поэтому конфигурация, от которой защищает Redlock (src/tasks/
+  # crm_shard_lock.py) — "два воркера на один шард" — структурно исключена
+  # самим этим списком сервисов. Число сервисов должно совпадать с
+  # CRM_OUTBOX_SHARD_COUNT (src/crm/crm_config.py, по умолчанию 4) — смена
+  # этого числа требует и правки .dev.env, и правки списка сервисов здесь.
+  celery-worker-shard-0:
+    build:
+      context: ..
+      dockerfile: src/Dockerfile
+    command: celery -A src.celery_app worker --loglevel=info --pool=solo -Q crm_sync.shard_0
+    depends_on:
+      - redis
+    volumes:
+      - ..:/app
+    restart: unless-stopped
+    env_file:
+      - .dev.env
+    environment:
+      DB_HOST: host.docker.internal
+      REDIS_URL: redis://redis:6379/0
+
+  celery-worker-shard-1:
+    build:
+      context: ..
+      dockerfile: src/Dockerfile
+    command: celery -A src.celery_app worker --loglevel=info --pool=solo -Q crm_sync.shard_1
+    depends_on:
+      - redis
+    volumes:
+      - ..:/app
+    restart: unless-stopped
+    env_file:
+      - .dev.env
+    environment:
+      DB_HOST: host.docker.internal
+      REDIS_URL: redis://redis:6379/0
+
+  celery-worker-shard-2:
+    build:
+      context: ..
+      dockerfile: src/Dockerfile
+    command: celery -A src.celery_app worker --loglevel=info --pool=solo -Q crm_sync.shard_2
+    depends_on:
+      - redis
+    volumes:
+      - ..:/app
+    restart: unless-stopped
+    env_file:
+      - .dev.env
+    environment:
+      DB_HOST: host.docker.internal
+      REDIS_URL: redis://redis:6379/0
+
+  celery-worker-shard-3:
+    build:
+      context: ..
+      dockerfile: src/Dockerfile
+    command: celery -A src.celery_app worker --loglevel=info --pool=solo -Q crm_sync.shard_3
+    depends_on:
+      - redis
+    volumes:
+      - ..:/app
+    restart: unless-stopped
+    env_file:
+      - .dev.env
+    environment:
+      DB_HOST: host.docker.internal
+      REDIS_URL: redis://redis:6379/0
+
+  # Планировщик — по расписанию (celery_app.py::beat_schedule) ставит
+  # периодические задачи в очередь; сам их не выполняет (это celery-worker).
+  # Разделены на два сервиса намеренно: падение одного не должно тянуть другой.
+  celery-beat:
+    build:
+      context: ..
+      dockerfile: src/Dockerfile
+    command: celery -A src.celery_app beat --loglevel=info
+    depends_on:
+      - redis
+    volumes:
+      - ..:/app
+    restart: unless-stopped
+    env_file:
+      - .dev.env
+    environment:
+      DB_HOST: host.docker.internal
+      REDIS_URL: redis://redis:6379/0
+
+  # Flower — веб-интерфейс мониторинга Celery: воркеры (по шардам), список задач
+  # со статусом/аргументами/результатом/временем, очереди crm_sync.shard_N,
+  # ретраи и отказы — в реальном времени, без похода в логи контейнеров.
+  # Задачи видны благодаря worker_send_task_events/task_send_sent_event в
+  # src/celery_app.py (без них Flower показывал бы только heartbeat'ы воркеров).
+  # Только `depends_on: redis` (не БД): Flower читает события брокера, ни одного
+  # SQL-запроса не выполняет, хотя импорт src.celery_app и требует настроенных
+  # DB_*/CRM_*-переменных (см. src/config.py/crm_config.py) — иначе процесс не
+  # стартует вовсе.
+  #
+  # Безопасность: Flower отдаёт содержимое задач (в т.ч. аргументы) и умеет
+  # управлять воркерами (revoke/shutdown), поэтому:
+  #   1) порт опубликован ТОЛЬКО на loopback хоста (127.0.0.1:5555), не на всех
+  #      интерфейсах;
+  #   2) пароль необязателен: если в src/.dev.env задана FLOWER_BASIC_AUTH
+  #      ("user:password"), Flower применяет её сам (префикс FLOWER_ для любых
+  #      своих опций); если нет — стартует без аутентификации, а в лог пишется
+  #      предупреждение (для локальной разработки за loopback это прежнее
+  #      поведение). Для окружения с внешним доступом задайте пароль.
+  # Открыть: http://localhost:5555 (логин/пароль — если задана FLOWER_BASIC_AUTH).
+  flower:
+    build:
+      context: ..
+      dockerfile: src/Dockerfile
+    command:
+      - sh
+      - -c
+      - >-
+        test -n "$$FLOWER_BASIC_AUTH"
+        || echo "WARNING: FLOWER_BASIC_AUTH не задан в src/.dev.env — Flower запущен БЕЗ аутентификации (доступ только с 127.0.0.1)";
+        exec celery -A src.celery_app flower --port=5555
+    ports:
+      - "127.0.0.1:5555:5555"
+    depends_on:
+      - redis
+    volumes:
+      - ..:/app
+    restart: unless-stopped
+    env_file:
+      - .dev.env
+    environment:
+      DB_HOST: host.docker.internal
+      REDIS_URL: redis://redis:6379/0

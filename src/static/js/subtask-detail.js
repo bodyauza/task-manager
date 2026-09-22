@@ -312,13 +312,6 @@ function renderSubtask(s) {
 
     const statusEl = document.getElementById('viewStatus');
     statusEl.innerHTML = `<span class="status-badge ${s.completed ? 'status-completed' : 'status-pending'}">${s.completed ? 'Выполнена' : 'В работе'}</span>`;
-
-    const crmEl = document.getElementById('viewCrm');
-    if (s.crm_subtask_id != null) {
-        crmEl.innerHTML = `<span class="crm-badge-ok">Синхронизирована (ID ${s.crm_subtask_id})</span>`;
-    } else {
-        crmEl.innerHTML = '<span class="crm-badge">Отсутствует в CRM</span>';
-    }
 }
 
 async function loadSubtask() {
@@ -336,6 +329,27 @@ async function loadSubtask() {
     }
 }
 
+// Снимок формы редактирования — см. подробное пояснение в task-detail.js
+// (editForm не оверлей-модалка, общий requestCloseModal сюда не подходит;
+// поля предзаполнены данными подзадачи, поэтому нужен снимок, а не hasUnsavedFormData).
+let _editFormSnapshot = null;
+
+function _readEditFormFields() {
+    return {
+        title: document.getElementById('editTitle').value,
+        description: document.getElementById('editDescription').value,
+        completed: document.getElementById('editCompleted').checked,
+    };
+}
+
+function _editFormHasUnsavedChanges() {
+    if (!_editFormSnapshot) return false;
+    const current = _readEditFormFields();
+    return current.title !== _editFormSnapshot.title
+        || current.description !== _editFormSnapshot.description
+        || current.completed !== _editFormSnapshot.completed;
+}
+
 function openEditForm() {
     if (!currentSubtask) return;
     const titleEl = document.getElementById('editTitle');
@@ -343,6 +357,7 @@ function openEditForm() {
     document.getElementById('editDescription').value = currentSubtask.description;
     document.getElementById('editCompleted').checked = currentSubtask.completed;
     _updateCharCounter(titleEl, document.getElementById('editTitleCounter'), TITLE_MAX_LENGTH);
+    _editFormSnapshot = _readEditFormFields();
     document.getElementById('editForm').classList.add('visible');
     document.getElementById('editToggleBtn').style.display = 'none';
 }
@@ -350,6 +365,16 @@ function openEditForm() {
 function closeEditForm() {
     document.getElementById('editForm').classList.remove('visible');
     document.getElementById('editToggleBtn').style.display = '';
+}
+
+// Кнопка «Отмена»: подтверждение только при реальном изменении относительно снимка.
+// saveSubtask → closeEditForm() напрямую — сохранение confirm() не проходит.
+function requestCloseEditForm() {
+    if (_editFormHasUnsavedChanges()
+        && !confirm('Отменить редактирование? Несохранённые данные будут потеряны.')) {
+        return;
+    }
+    closeEditForm();
 }
 
 async function saveSubtask() {
@@ -367,7 +392,6 @@ async function saveSubtask() {
         if (!resp) return;
         if (resp.ok) {
             const s = await resp.json();
-            if (s.crm_synced === false) showToast('Сохранено без синхронизации с CRM', 'warning');
             renderSubtask(s);
             closeEditForm();
         // Namespace-проверка владельца намеренно не выполняется — Shared board.
@@ -392,8 +416,6 @@ async function deleteSubtask() {
         const resp = await fetchWithAuth(`/delete-subtask/${subtaskId}`, { method: 'DELETE' });
         if (!resp) return;
         if (resp.ok) {
-            const s = await resp.json();
-            if (s.crm_synced === false) showToast('Удалено без синхронизации с CRM', 'warning');
             window.location.href = `/subtask-board/${taskId}`;
         // Namespace-проверка владельца намеренно не выполняется — Shared board.
         // См. src/services/subtasks.py::delete_subtask и docs/task-manager-documentation.md.
@@ -444,7 +466,9 @@ function connectWebSocket() {
                 } else if (data.type === 'task_deleted' && data.task_id === taskId) {
                     // Удалена родительская задача — эта подзадача каскадно удалена вместе с ней
                     // (ON DELETE CASCADE), хотя сама subtask_deleted для неё не рассылается.
-                    // exclude_user_id на сервере не даёт актору получить собственное событие.
+                    // Текст ниже нейтрален по "кем" намеренно: task_deleted actor'а больше не
+                    // исключает (см. services/tasks.py), и удалить родителя из другой своей же
+                    // вкладки — легитимный случай, не только "другой пользователь".
                     // Редирект на /task-board, а не /subtask-board/{taskId}: страница подзадач
                     // этой (уже несуществующей) задачи сама ответила бы 404 Task not found.
                     alert('Задача, к которой относится эта подзадача, была удалена');
@@ -467,7 +491,7 @@ window.addEventListener('load', function() {
     connectWebSocket();
 
     document.getElementById('editToggleBtn').addEventListener('click', openEditForm);
-    document.getElementById('cancelBtn').addEventListener('click', closeEditForm);
+    document.getElementById('cancelBtn').addEventListener('click', requestCloseEditForm);
     document.getElementById('saveBtn').addEventListener('click', saveSubtask);
     document.getElementById('deleteBtn').addEventListener('click', deleteSubtask);
 

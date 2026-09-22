@@ -49,6 +49,17 @@ aiosmtplib>=3.0.0
 # Alembic migrations
 alembic==1.14.0
 
+# Celery + Redis: брокер и планировщик для фоновой синхронизации CRM-справочников
+# (src/tasks/global_lists_tasks.py) и durable-retry очереди CRM-синхронизации задач
+# (src/tasks/crm_outbox_tasks.py) — см. docs/project_field_crm_implementation_guide.md §1.4.
+celery==5.4.0
+redis==5.0.8
+
+# Веб-интерфейс мониторинга Celery (задачи/воркеры в реальном времени) —
+# см. src/docker-compose.yml, сервис flower, порт 5555 (только loopback,
+# необязательный FLOWER_BASIC_AUTH в src/.dev.env).
+flower==2.0.1
+
 # Определение MIME-типа файла по сигнатуре байтов (magic bytes).
 # python-magic-bin — Windows-вариант: содержит скомпилированные DLL libmagic,
 # не требует системной установки. На Linux/macOS использовать python-magic==0.4.27
@@ -68,3 +79,11 @@ alembic==1.14.0
 # системную библиотеку libmagic1, устанавливаемую через apt в src/Dockerfile.
 python-magic-bin==0.4.14; sys_platform == "win32"
 python-magic==0.4.27; sys_platform != "win32"
+# Admin-панель /admin поверх User/Role/Task/Subtask/Project/CrmOutbox (src/admin/).
+# wtforms — транзитивная зависимость sqladmin; itsdangerous — требуется
+# starlette.middleware.sessions.SessionMiddleware (подключается AdminAuth,
+# см. src/admin/auth.py), сама starlette её не тянет как обязательную.
+# Обе закреплены явно для воспроизводимости сборки.
+sqladmin==0.20.1
+wtforms==3.1.2
+itsdangerous==2.2.0

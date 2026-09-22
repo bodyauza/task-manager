@@ -1,121 +1,77 @@
 """Юнит-тесты src.services.tasks: создание/чтение/обновление/удаление задач
 без HTTP-слоя.
 
-Сервисный слой принимает db-сессию, пользователя и CRM-абстракцию как обычные
-параметры — тесты вызывают его напрямую, подставляя фейковую реализацию
-TaskCRMSync/SubtaskCRMSync (см. DIP в src/crm/task_service.py), а не мокая
-импорт конкретного класса. По духу — то же самое, что делает
-tests/test_realtime.py для FakeBroadcaster.
+Сервисный слой больше не принимает CRM-абстракцию как параметр и сам CRM
+никогда не вызывает (см. src/tasks/crm_outbox_tasks.py::dispatch_outbox_row) —
+он лишь вставляет строку CrmOutbox в той же транзакции, что и основное
+изменение, и диспатчит её в Celery. Эти тесты поэтому проверяют не факт CRM-
+вызова (это дело tests/test_crm_outbox.py — обработчиков _do_create_task и
+т.п.), а то, что нужная строка CrmOutbox появилась с правильным payload, и что
+dispatch_outbox_row была вызвана для неё (мок из tests/conftest.py::
+mock_outbox_dispatch — реального Celery/Redis в тестах нет).
 """
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from src.auth.user_models import Role, User
+from src.auth.user_models import User
 from src.database import async_session_maker
 from src.services import tasks as task_service
-from src.task_logic.models import Task
+from src.task_logic.models import CrmOutbox, Task
 from src.task_logic.task_schemas import TaskCreate, TaskUpdate
+from tests.conftest import make_user
 
 
-class FakeTaskCRMSync:
-    """Реализация протокола TaskCRMSync для тестов — без сети, с журналом вызовов."""
-
-    def __init__(self, create_id: int | None = 99, fail_create: bool = False):
-        self.create_id = create_id
-        self.fail_create = fail_create
-        self.created: list[dict] = []
-        self.updated: list[dict] = []
-        self.deleted: list[int] = []
-
-    async def create_task(self, title, description, completed=False):
-        self.created.append({"title": title, "description": description, "completed": completed})
-        if self.fail_create:
-            raise Exception("CRM unreachable")
-        return {"id": self.create_id}
-
-    async def update_task(self, task_id, **kwargs):
-        self.updated.append({"task_id": task_id, **kwargs})
-        return {}
-
-    async def delete_task(self, task_id):
-        self.deleted.append(task_id)
-        return {}
+async def _outbox_rows_for(session, aggregate_type: str, aggregate_id: int) -> list[CrmOutbox]:
+    return (
+        await session.execute(
+            select(CrmOutbox)
+            .where(CrmOutbox.aggregate_type == aggregate_type, CrmOutbox.aggregate_id == aggregate_id)
+            .order_by(CrmOutbox.id)
+        )
+    ).scalars().all()
 
 
-class FakeSubtaskCRMSync:
-    """Реализация протокола SubtaskCRMSync — используется только в delete_task
-    (каскадное удаление подзадач из CRM), содержимое не важно для тестов задач."""
-
-    async def create_subtask(self, **kwargs):
-        return {"id": None}
-
-    async def update_subtask(self, **kwargs):
-        return {}
-
-    async def delete_subtask(self, subtask_id):
-        return {}
-
-
-async def _make_user(session, email: str = "alice@example.com") -> User:
-    # roles=[role] при конструировании нового User — не bulk-replace на уже
-    # загруженной связи (это был бы отдельный риск MissingGreenlet, см.
-    # auth/manager.py::UserManager.create()), а обычный kwarg конструктора
-    # transient-объекта, безопасен в async без предварительной eager-загрузки.
-    role = (await session.execute(select(Role).where(Role.id == 1))).scalar_one()
-    user = User(
-        email=email, username=email.split("@")[0], firstname="A", lastname="B",
-        hashed_password="x", roles=[role], is_active=True, is_verified=True,
-    )
-    session.add(user)
-    await session.commit()
-    await session.refresh(user)
-    return user
+_make_user = make_user
 
 
 # ── create_task ──────────────────────────────────────────────────────────────
 
-async def test_create_task_success():
+async def test_create_task_success(mock_outbox_dispatch):
     async with async_session_maker() as session:
         user = await _make_user(session)
-        crm = FakeTaskCRMSync(create_id=42)
 
         result = await task_service.create_task(
-            session, user, TaskCreate(title="My Task", description="desc"), crm,
+            session, user, TaskCreate(title="My Task", description="desc"),
         )
 
         assert result.title == "My Task"
-        assert result.crm_task_id == 42
-        assert result.crm_synced is True
-        assert crm.created == [{"title": "My Task", "description": "desc", "completed": False}]
+        # crm_task_id/crm_synced не в ответе (см. TaskResponse) — CRM-создание
+        # отправлено в фон, статус проверяется через outbox-строку ниже.
+        rows = await _outbox_rows_for(session, "task", result.id)
+        assert len(rows) == 1
+        assert rows[0].operation == "create"
+        assert rows[0].status == "pending"
+        assert rows[0].payload == {
+            "title": "My Task", "description": "desc", "completed": False, "project": None,
+        }
+        mock_outbox_dispatch.assert_called_once()
 
 
-async def test_create_task_duplicate_title_raises_409_before_calling_crm_again():
+async def test_create_task_duplicate_title_raises_409_before_second_outbox_row():
     async with async_session_maker() as session:
         user = await _make_user(session)
-        crm = FakeTaskCRMSync()
-        await task_service.create_task(session, user, TaskCreate(title="Dup", description="d"), crm)
+        first = await task_service.create_task(session, user, TaskCreate(title="Dup", description="d"))
 
         with pytest.raises(HTTPException) as exc_info:
-            await task_service.create_task(session, user, TaskCreate(title="Dup", description="d"), crm)
+            await task_service.create_task(session, user, TaskCreate(title="Dup", description="d"))
 
         assert exc_info.value.status_code == 409
-        # Проверка дубля выполняется до вызова CRM — второй запрос не должен дойти до create_task.
-        assert len(crm.created) == 1
-
-
-async def test_create_task_crm_failure_is_best_effort():
-    async with async_session_maker() as session:
-        user = await _make_user(session)
-        crm = FakeTaskCRMSync(fail_create=True)
-
-        result = await task_service.create_task(
-            session, user, TaskCreate(title="No CRM", description="d"), crm,
-        )
-
-        assert result.crm_task_id is None
-        assert result.crm_synced is False
+        # Проверка дубля выполняется до вставки outbox-строки — второй запрос не
+        # должен породить вторую строку 'create' для другой задачи с тем же title.
+        rows = await _outbox_rows_for(session, "task", first.id)
+        assert len(rows) == 1
 
 
 # ── list_tasks / get_task ────────────────────────────────────────────────────
@@ -123,11 +79,8 @@ async def test_create_task_crm_failure_is_best_effort():
 async def test_list_tasks_pagination():
     async with async_session_maker() as session:
         user = await _make_user(session)
-        crm = FakeTaskCRMSync()
         for i in range(3):
-            await task_service.create_task(
-                session, user, TaskCreate(title=f"Task {i}", description="d"), crm,
-            )
+            await task_service.create_task(session, user, TaskCreate(title=f"Task {i}", description="d"))
 
         results, total = await task_service.list_tasks(session, skip=0, limit=2)
 
@@ -146,53 +99,83 @@ async def test_get_task_not_found_raises_404():
 
 async def test_update_task_not_found_raises_404():
     async with async_session_maker() as session:
-        crm = FakeTaskCRMSync()
         with pytest.raises(HTTPException) as exc_info:
-            await task_service.update_task(session, None, 9999, TaskUpdate(title="x"), crm)
+            await task_service.update_task(session, None, 9999, TaskUpdate(title="x"))
         assert exc_info.value.status_code == 404
 
 
-async def test_update_task_syncs_crm_when_previously_synced():
+async def test_update_task_enqueues_outbox_when_previously_synced(mock_outbox_dispatch):
     async with async_session_maker() as session:
         user = await _make_user(session)
-        crm = FakeTaskCRMSync(create_id=7)
-        created = await task_service.create_task(
-            session, user, TaskCreate(title="Orig", description="d"), crm,
-        )
+        created = await task_service.create_task(session, user, TaskCreate(title="Orig", description="d"))
+        # Симулирует то, что Celery уже успел выполнить 'create' и записать crm_task_id
+        # (в реальности это делает _do_create_task — здесь незачем гонять целиком Celery).
+        db_task = await session.get(Task, created.id)
+        db_task.crm_task_id = 7
+        await session.commit()
+        mock_outbox_dispatch.reset_mock()
 
-        result = await task_service.update_task(
-            session, user, created.id, TaskUpdate(title="Renamed"), crm,
-        )
+        result = await task_service.update_task(session, user, created.id, TaskUpdate(title="Renamed"))
 
         assert result.title == "Renamed"
-        assert result.crm_synced is True
-        assert crm.updated == [{"task_id": 7, "title": "Renamed", "description": None, "completed": None}]
+        # crm_synced не в ответе (см. TaskResponse) — результат проверяется
+        # через outbox-строку ниже.
+        rows = await _outbox_rows_for(session, "task", created.id)
+        update_rows = [r for r in rows if r.operation == "update"]
+        assert len(update_rows) == 1
+        # project=None: поле "project" не передавалось в TaskUpdate(title="Renamed") —
+        # см. src/services/tasks.py::update_task, project_crm_id_for_crm остаётся None.
+        assert update_rows[0].payload == {
+            "crm_task_id": 7, "title": "Renamed", "description": None, "completed": None, "project": None,
+        }
+        mock_outbox_dispatch.assert_called_once()
+
+
+async def test_update_task_not_synced_skips_outbox(mock_outbox_dispatch):
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        created = await task_service.create_task(session, user, TaskCreate(title="Orig", description="d"))
+        mock_outbox_dispatch.reset_mock()
+
+        result = await task_service.update_task(session, user, created.id, TaskUpdate(title="Renamed"))
+
+        # crm_task_id всё ещё None (create ушёл в фон, ничего его не завершило) —
+        # синхронизировать нечего, outbox-строка для update не создаётся.
+        rows = await _outbox_rows_for(session, "task", created.id)
+        assert not any(r.operation == "update" for r in rows)
+        mock_outbox_dispatch.assert_not_called()
 
 
 # ── delete_task ──────────────────────────────────────────────────────────────
 
-async def test_delete_task_removes_row_and_calls_crm():
+async def test_delete_task_removes_row_and_enqueues_outbox(mock_outbox_dispatch):
     async with async_session_maker() as session:
         user = await _make_user(session)
-        crm = FakeTaskCRMSync(create_id=7)
-        created = await task_service.create_task(
-            session, user, TaskCreate(title="ToDelete", description="d"), crm,
-        )
+        created = await task_service.create_task(session, user, TaskCreate(title="ToDelete", description="d"))
+        db_task = await session.get(Task, created.id)
+        db_task.crm_task_id = 7
+        await session.commit()
+        mock_outbox_dispatch.reset_mock()
 
-        snapshot = await task_service.delete_task(session, user, created.id, crm, FakeSubtaskCRMSync())
+        snapshot = await task_service.delete_task(session, user, created.id)
 
         assert snapshot.title == "ToDelete"
-        assert snapshot.crm_synced is True
-        assert crm.deleted == [7]
-
+        # crm_synced не в ответе (см. TaskResponse) — результат проверяется
+        # через outbox-строку ниже.
         remaining = (
             await session.execute(select(Task).where(Task.id == created.id))
         ).scalar_one_or_none()
         assert remaining is None
 
+        rows = await _outbox_rows_for(session, "task", created.id)
+        delete_rows = [r for r in rows if r.operation == "delete"]
+        assert len(delete_rows) == 1
+        assert delete_rows[0].payload == {"crm_task_id": 7, "crm_subtask_ids": []}
+        mock_outbox_dispatch.assert_called_once()
+
 
 async def test_delete_task_not_found_raises_404():
     async with async_session_maker() as session:
         with pytest.raises(HTTPException) as exc_info:
-            await task_service.delete_task(session, None, 9999, FakeTaskCRMSync(), FakeSubtaskCRMSync())
+            await task_service.delete_task(session, None, 9999)
         assert exc_info.value.status_code == 404

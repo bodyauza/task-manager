@@ -5,7 +5,20 @@
 этого не знает и знать не должен (см. manager.py).
 """
 
+from src.realtime import chat_history
 from src.realtime.connection_manager import Broadcaster, connection_manager
+
+# События задач/подзадач — CRUD и файловые — персистируются в Redis List
+# (chat_history), переживают перезагрузку страницы и выводятся в WS-чат в
+# одном формате «You: ...» (свои) / «email: ...» (чужие), см.
+# docs/chat_history_redis_list_guide.md. Файловые события раньше были
+# эфемерными и рисовались отдельной английской фразой только для актора; теперь
+# они такие же записи чата, как и остальные действия.
+_PERSISTED_EVENT_TYPES = frozenset({
+    "task_created", "task_updated", "task_deleted",
+    "subtask_created", "subtask_updated", "subtask_deleted",
+    "task_files_updated", "subtask_files_updated",
+})
 
 
 async def broadcast_task_event(
@@ -23,7 +36,13 @@ async def broadcast_task_event(
     # Разделение намеренное: dict — «что отправить»; exclude_user_id — «кому не отправлять».
     # Если бы exclude_user_id лежал внутри dict — он попал бы в JSON-ответ клиента,
     # но никого бы не исключил из рассылки: Broadcaster.broadcast читает его отдельным аргументом.
-    await broadcaster.broadcast(
-        {"type": event_type, "title": title, "sender": sender_email, **extra},
-        exclude_user_id,
-    )
+    payload = {"type": event_type, "title": title, "sender": sender_email, **extra}
+    if event_type in _PERSISTED_EVENT_TYPES:
+        # Персистируется ВСЕГДА, независимо от exclude_user_id — это фильтр
+        # только живой доставки; история должна одинаково пережить перезагрузку
+        # и для актора (он увидит "Вы: ..." при повторном рендере на клиенте
+        # по actor_id), и для остальных.
+        entry = await chat_history.append_event(payload)
+        payload["id"] = entry["id"]
+        payload["created_at"] = entry["created_at"]
+    await broadcaster.broadcast(payload, exclude_user_id)

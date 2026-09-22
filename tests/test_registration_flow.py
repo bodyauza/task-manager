@@ -3,7 +3,11 @@
 #   POST /auth/register/verify-code   — проверка кода, выдача reg_token cookie
 #   POST /auth/register/complete      — создание записи в person
 from httpx import AsyncClient
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
+from src.auth.user_models import RegistrationPending, User
+from src.database import async_session_maker
 from tests.conftest import promote_to_admin
 
 VALID_EMAIL    = "new@example.com"
@@ -172,11 +176,52 @@ async def test_verify_code_too_short(client: AsyncClient, mock_smtp: dict):
 
 # ─── complete ─────────────────────────────────────────────────────────────────
 
-async def test_complete_success(client: AsyncClient, mock_smtp: dict):
+async def test_complete_success(client: AsyncClient, mock_smtp: dict, mock_crm: dict):
     await _request_code(client)
     await _verify_code(client, mock_smtp)
     r = await _complete(client)
     assert r.status_code == 201
+
+    # Пользователь реально создан и зарегистрирован в CRM, а не только «формально успешен».
+    async with async_session_maker() as session:
+        user = (await session.execute(
+            select(User).options(selectinload(User.roles)).where(User.email == VALID_EMAIL)
+        )).scalar_one()
+        pending = (await session.execute(
+            select(RegistrationPending).where(RegistrationPending.email == VALID_EMAIL)
+        )).scalar_one_or_none()
+    assert user.username == "new"                          # часть email до '@'
+    assert (user.firstname, user.lastname) == ("Иван", "Иванов")
+    assert user.is_verified and user.is_active
+    assert [role.name for role in user.roles] == ["user"]  # роль по умолчанию
+    assert user.hashed_password != VALID_PASSWORD          # пароль не хранится в открытом виде
+    assert pending is None                                 # заявка на регистрацию израсходована
+    mock_crm["crm"].register_user.assert_awaited_once()
+    assert mock_crm["crm"].register_user.call_args.kwargs["email"] == VALID_EMAIL
+
+
+async def test_complete_succeeds_even_if_crm_registration_fails(
+    client: AsyncClient, mock_smtp: dict, mock_crm: dict,
+):
+    """Регистрация в CRM — best-effort (auth/manager.py::create): недоступность
+    CRM (сеть, таймаут, невалидный ответ) не должна останавливать регистрацию
+    пользователя. Раньше любая ошибка CRM превращалась в CRMUnavailableError и
+    503 клиенту, а person не создавался вовсе — это ограничение снято, т.к.
+    /auth/login больше не проверяет наличие пользователя в CRM (см. mock_crm
+    ниже и docstring этой фикстуры в tests/conftest.py)."""
+    mock_crm["crm"].register_user.side_effect = Exception("CRM недоступна")
+
+    await _request_code(client)
+    await _verify_code(client, mock_smtp)
+    r = await _complete(client)
+
+    assert r.status_code == 201
+    # Пользователь реально создан в PostgreSQL, а не только формально "успешен" —
+    # логин работает как для обычной, полностью успешной регистрации.
+    login = await client.post(
+        "/auth/login", data={"username": VALID_EMAIL, "password": VALID_PASSWORD}
+    )
+    assert login.status_code == 200
 
 
 async def test_complete_no_token(client: AsyncClient):
@@ -190,6 +235,21 @@ async def test_complete_weak_password(client: AsyncClient, mock_smtp: dict):
     await _verify_code(client, mock_smtp)
     r = await _complete(client, password="weak")
     assert r.status_code == 422
+
+
+async def test_complete_rejects_password_longer_than_72_chars(client: AsyncClient, mock_smtp: dict):
+    """Верхняя граница длины (max_length=72) — в схеме, а не в регэкспе."""
+    await _request_code(client)
+    await _verify_code(client, mock_smtp)
+    r = await _complete(client, password="Aa1!" + "x" * 69)     # 73 символа
+    assert r.status_code == 422
+
+
+async def test_complete_accepts_password_of_exactly_72_chars(client: AsyncClient, mock_smtp: dict):
+    await _request_code(client)
+    await _verify_code(client, mock_smtp)
+    r = await _complete(client, password="Aa1!" + "x" * 68)     # ровно 72 символа
+    assert r.status_code == 201
 
 
 async def test_complete_missing_firstname(client: AsyncClient, mock_smtp: dict):
@@ -227,9 +287,16 @@ async def test_reg_token_deleted_after_complete(client: AsyncClient, mock_smtp: 
     await _verify_code(client, mock_smtp)
     r = await _complete(client)
     assert r.status_code == 201
-    # reg_token должен быть удалён или иметь пустое значение
-    cookie = r.cookies.get("reg_token", "")
-    assert cookie == "" or "reg_token" not in r.cookies
+    # Сервер ЯВНО удаляет куку: Set-Cookie: reg_token=...; Max-Age=0 (проверка по
+    # r.cookies.get("reg_token", "") пропускала бы и «сервер ничего не прислал»).
+    deletions = [h for h in r.headers.get_list("set-cookie") if h.startswith("reg_token=")]
+    assert deletions, "сервер не прислал Set-Cookie для reg_token"
+    assert "Max-Age=0" in deletions[0] or "expires=" in deletions[0].lower()
+    assert "reg_token" not in client.cookies
+    # Повторно использовать одноразовый токен нельзя.
+    again = await _complete(client)
+    assert again.status_code == 401
+    assert again.json()["detail"] == "MISSING_REG_TOKEN"
 
 
 async def test_code_consumed_after_verify(client: AsyncClient, mock_smtp: dict):
