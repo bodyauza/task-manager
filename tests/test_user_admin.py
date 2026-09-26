@@ -1,12 +1,10 @@
 """Тесты формы создания пользователя и правки пароля в sqladmin
-(src/admin/user_admin.py::UserAdmin): создание идёт через UserManager.create()
-(CRM-регистрация мокается — get_user_registrar подменяется), пароль хешируется
-тем же PasswordHelper, что и при регистрации, валидация та же, что у API, пароль не
-попадает в ответы/логи.
+(src/admin/user_admin.py::UserAdmin): создание идёт через UserManager.create(),
+пароль хешируется тем же PasswordHelper, что и при регистрации, валидация та
+же, что у API, пароль не попадает в ответы/логи.
 """
 
 import logging
-from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -25,14 +23,6 @@ ADMIN_EMAIL = ADMIN_PANEL_EMAIL
 PASSWORD = "Password1!"
 NEW_EMAIL = "new.person@example.com"
 NEW_PASSWORD = "Secret1!x"
-
-
-@pytest.fixture
-def crm_registrar():
-    """Подмена get_user_registrar (UserManager.create() вызывает CRM в реальности)."""
-    fake = AsyncMock()
-    with patch("src.admin.user_admin.get_user_registrar", return_value=fake):
-        yield fake
 
 
 def _create_form(**overrides) -> dict:
@@ -82,9 +72,7 @@ async def test_delete_stays_disabled(admin_client: AsyncClient):
 
 # ── Создание ────────────────────────────────────────────────────────────────
 
-async def test_create_user_hashes_password_and_registers_like_normal_flow(
-    admin_client: AsyncClient, crm_registrar: AsyncMock,
-):
+async def test_create_user_hashes_password_and_sets_defaults(admin_client: AsyncClient):
     r = await _post_create(admin_client)
     assert r.status_code == 302
 
@@ -97,12 +85,8 @@ async def test_create_user_hashes_password_and_registers_like_normal_flow(
     assert user.hashed_password != NEW_PASSWORD
     assert password_helper.verify_and_update(NEW_PASSWORD, user.hashed_password)[0]
 
-    crm_registrar.register_user.assert_awaited_once()
-    kwargs = crm_registrar.register_user.call_args.kwargs
-    assert kwargs["email"] == NEW_EMAIL and kwargs["username"] == "new.person"
 
-
-async def test_created_user_can_log_in(admin_client: AsyncClient, crm_registrar: AsyncMock):
+async def test_created_user_can_log_in(admin_client: AsyncClient):
     assert (await _post_create(admin_client)).status_code == 302
     admin_client.cookies.clear()
     r = await admin_client.post("/auth/login", data={"username": NEW_EMAIL, "password": NEW_PASSWORD})
@@ -110,25 +94,17 @@ async def test_created_user_can_log_in(admin_client: AsyncClient, crm_registrar:
     assert "access_token" in r.cookies or "access_token" in admin_client.cookies
 
 
-async def test_create_user_without_patronymic_stores_null(admin_client: AsyncClient, crm_registrar: AsyncMock):
+async def test_create_user_without_patronymic_stores_null(admin_client: AsyncClient):
     assert (await _post_create(admin_client, patronymic="")).status_code == 302
     assert (await _get_user(NEW_EMAIL)).patronymic is None
 
 
-async def test_create_user_with_selected_roles_replaces_default(admin_client: AsyncClient, crm_registrar: AsyncMock):
+async def test_create_user_with_selected_roles_replaces_default(admin_client: AsyncClient):
     r = await admin_client.post(
         "/admin/user/create", data={**_create_form(), "roles": ["2"]}, follow_redirects=False,
     )
     assert r.status_code == 302
     assert [role.name for role in (await _get_user(NEW_EMAIL)).roles] == ["admin"]
-
-
-async def test_create_user_survives_crm_failure(admin_client: AsyncClient, crm_registrar: AsyncMock):
-    """Как и при самостоятельной регистрации, недоступность CRM не мешает
-    создать пользователя в PostgreSQL."""
-    crm_registrar.register_user.side_effect = RuntimeError("CRM down")
-    assert (await _post_create(admin_client)).status_code == 302
-    assert await _get_user(NEW_EMAIL) is not None
 
 
 @pytest.mark.parametrize("overrides, expected_text", [
@@ -140,25 +116,21 @@ async def test_create_user_survives_crm_failure(admin_client: AsyncClient, crm_r
     ({"firstname": ""}, ""),                                          # обязательное поле формы
 ])
 async def test_create_user_rejects_invalid_input(
-    admin_client: AsyncClient, crm_registrar: AsyncMock, overrides: dict, expected_text: str,
+    admin_client: AsyncClient, overrides: dict, expected_text: str,
 ):
     r = await _post_create(admin_client, **overrides)
     assert r.status_code == 400
     assert expected_text.lower() in r.text.lower()
     assert await _get_user(NEW_EMAIL) is None
-    crm_registrar.register_user.assert_not_called()
 
 
-async def test_create_user_rejects_duplicate_email(admin_client: AsyncClient, crm_registrar: AsyncMock):
+async def test_create_user_rejects_duplicate_email(admin_client: AsyncClient):
     r = await _post_create(admin_client, email=ADMIN_EMAIL)
     assert r.status_code == 400
     assert "уже существует" in r.text
-    crm_registrar.register_user.assert_not_called()
 
 
-async def test_create_error_does_not_leak_password(
-    admin_client: AsyncClient, crm_registrar: AsyncMock, caplog,
-):
+async def test_create_error_does_not_leak_password(admin_client: AsyncClient, caplog):
     """Ни в HTML ответа, ни в логи (sqladmin делает logger.exception(e)) пароль
     не попадает — в отличие от текста pydantic.ValidationError (input_value)."""
     secret = "leakcheck"           # заведомо слабый: не пройдёт проверку формата
@@ -177,7 +149,7 @@ async def test_create_requires_admin_login(client: AsyncClient):
 
 # ── Правка пароля ───────────────────────────────────────────────────────────
 
-async def _make_target(admin_client: AsyncClient, crm_registrar: AsyncMock) -> User:
+async def _make_target(admin_client: AsyncClient) -> User:
     assert (await _post_create(admin_client)).status_code == 302
     return await _get_user(NEW_EMAIL)
 
@@ -187,8 +159,8 @@ async def _edit(client: AsyncClient, user_id: int, **fields):
     return await client.post(f"/admin/user/edit/{user_id}", data=data, follow_redirects=False)
 
 
-async def test_edit_without_password_keeps_hash(admin_client: AsyncClient, crm_registrar: AsyncMock):
-    target = await _make_target(admin_client, crm_registrar)
+async def test_edit_without_password_keeps_hash(admin_client: AsyncClient):
+    target = await _make_target(admin_client)
     old_hash = target.hashed_password
 
     r = await _edit(admin_client, target.id, password="")
@@ -197,16 +169,16 @@ async def test_edit_without_password_keeps_hash(admin_client: AsyncClient, crm_r
     assert (await _get_user(NEW_EMAIL)).hashed_password == old_hash
 
 
-async def test_edit_without_password_field_at_all_keeps_hash(admin_client: AsyncClient, crm_registrar: AsyncMock):
-    target = await _make_target(admin_client, crm_registrar)
+async def test_edit_without_password_field_at_all_keeps_hash(admin_client: AsyncClient):
+    target = await _make_target(admin_client)
     old_hash = target.hashed_password
 
     assert (await _edit(admin_client, target.id)).status_code == 302
     assert (await _get_user(NEW_EMAIL)).hashed_password == old_hash
 
 
-async def test_edit_with_password_sets_new_hash_and_allows_login(admin_client: AsyncClient, crm_registrar: AsyncMock):
-    target = await _make_target(admin_client, crm_registrar)
+async def test_edit_with_password_sets_new_hash_and_allows_login(admin_client: AsyncClient):
+    target = await _make_target(admin_client)
     old_hash = target.hashed_password
     fresh_password = "Fresh2@pass"
 
@@ -233,9 +205,9 @@ async def test_edit_with_password_sets_new_hash_and_allows_login(admin_client: A
     ("Aa1!" + "x" * 69, "72 символ"),
 ])
 async def test_edit_rejects_invalid_password_and_keeps_hash(
-    admin_client: AsyncClient, crm_registrar: AsyncMock, bad_password: str, expected_text: str,
+    admin_client: AsyncClient, bad_password: str, expected_text: str,
 ):
-    target = await _make_target(admin_client, crm_registrar)
+    target = await _make_target(admin_client)
     old_hash = target.hashed_password
 
     r = await _edit(admin_client, target.id, password=bad_password)
@@ -245,8 +217,8 @@ async def test_edit_rejects_invalid_password_and_keeps_hash(
     assert (await _get_user(NEW_EMAIL)).hashed_password == old_hash
 
 
-async def test_edit_password_together_with_is_active_and_roles(admin_client: AsyncClient, crm_registrar: AsyncMock):
-    target = await _make_target(admin_client, crm_registrar)
+async def test_edit_password_together_with_is_active_and_roles(admin_client: AsyncClient):
+    target = await _make_target(admin_client)
 
     r = await admin_client.post(
         f"/admin/user/edit/{target.id}",
@@ -261,8 +233,8 @@ async def test_edit_password_together_with_is_active_and_roles(admin_client: Asy
     assert password_helper.verify_and_update("Fresh2@pass", updated.hashed_password)[0]
 
 
-async def test_edit_form_never_echoes_password_or_hash(admin_client: AsyncClient, crm_registrar: AsyncMock):
-    target = await _make_target(admin_client, crm_registrar)
+async def test_edit_form_never_echoes_password_or_hash(admin_client: AsyncClient):
+    target = await _make_target(admin_client)
     r = await admin_client.get(f"/admin/user/edit/{target.id}")
     assert r.status_code == 200
     assert NEW_PASSWORD not in r.text

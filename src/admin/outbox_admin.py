@@ -13,40 +13,23 @@ failed-событие в очередь после устранения прич
 
 from sqladmin import ModelView, action
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
 from starlette.responses import RedirectResponse
 
 from src.admin.formatters import TYPE_FORMATTERS
 from src.database import async_session_maker
 from src.task_logic.models import CrmOutbox
-from src.tasks.crm_outbox_tasks import dispatch_outbox_row, set_aggregate_sync_status
+from src.tasks.crm_outbox_tasks import (
+    has_newer_done_sibling,
+    dispatch_outbox_row,
+    set_aggregate_sync_status,
+)
 
 
 def flash(request: Request, text: str, level: str = "success") -> None:
     """Одноразовое сообщение для следующей страницы: sqladmin не имеет flash-
     механизма, поэтому кладём его в сессию, а layout.html показывает и удаляет."""
     request.session["admin_flash"] = {"text": text, "level": level}
-
-
-async def _has_newer_done_sibling(session: AsyncSession, row: CrmOutbox) -> bool:
-    """True, если у той же сущности (aggregate_type, aggregate_id) есть ДРУГАЯ
-    строка с БОЛЬШИМ id и статусом 'done' — то есть более позднее событие уже
-    успешно синхронизировалось с CRM после того, как row провалилась. Возврат
-    row в очередь в этом случае применил бы устаревшие данные поверх свежих."""
-    newer = (
-        await session.execute(
-            select(CrmOutbox.id)
-            .where(
-                CrmOutbox.aggregate_type == row.aggregate_type,
-                CrmOutbox.aggregate_id == row.aggregate_id,
-                CrmOutbox.id > row.id,
-                CrmOutbox.status == "done",
-            )
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    return newer is not None
 
 
 class CrmOutboxAdmin(ModelView, model=CrmOutbox):
@@ -110,7 +93,7 @@ class CrmOutboxAdmin(ModelView, model=CrmOutbox):
                     )
                 ).scalars().all())
                 for row in candidates:
-                    if await _has_newer_done_sibling(session, row):
+                    if await has_newer_done_sibling(session, row):
                         stale.append(row)
                         continue
                     row.status = "pending"

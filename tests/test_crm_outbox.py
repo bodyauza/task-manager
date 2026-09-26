@@ -380,7 +380,7 @@ async def test_process_outbox_row_create_subtask_reads_fresh_parent_crm_task_id(
         await _process_outbox_row_async(outbox_id)
 
     fake_subtask_mgr.create_subtask.assert_called_once_with(
-        parent_item_id=42, title="Sub", description="d", completed=False,
+        parent_item_id=42, title="Sub", description="d", completed=False, creator_email=None,
     )
     async with async_session_maker() as session:
         subtask = (await session.execute(select(Subtask).where(Subtask.id == subtask_id))).scalar_one()
@@ -875,6 +875,104 @@ async def test_exhausted_attempts_mark_task_sync_status_failed():
     async with async_session_maker() as session:
         assert (await session.get(CrmOutbox, outbox_id)).status == "failed"
         assert (await session.get(Task, task_id)).sync_status == "failed"
+
+
+async def test_newer_event_of_same_task_is_not_overtaken_by_older_pending_sibling():
+    """Структурный запрет на обгон (_has_older_unfinished): более новое событие
+    той же задачи не начинает попытку, пока более старое ещё не завершилось —
+    не постфактум-проверка перед записью статуса (как было раньше), а отказ
+    выполниться вообще. Обработчик CRM не должен быть вызван."""
+    from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+
+    task_id, older_id = await _task_and_update_row(attempts=0, sync_status="pending")
+    async with async_session_maker() as session:
+        newer = CrmOutbox(
+            aggregate_type="task", aggregate_id=task_id, operation="update", status="pending",
+            attempts=0, shard="shard_0",
+            payload={"crm_task_id": 42, "title": "Y", "description": None, "completed": None, "project": None},
+        )
+        session.add(newer)
+        await session.commit()
+        newer_id = newer.id
+        assert newer_id > older_id  # иначе тест не проверяет то, что задуман
+
+    mgr = AsyncMock()
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=mgr):
+        await _process_outbox_row_async(newer_id)   # older_id всё ещё pending
+
+    mgr.update_task.assert_not_awaited()
+    async with async_session_maker() as session:
+        row = await session.get(CrmOutbox, newer_id)
+        assert row.status == "pending"
+        assert row.attempts == 0  # попытка не потрачена — строка просто отложена
+
+
+async def test_newer_event_waits_while_older_sibling_is_blocked():
+    """Тот же запрет — 'blocked' считается незавершённым наравне с 'pending'
+    (строка ждёт свою event-зависимость, а не провалилась окончательно)."""
+    from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+
+    task_id, older_id = await _task_and_update_row(attempts=0, sync_status="pending")
+    async with async_session_maker() as session:
+        older = await session.get(CrmOutbox, older_id)
+        older.status = "blocked"
+        newer = CrmOutbox(
+            aggregate_type="task", aggregate_id=task_id, operation="update", status="pending",
+            attempts=0, shard="shard_0",
+            payload={"crm_task_id": 42, "title": "Y", "description": None, "completed": None, "project": None},
+        )
+        session.add(newer)
+        await session.commit()
+        newer_id = newer.id
+
+    mgr = AsyncMock()
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=mgr):
+        await _process_outbox_row_async(newer_id)
+
+    mgr.update_task.assert_not_awaited()
+    async with async_session_maker() as session:
+        assert (await session.get(CrmOutbox, newer_id)).status == "pending"
+
+
+async def test_after_older_event_fails_newer_event_can_proceed_and_sync():
+    """Сквозной сценарий (воспроизводит живой баг задачи №28):
+    более старое событие исчерпывает попытки первым — раз оно было единственным
+    событием агрегата на тот момент, sync_status честно становится 'failed'
+    (порождать нечего — младшее событие физически не могло выполниться раньше,
+    см. докстринг _refresh_sync_status). После этого более новое событие уже
+    не заблокировано (_has_older_unfinished больше не видит незавершённых
+    старших) — выполняется и пересчитывает sync_status заново в 'synced', без
+    отдельного шага «довести до synced», который требовался раньше."""
+    from src.tasks.crm_outbox_tasks import MAX_ATTEMPTS, _process_outbox_row_async
+
+    task_id, older_id = await _task_and_update_row(attempts=MAX_ATTEMPTS - 1, sync_status="pending")
+    async with async_session_maker() as session:
+        newer = CrmOutbox(
+            aggregate_type="task", aggregate_id=task_id, operation="update", status="pending",
+            attempts=0, shard="shard_0",
+            payload={"crm_task_id": 42, "title": "Y", "description": None, "completed": None, "project": None},
+        )
+        session.add(newer)
+        await session.commit()
+        newer_id = newer.id
+
+    failing = AsyncMock()
+    failing.update_task.side_effect = Exception("CRM down")
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=failing):
+        await _process_outbox_row_async(older_id)   # 5-я попытка — исчерпаны
+
+    async with async_session_maker() as session:
+        assert (await session.get(CrmOutbox, older_id)).status == "failed"
+        assert (await session.get(Task, task_id)).sync_status == "failed"
+
+    succeeding = AsyncMock()
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=succeeding):
+        await _process_outbox_row_async(newer_id)   # older уже терминален — теперь можно
+
+    succeeding.update_task.assert_awaited_once()
+    async with async_session_maker() as session:
+        assert (await session.get(CrmOutbox, newer_id)).status == "done"
+        assert (await session.get(Task, task_id)).sync_status == "synced"
 
 
 async def test_non_final_failure_keeps_task_sync_status():

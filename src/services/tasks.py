@@ -184,6 +184,7 @@ async def create_task(
         payload={
             "title": task.title, "description": task.description,
             "completed": False, "project": task.project,
+            "creator_email": user_email,
         },
     )
     db.add(outbox_create)

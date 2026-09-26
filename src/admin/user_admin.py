@@ -6,11 +6,11 @@ role_ids, каскады) и не замена самостоятельной р
 
 **Создание** идёт не прямой записью в БД, а через UserManager.create()
 (insert_model ниже): тот же путь, что у регистрации, — хеш пароля, роль
-`user` по умолчанию, username = часть email до '@', best-effort регистрация в
-CRM. Минимальные проверки (email/пароль) — те же функции, что у API
-(auth/user_schemas.py). Роли из формы, если выбраны, ЗАМЕНЯЮТ роль по умолчанию.
-Созданный администратором пользователь сразу is_verified=True (как после
-подтверждения email кодом при самостоятельной регистрации).
+`user` по умолчанию, username = часть email до '@'. Минимальные проверки
+(email/пароль) — те же функции, что у API (auth/user_schemas.py). Роли из
+формы, если выбраны, ЗАМЕНЯЮТ роль по умолчанию. Созданный администратором
+пользователь сразу is_verified=True (как после подтверждения email кодом
+при самостоятельной регистрации).
 
 **Пароль** — виртуальное поле «Пароль» (у модели такой колонки нет, хранится
 только hashed_password, который в форму не попадает): при создании обязателен,
@@ -20,9 +20,8 @@ CRM. Минимальные проверки (email/пароль) — те же 
 обязано быть и в form_create_rules, и в form_edit_rules: sqladmin удаляет с
 формы всё, чего нет в правилах.
 
-**Не редактируется** через форму: email (логин, синхронизирован с CRM),
-firstname/lastname/patronymic после создания (синхронизированы с CRM при
-регистрации), hashed_password/is_superuser/registered_at, коллекция tasks
+**Не редактируется** через форму: email (логин), firstname/lastname/patronymic
+после создания, hashed_password/is_superuser/registered_at, коллекция tasks
 (delete-orphan: снятие галочки физически удалило бы задачу с подзадачами в
 обход outbox/файлов; владельца меняют со стороны TaskAdmin.owner).
 can_delete = False: удаление каскадно сносит задачи пользователя в обход
@@ -54,7 +53,6 @@ from src.auth.user_schemas import (
     is_valid_email_format,
     is_valid_password_format,
 )
-from src.crm.user_service import get_user_registrar
 from src.database import async_session_maker
 
 logger = logging.getLogger(__name__)
@@ -66,7 +64,7 @@ _PASSWORD_TOO_LONG = f"Пароль не должен быть длиннее {_
 # Тот же PasswordHelper, которым пользуется сам UserManager (BaseUserManager.
 # __init__ создаёт свой экземпляр — класс-атрибут UserManager.password_helper
 # им перекрывается), — хеш при правке пароля идентичен хешу при регистрации.
-_password_helper = UserManager(None, None).password_helper
+_password_helper = UserManager(None).password_helper
 
 
 def _validate_password(password: str) -> None:
@@ -167,7 +165,7 @@ class UserAdmin(ModelView, model=User):
             patronymic=patronymic, is_active=True, is_verified=True,
         )
         async with async_session_maker() as session:
-            manager = UserManager(SQLAlchemyUserDatabase(session, User), get_user_registrar())
+            manager = UserManager(SQLAlchemyUserDatabase(session, User))
             try:
                 user = await manager.create(user_create, safe=False, request=request)
             except exceptions.UserAlreadyExists:

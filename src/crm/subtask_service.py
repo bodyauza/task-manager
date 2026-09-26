@@ -19,6 +19,7 @@ class SubtaskManager(CRMClient):
         FIELD_TITLE — Название (строка)
         FIELD_DESCR — Описание (текст)
         FIELD_DONE  — Статус   (чекбокс: "true" / "false")
+        FIELD_CREATOR_EMAIL — Email создателя (строка, только при создании)
 
     Номера entity_id/field_* генерируются внутри конкретной инсталляции CRM и
     отличаются между инстансами — не хардкодятся, читаются из crm_settings
@@ -31,6 +32,7 @@ class SubtaskManager(CRMClient):
     FIELD_DONE  = crm_settings.SUBTASK_FIELD_COMPLETED     # ID поля «Статус» (чекбокс "true"/"false")
     FIELD_SPEC  = crm_settings.SUBTASK_FIELD_SPECIFICATION  # ID поля «Техническое задание» (одиночный файл)
     FIELD_OTHER = crm_settings.SUBTASK_FIELD_OTHER_FILES   # ID поля «Иные документы» (множественные файлы)
+    FIELD_CREATOR_EMAIL = crm_settings.SUBTASK_FIELD_CREATOR_EMAIL  # ID поля «Email создателя»
 
     async def create_subtask(
         self,
@@ -38,6 +40,7 @@ class SubtaskManager(CRMClient):
         title: str,
         description: str,
         completed: bool = False,
+        creator_email: Optional[str] = None,    # email пользователя, создавшего подзадачу; None — не передавать
     ) -> Dict[str, Any]:
         record = {
             f"field_{self.FIELD_TITLE}": title,             # "field_322": "Название"
@@ -45,6 +48,8 @@ class SubtaskManager(CRMClient):
             f"field_{self.FIELD_DONE}":  self._bool_to_crm(completed),  # "field_324": "false"
             "parent_item_id": parent_item_id,               # привязка к родительской задаче в CRM
         }
+        if creator_email is not None:
+            record[f"field_{self.FIELD_CREATOR_EMAIL}"] = creator_email
         logger.info("CRM: insert subtask parent_item_id=%s title='%s'", parent_item_id, title)
         result = await self._call(action="insert", entity_id=self.ENTITY_ID, items=[record])
         # _call() бросает Exception при: HTTP-ошибке, таймауте, невалидном JSON, ответе с "msg"
