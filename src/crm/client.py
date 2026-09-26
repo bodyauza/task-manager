@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # is None). Такой синглтон надёжен, только если первым инстанцируется сам
 # базовый класс: тогда атрибут пишется в его __dict__, и подклассы находят его
 # обычным lookup по MRO. Но CRMClient никогда не инстанцируется напрямую —
-# используются только TaskManager, SubtaskManager и CRMUserRegistrar.
+# используются только TaskManager и SubtaskManager.
 # Присваивание через cls внутри classmethod пишет атрибут
 # в __dict__ ТОГО класса, что передан как cls, а не мутирует атрибут родителя —
 # значит первый же вызов _get_client() у каждого из подклассов заводил
@@ -41,7 +41,24 @@ _shared_http_client: httpx.AsyncClient | None = None
 def _get_shared_http_client() -> httpx.AsyncClient:
     global _shared_http_client
     if _shared_http_client is None:
-        _shared_http_client = httpx.AsyncClient(timeout=30.0)
+        # timeout=30.0 (единый float) не подходит: httpx разворачивает его в
+        # ЧЕТЫРЕ независимых бюджета — connect/write/read/pool (см.
+        # src/tasks/crm_shard_lock.py, где эта механика разобрана подробно).
+        # Файловые операции (_file_to_crm ниже) передают файл до MAX_FILE_SIZE=
+        # 100 МБ (src/utils/file_utils.py) закодированным в base64 (~+33% объёма,
+        # до ~133 МБ) одним JSON-телом — на медленном канале или при долгой
+        # обработке большого поля на стороне CRM 30 секунд на фазу write или read
+        # легко не хватает: воспроизведено на реальном файле 93.6 МБ — httpx падал
+        # с TimeoutException, в crm_outbox.last_error оседало "CRM request timed
+        # out", sync_status оставался pending до исчерпания 5 попыток. connect/pool
+        # оставлены на 30 — там таймаут не наблюдался (быстрый TCP/TLS-хендшейк;
+        # воркер обрабатывает CRM-вызовы строго последовательно, --pool=solo,
+        # конкуренции за пул соединений внутри процесса нет). Смена этого значения
+        # требует пересчитать src/tasks/crm_shard_lock.py::_LOCK_TIMEOUT_SECONDS —
+        # оба числа рассчитаны от одного и того же худшего сценария.
+        _shared_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=30.0, write=120.0, read=120.0, pool=30.0)
+        )
     return _shared_http_client
 
 

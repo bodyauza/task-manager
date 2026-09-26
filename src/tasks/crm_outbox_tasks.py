@@ -54,6 +54,19 @@ src/tasks/crm_shard_lock.py, src/tasks/crm_rate_limit.py. Redlock здесь —
 топологией деплоя (один celery-worker-shard-N процесс на шард, --pool=solo,
 concurrency=1 — см. src/docker-compose.yml).
 
+Топология выше гарантирует, что два ПРОЦЕССА не читают одну очередь
+одновременно, но НЕ гарантирует порядок обработки событий ОДНОЙ сущности —
+строка с паузой перед повтором (_retry_delay_seconds) может пропустить
+вперёд себя более новое событие той же сущности, которое было поставлено в
+очередь сразу после вставки (dispatch_outbox_row) и не ждёт никакой паузы.
+_has_older_unfinished (ниже) закрывает это структурно: событие не начинает
+попытку, пока у той же сущности есть более старое ещё не завершённое
+(pending/blocked) событие. Без этой гарантии более старое событие, довыполнившись
+позже более нового, могло бы применить в CRM устаревшие данные ПОВЕРХ уже
+отправленных свежих. Task.sync_status/Subtask.sync_status в паре с этим
+ПЕРЕСЧИТЫВАЕТСЯ при каждом терминальном исходе (_refresh_sync_status), а не
+записывается условно, как раньше.
+
 Celery-задачи синхронные — src.celery_app.run_celery_task() оборачивает
 async-тело в свой asyncio.run(), освобождает пул соединений SQLAlchemy и
 закрывает общий httpx-клиент CRM сразу после (см. её докстринг — без этого
@@ -130,10 +143,15 @@ async def set_aggregate_sync_status(
     """Task.sync_status / Subtask.sync_status агрегата этой outbox-строки
     ('unsynced' | 'pending' | 'synced' | 'failed'). Агрегата уже может не
     быть (удалён) — тогда ничего не делает. only_from — менять только если
-    текущее значение среди перечисленных (не затирать, например, 'failed'
-    успешным статусом чужой операции). Общая точка для воркера (исчерпание
-    попыток / восстановление после успешного повтора) и admin-действия
-    «Повторить» (src/admin/outbox_admin.py)."""
+    текущее значение среди перечисленных.
+
+    Единственный оставшийся вызывающий — admin-действие «Повторить»
+    (src/admin/outbox_admin.py): сбрасывает 'failed' обратно в 'pending' перед
+    повторной постановкой строки в очередь. Терминальные исходы (успех или
+    провал попытки) сам воркер больше не «записывает» этой функцией — см.
+    _refresh_sync_status ниже, которая ПЕРЕСЧИТЫВАЕТ статус из текущего
+    состояния событий сущности, а не устанавливает заданное значение
+    условно."""
     model = _SYNC_STATUS_MODELS.get(row.aggregate_type)
     if model is None:
         return
@@ -170,6 +188,122 @@ async def _other_unfinished_events_exist(db: AsyncSession, row: CrmOutbox) -> bo
         )
     ).scalar_one_or_none()
     return other is not None
+
+
+async def _has_older_unfinished(db: AsyncSession, row: CrmOutbox) -> bool:
+    """Есть ли у ТОЙ ЖЕ сущности (aggregate_type, aggregate_id) более старое
+    (id < row.id) событие, ещё не завершённое ('pending' или 'blocked').
+
+    Структурный запрет на обгон, а не проверка постфактум перед записью
+    статуса (как было раньше — см. историю в докстринге has_newer_done_sibling
+    ниже): событие просто не начинает попытку, пока порядок не восстановлен,
+    вместо того чтобы выполниться и разбираться с последствиями потом.
+    Топология деплоя (--pool=solo, concurrency=1 — src/docker-compose.yml) не
+    даёт двум ПРОЦЕССАМ читать одну очередь одновременно, но не гарантирует,
+    что ОДИН и тот же воркер обработает события строго по id: у строки с
+    паузой перед повтором (_retry_delay_seconds) есть окно, в которое более
+    новое событие той же сущности — поставленное в очередь сразу после
+    вставки, без всякой паузы — успевает пройти вперёд и завершиться раньше.
+
+    Без этой проверки устаревшее событие, довыполнившись позже, могло бы
+    применить в CRM старые данные ПОВЕРХ уже отправленных свежих — не только
+    испортить sync_status (это лечили два прежних патча — has_newer_done_
+    sibling в ветке провала и доведение sync_status до 'synced' на последней
+    попытке, — см. git-историю этого файла), но и реально перезаписать
+    актуальные данные в самой CRM. Эта проверка устраняет причину (сам обгон),
+    а не только её проявление в статусе — поэтому оба прежних патча стали не
+    нужны и удалены (см. _refresh_sync_status ниже)."""
+    older = (
+        await db.execute(
+            select(CrmOutbox.id)
+            .where(
+                CrmOutbox.aggregate_type == row.aggregate_type,
+                CrmOutbox.aggregate_id == row.aggregate_id,
+                CrmOutbox.id < row.id,
+                CrmOutbox.status.in_(("pending", "blocked")),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return older is not None
+
+
+async def _refresh_sync_status(db: AsyncSession, row: CrmOutbox, *, failed: bool) -> None:
+    """Task.sync_status/Subtask.sync_status — не запись заданного значения, а
+    ПЕРЕСЧЁТ из текущего состояния событий сущности при каждом терминальном
+    исходе (row.status стал 'done' или 'failed'). Единая точка для ЛЮБОЙ
+    операции — create/update/delete/sync_files — а не только update/sync_files,
+    как было раньше: create ставил sync_status сам, внутри _do_create_task/
+    _do_create_subtask, теперь не ставит — эта функция делает то же самое за
+    него, тем же способом, что и для остальных операций.
+
+    failed=True: статус безусловно 'failed'. Благодаря _has_older_unfinished
+    (см. её докстринг) в момент, когда СТАРШЕЕ событие сущности проваливается
+    окончательно, ни одно МЛАДШЕЕ событие той же сущности ещё не могло
+    выполниться — оно физически не начало бы попытку, пока это событие не
+    стало терминальным. Портить нечем — 'failed' здесь всегда честная картина
+    происходящего прямо сейчас, а не потенциальное затирание более свежего
+    'synced'.
+
+    failed=False: пересчитывается из _other_unfinished_events_exist — остались
+    ли у сущности другие незавершённые (pending/blocked) события. Если да —
+    'pending' (работа продолжается), если нет — 'synced'. Этим же путём статус
+    самостоятельно восстанавливается после более раннего 'failed' другого
+    события: как только ПОСЛЕДНИЙ незавершённый сосед (в т.ч. ранее
+    провалившийся) разрешается успехом, пересчёт видит «незавершённых больше
+    нет» и ставит 'synced' — без отдельного шага «довести до synced», который
+    раньше требовался специально для этого случая.
+
+    Агрегата уже может не быть — после 'delete' (обычный случай: сущность
+    удаляется на веб-стороне СИНХРОННО, до того как воркер вообще увидит
+    outbox-строку 'delete') или если её удалили конкурентно, пока воркер
+    обрабатывал более старое событие. db.get вернёт None — функция просто
+    ничего не делает, отдельная проверка row.operation != "delete" (как было
+    раньше) для этого не нужна."""
+    model = _SYNC_STATUS_MODELS.get(row.aggregate_type)
+    if model is None:
+        return
+    entity = await db.get(model, row.aggregate_id)
+    if entity is None:
+        return
+    if failed:
+        entity.sync_status = "failed"
+        return
+    entity.sync_status = "pending" if await _other_unfinished_events_exist(db, row) else "synced"
+
+
+async def has_newer_done_sibling(db: AsyncSession, row: CrmOutbox) -> bool:
+    """True, если у той же сущности (aggregate_type, aggregate_id) есть ДРУГАЯ
+    строка с БОЛЬШИМ id и статусом 'done' — то есть более позднее событие уже
+    успешно синхронизировалось с CRM.
+
+    Используется в admin-действии «Повторить» (src/admin/outbox_admin.py) —
+    не переставлять в очередь failed-строку, которую перекрыло более новое
+    успешное событие (иначе повтор применил бы устаревшие данные поверх уже
+    отправленных в CRM свежих). Актуально именно для РУЧНОГО повтора: к
+    моменту, когда администратор решает вернуть в очередь уже терминальную
+    ('failed') строку, _has_older_unfinished её больше не защищает — тот
+    запрет действует только пока строка сама ещё не завершилась, а тут она
+    уже давно завершилась (неудачей) и с тех пор порядок никем не
+    контролируется.
+
+    До этой правки та же функция использовалась ЕЩЁ и в самом воркере — как
+    заплатка поверх отсутствовавшего структурного запрета на обгон (см.
+    докстринг _has_older_unfinished и _refresh_sync_status). Теперь обгон
+    невозможен в принципе, поэтому там эта проверка была удалена."""
+    newer = (
+        await db.execute(
+            select(CrmOutbox.id)
+            .where(
+                CrmOutbox.aggregate_type == row.aggregate_type,
+                CrmOutbox.aggregate_id == row.aggregate_id,
+                CrmOutbox.id > row.id,
+                CrmOutbox.status == "done",
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return newer is not None
 
 
 async def _lock_entity(db: AsyncSession, model, entity_id: int):
@@ -259,9 +393,10 @@ async def _do_create_task(db: AsyncSession, row: CrmOutbox) -> None:
     """Идемпотентный retry: сначала ищем уже созданную запись (find_task,
     эвристика title+description — см. её докстринг), чтобы повторная попытка
     после сбоя между "CRM создала запись" и "мы записали crm_task_id" не
-    создала дубликат. Task.crm_task_id/sync_status обновляются здесь же —
-    в отличие от update/delete/sync_files, 'create' не может унаследовать
-    crm_task_id из своего payload (его ещё не существовало на момент вставки).
+    создала дубликат. Task.crm_task_id обновляется здесь же — в отличие от
+    update/delete/sync_files, 'create' не может унаследовать crm_task_id из
+    своего payload (его ещё не существовало на момент вставки). sync_status
+    здесь не трогается — см. _refresh_sync_status.
     """
     payload = row.payload
     mgr = TaskManager()
@@ -273,6 +408,7 @@ async def _do_create_task(db: AsyncSession, row: CrmOutbox) -> None:
         result = await mgr.create_task(
             title=payload["title"], description=payload["description"],
             completed=payload.get("completed", False), project=payload.get("project"),
+            creator_email=payload.get("creator_email"),
         )
         crm_id = result.get("id")
     crm_id = int(crm_id) if crm_id is not None else None
@@ -294,7 +430,8 @@ async def _do_create_task(db: AsyncSession, row: CrmOutbox) -> None:
             )
         return
     task.crm_task_id = crm_id
-    task.sync_status = "synced" if crm_id is not None else "failed"
+    # sync_status здесь больше не ставится — _refresh_sync_status в конце
+    # _process_outbox_row_async делает это единообразно для всех операций.
     if crm_id is None:
         raise Exception("CRM create_task retry: no valid id in response")
 
@@ -405,6 +542,7 @@ async def _do_create_subtask(db: AsyncSession, row: CrmOutbox) -> None:
         result = await mgr.create_subtask(
             parent_item_id=task.crm_task_id, title=payload["title"],
             description=payload["description"], completed=payload.get("completed", False),
+            creator_email=payload.get("creator_email"),
         )
         crm_id = result.get("id")
     crm_id = int(crm_id) if crm_id is not None else None
@@ -421,7 +559,7 @@ async def _do_create_subtask(db: AsyncSession, row: CrmOutbox) -> None:
             )
         return
     subtask.crm_subtask_id = crm_id
-    subtask.sync_status = "synced" if crm_id is not None else "failed"
+    # sync_status здесь больше не ставится — см. _do_create_task выше.
     if crm_id is None:
         raise Exception("CRM create_subtask retry: no valid id in response")
 
@@ -504,6 +642,17 @@ async def _process_outbox_row_async(outbox_id: int) -> None:
             # чем эта задача успела выполниться — не повторная отправка в CRM.
             return
 
+        if await _has_older_unfinished(db, row):
+            # Структурный запрет на обгон — см. докстринг _has_older_unfinished.
+            # Попытка не тратится, статус не трогается: следующий тик
+            # reconcile_pending_outbox найдёт строку снова, когда более старое
+            # событие этой же сущности к тому моменту уже станет терминальным.
+            logger.info(
+                "crm_outbox id=%s: у сущности есть более старое незавершённое событие — ждём",
+                outbox_id,
+            )
+            return
+
         if row.depends_on_event_id is not None:
             dep_status = await _dependency_status(db, row.depends_on_event_id)
             if dep_status != "done":
@@ -547,12 +696,6 @@ async def _process_outbox_row_async(outbox_id: int) -> None:
             row.last_error = _format_error(exc)
             if row.attempts >= MAX_ATTEMPTS:
                 row.status = "failed"
-                if row.operation != "delete":
-                    # Попытки исчерпаны — сама сущность не синхронизирована с
-                    # CRM (для delete агрегата уже нет, менять нечего). Виден в
-                    # /admin/crm-sync; вернуть в работу — действие «Повторить»
-                    # в CRM outbox (src/admin/outbox_admin.py).
-                    await set_aggregate_sync_status(db, row, "failed")
                 logger.error(
                     "crm_outbox id=%s (%s/%s): попытки исчерпаны (%d) — требуется ручное вмешательство: %s",
                     outbox_id, row.aggregate_type, row.operation, row.attempts, exc,
@@ -562,15 +705,17 @@ async def _process_outbox_row_async(outbox_id: int) -> None:
                     "crm_outbox id=%s (%s/%s): попытка %d не удалась, остаётся pending: %s",
                     outbox_id, row.aggregate_type, row.operation, row.attempts, exc,
                 )
-        if row.status == "done" and row.operation in ("update", "sync_files"):
-            # create сам ставит 'synced' в обработчике; update/sync_files
-            # восстанавливают статус после ранее исчерпанных попыток
-            # ('failed') или повтора из админки ('pending'). Но только если у
-            # сущности не осталось ДРУГИХ незавершённых событий — иначе более
-            # раннее из двух параллельных update/sync_files преждевременно
-            # пометило бы сущность 'synced', пока более позднее ещё pending.
-            if not await _other_unfinished_events_exist(db, row):
-                await set_aggregate_sync_status(db, row, "synced", only_from=("failed", "pending"))
+
+        if row.status in ("done", "failed"):
+            # Единая точка пересчёта sync_status для ЛЮБОЙ операции — см.
+            # докстринг _refresh_sync_status. Раньше здесь стояли два патча
+            # (has_newer_done_sibling в ветке провала + доведение до 'synced'
+            # на последней попытке) — оба больше не нужны: _has_older_unfinished
+            # выше делает обгон структурно невозможным, поэтому пересчёт по
+            # факту не может затереть более свежий 'synced' устаревшим
+            # 'failed', а более раннее 'failed' само рассосётся, как только
+            # разрешится последнее незавершённое событие сущности.
+            await _refresh_sync_status(db, row, failed=(row.status == "failed"))
         await db.commit()
 
 

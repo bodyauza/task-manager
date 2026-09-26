@@ -287,7 +287,7 @@ async def verify_registration_code(
     "/register/complete",
     status_code=201,
     summary="Шаг 3: создать пользователя",
-    description="Требует куку `reg_token` из шага 2. Регистрация в CRM выполняется best-effort.",
+    description="Требует куку `reg_token` из шага 2.",
     responses=responses(401, 409, 422, c401="MISSING_REG_TOKEN — нет куки reg_token или токен недействителен", c409="EMAIL_ALREADY_REGISTERED", c422="Слабый пароль или ошибка валидации полей"),
 )
 async def complete_registration(
@@ -296,7 +296,7 @@ async def complete_registration(
     reg_token: Optional[str] = Cookie(default=None),
     user_manager: UserManager = Depends(get_user_manager),
 ) -> dict:
-    """Шаг 3 из 3. Создаёт пользователя в БД и CRM; удаляет reg_token-куку.
+    """Шаг 3 из 3. Создаёт пользователя в БД; удаляет reg_token-куку.
 
     reg_token из HttpOnly-куки — единственное доказательство подтверждённого email.
     Подделать его без знания REG_TOKEN_SECRET невозможно: JWT подписан HMAC-SHA256.
@@ -329,9 +329,8 @@ async def complete_registration(
     )
 
     try:
-        # user_manager.create: пытается зарегистрировать в CRM (best-effort,
-        # сбой только логируется — см. auth/manager.py::create), затем INSERT
-        # в person независимо от результата CRM-регистрации.
+        # user_manager.create: хеширует пароль, назначает роль по умолчанию,
+        # создаёт запись в person.
         await user_manager.create(user_create)
     except Exception as exc:
         from fastapi_users import exceptions as fu_exc

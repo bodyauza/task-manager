@@ -13,7 +13,6 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from src.auth.user_models import Role, User
 from src.config import settings
-from src.crm.user_service import get_user_registrar
 from src.database import async_session_maker, engine, Base
 from src.main import app
 
@@ -133,30 +132,6 @@ async def promote_to_admin(email: str) -> None:
 
 
 @pytest.fixture(autouse=True)
-def mock_crm():
-    # Подмена через app.dependency_overrides, а не patch() по пути импорта: UserManager
-    # получает CRM-абстракцию через Depends(get_user_registrar) (см. src/crm/user_service.py) —
-    # тест подставляет фейковую реализацию прямо в граф зависимостей FastAPI, не завися от
-    # того, где и как именно вызывающий код импортирует конкретный класс. /auth/login
-    # больше не обращается к CRM вообще (проверка существования пользователя в CRM при
-    # входе удалена) — мокать здесь нечего, кроме регистрации. Task/Subtask
-    # CRM-синхронизация — целиком в Celery-воркере (веб-процесс её не вызывает вообще) —
-    # см. mock_outbox_dispatch ниже, эта фикстура их не мокает.
-    # test_crm.py работает с TaskManager/CRMClient/CRMUserRegistrar напрямую (не через app),
-    # поэтому эта фикстура на него не влияет.
-    mock_crm_instance = AsyncMock()
-    mock_crm_instance.register_user.return_value = {"status": "success", "data": {"id": "99"}}
-
-    app.dependency_overrides[get_user_registrar] = lambda: mock_crm_instance
-
-    yield {
-        "crm": mock_crm_instance,
-    }
-
-    del app.dependency_overrides[get_user_registrar]
-
-
-@pytest.fixture(autouse=True)
 def mock_outbox_dispatch():
     """Патчит dispatch_outbox_row (src/tasks/crm_outbox_tasks.py) во всех трёх
     продюсерах (services/tasks.py, services/subtasks.py, services/attachments.py
@@ -188,9 +163,9 @@ def mock_realtime_redis():
     трогающего create/update/delete задач или подзадач, не только из
     tests/test_realtime.py. Публикация уже best-effort (try/except в самом
     broadcast()), но без мока тесты всё равно пытались бы открыть настоящее
-    TCP-соединение к REDIS_URL на каждый такой вызов — тот же принцип, что и
-    mock_crm ниже: подменяем прямую зависимость, а не полагаемся на то, что
-    внешний сервис недоступен и упадёт достаточно быстро.
+    TCP-соединение к REDIS_URL на каждый такой вызов — подменяем прямую
+    зависимость, а не полагаемся на то, что внешний сервис недоступен и
+    упадёт достаточно быстро.
     """
     fake = AsyncMock()
     with patch("src.realtime.connection_manager._get_redis", return_value=fake):

@@ -1,12 +1,10 @@
 """
-Юнит-тесты CRM-клиентов из src/crm/user_service.py (CRMUserRegistrar) и
-src/crm/task_service.py (TaskManager); SubtaskManager — в test_crm_subtask.py.
+Юнит-тесты CRM-клиента src/crm/task_service.py (TaskManager); SubtaskManager —
+в test_crm_subtask.py.
 
 Все HTTP-вызовы перехватываются через unittest.mock (httpx-клиент): реальных
-запросов нет. Тесты работают с менеджерами напрямую, минуя приложение, поэтому
-autouse-фикстура mock_crm из conftest.py (подмена зависимости FastAPI
-get_user_registrar) на них не влияет — каждый тест сам настраивает свой mock
-для полного контроля сценария.
+запросов нет. Тесты работают с менеджером напрямую, минуя приложение, поэтому
+каждый тест сам настраивает свой mock для полного контроля сценария.
 """
 import json
 
@@ -15,7 +13,6 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.crm.task_service import TaskManager
-from src.crm.user_service import CRMUserRegistrar
 
 # Ключи полей CRM выводятся из констант TaskManager, а не хардкодятся строками:
 # сторонние разработчики меняют FIELD_TITLE/FIELD_DESCR/FIELD_DONE в task_service.py
@@ -68,88 +65,6 @@ def _patch_httpx(return_value=None, side_effect=None):
     return patcher, mock_http
 
 
-# ── CRMClient.register_user ───────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_register_user_success():
-    """register_user возвращает ответ CRM при успешном запросе."""
-    patcher, mock_http = _patch_httpx(_resp({"id": "42"}))
-    try:
-        result = await CRMUserRegistrar().register_user(
-            group_id=6, firstname="Ivan", lastname="Petrov",
-            username="ivan", email="ivan@example.com",
-        )
-        assert result["status"] == "success"
-        payload = mock_http.post.call_args.kwargs["json"]
-        assert payload["action"] == "insert"
-        assert payload["entity_id"] == 1
-        assert payload["items"][0]["email"] == "ivan@example.com"
-    finally:
-        patcher.stop()
-
-
-@pytest.mark.asyncio
-async def test_register_user_connection_error():
-    """register_user бросает Exception при недоступности CRM."""
-    patcher, _ = _patch_httpx(side_effect=httpx.ConnectError("refused"))
-    try:
-        with pytest.raises(Exception, match="Connection error"):
-            await CRMUserRegistrar().register_user(
-                group_id=6, firstname="Ivan", lastname="Petrov",
-                username="ivan", email="ivan@example.com",
-            )
-    finally:
-        patcher.stop()
-
-
-@pytest.mark.asyncio
-async def test_register_user_timeout():
-    """register_user бросает Exception при превышении таймаута."""
-    patcher, _ = _patch_httpx(side_effect=httpx.TimeoutException("timeout"))
-    try:
-        with pytest.raises(Exception, match="timed out"):
-            await CRMUserRegistrar().register_user(
-                group_id=6, firstname="Ivan", lastname="Petrov",
-                username="ivan", email="ivan@example.com",
-            )
-    finally:
-        patcher.stop()
-
-
-@pytest.mark.asyncio
-async def test_register_user_crm_api_error():
-    """register_user бросает Exception, если CRM вернула ошибку в теле ответа."""
-    patcher, _ = _patch_httpx(_err_resp("Email already exists"))
-    try:
-        with pytest.raises(Exception, match="CRM API error"):
-            await CRMUserRegistrar().register_user(
-                group_id=6, firstname="Ivan", lastname="Petrov",
-                username="ivan", email="ivan@example.com",
-            )
-    finally:
-        patcher.stop()
-
-
-@pytest.mark.asyncio
-async def test_register_user_invalid_json():
-    """register_user бросает Exception при невалидном JSON."""
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.raise_for_status = MagicMock()
-    mock_resp.text = "not-json"
-    mock_resp.json.side_effect = ValueError("invalid json")
-
-    patcher, _ = _patch_httpx(mock_resp)
-    try:
-        with pytest.raises(Exception, match="invalid JSON"):
-            await CRMUserRegistrar().register_user(
-                group_id=6, firstname="Ivan", lastname="Petrov",
-                username="ivan", email="ivan@example.com",
-            )
-    finally:
-        patcher.stop()
-
-
 # ── TaskManager.create_task ───────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -195,6 +110,34 @@ async def test_create_task_crm_api_error():
     try:
         with pytest.raises(Exception, match="CRM API error"):
             await TaskManager().create_task(title="Existing", description="D")
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_create_task_with_creator_email():
+    """create_task передаёт email создателя, если он указан."""
+    _FIELD_CREATOR_EMAIL = f"field_{TaskManager.FIELD_CREATOR_EMAIL}"
+    patcher, mock_http = _patch_httpx(_resp({"id": "1"}))
+    try:
+        await TaskManager().create_task(
+            title="T", description="D", creator_email="user@example.com"
+        )
+        payload = mock_http.post.call_args.kwargs["json"]
+        assert payload["items"][0][_FIELD_CREATOR_EMAIL] == "user@example.com"
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_create_task_without_creator_email_omits_field():
+    """creator_email=None (дефолт) — поле в CRM не отправляется вовсе."""
+    _FIELD_CREATOR_EMAIL = f"field_{TaskManager.FIELD_CREATOR_EMAIL}"
+    patcher, mock_http = _patch_httpx(_resp({"id": "1"}))
+    try:
+        await TaskManager().create_task(title="T", description="D")
+        payload = mock_http.post.call_args.kwargs["json"]
+        assert _FIELD_CREATOR_EMAIL not in payload["items"][0]
     finally:
         patcher.stop()
 

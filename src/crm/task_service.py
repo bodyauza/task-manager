@@ -16,6 +16,7 @@ class TaskManager(CRMClient):
         FIELD_TITLE — Название    (строка, уникальное)
         FIELD_DESCR — Описание    (текст)
         FIELD_DONE  — Статус      (чекбокс: "true" / "false")
+        FIELD_CREATOR_EMAIL — Email создателя (строка, только при создании)
 
     Номера entity_id/field_* генерируются внутри конкретной инсталляции CRM и
     отличаются между инстансами — не хардкодятся, читаются из crm_settings
@@ -29,6 +30,7 @@ class TaskManager(CRMClient):
     FIELD_SPEC    = crm_settings.TASK_FIELD_SPECIFICATION  # ID поля «Техническое задание» (одиночный файл)
     FIELD_OTHER   = crm_settings.TASK_FIELD_OTHER_FILES    # ID поля «Иные документы» (множественные файлы)
     FIELD_PROJECT = crm_settings.TASK_FIELD_PROJECT        # ID поля «Проект» (выпадающий список, ссылка на глобальный справочник CRM)
+    FIELD_CREATOR_EMAIL = crm_settings.TASK_FIELD_CREATOR_EMAIL  # ID поля «Email создателя»
 
     async def create_task(
         self,
@@ -36,6 +38,7 @@ class TaskManager(CRMClient):
         description: str,
         completed: bool = False,
         project: Optional[str] = None,  # CRM-ID опции списка "Проект"; None — поле не выбрано
+        creator_email: Optional[str] = None,  # email пользователя, создавшего задачу; None — не передавать
     ) -> Dict[str, Any]:
         """Создаёт задачу в CRM; возвращает {'id': int|None, 'response': dict}."""
         record = {
@@ -45,6 +48,8 @@ class TaskManager(CRMClient):
         }
         if project is not None:
             record[f"field_{self.FIELD_PROJECT}"] = project
+        if creator_email is not None:
+            record[f"field_{self.FIELD_CREATOR_EMAIL}"] = creator_email
         logger.info("CRM: insert task title='%s'", title)
         result = await self._call(action="insert", entity_id=self.ENTITY_ID, items=[record])
 

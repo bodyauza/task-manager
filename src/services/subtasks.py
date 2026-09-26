@@ -125,7 +125,10 @@ async def create_subtask(
     outbox_create = CrmOutbox(
         aggregate_type="subtask", aggregate_id=db_subtask.id, operation="create", shard=shard,
         depends_on_event_id=depends_on_id,
-        payload={"title": subtask.title, "description": subtask.description, "completed": False},
+        payload={
+            "title": subtask.title, "description": subtask.description,
+            "completed": False, "creator_email": user_email,
+        },
     )
     db.add(outbox_create)
     db_subtask.sync_status = "pending"   # см. services/tasks.py::create_task

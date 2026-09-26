@@ -2,10 +2,8 @@
 Юнит-тесты для SubtaskManager из src/crm/subtask_service.py.
 
 Все HTTP-вызовы перехватываются через unittest.mock: реальных запросов нет.
-Тесты работают с SubtaskManager напрямую, минуя приложение, поэтому
-autouse-фикстура mock_crm из conftest.py (подмена зависимости FastAPI
-get_user_registrar) на них не влияет — каждый тест сам настраивает свой mock
-для полного контроля сценария.
+Тесты работают с SubtaskManager напрямую, минуя приложение — каждый тест
+сам настраивает свой mock для полного контроля сценария.
 """
 import json
 
@@ -140,6 +138,34 @@ async def test_create_subtask_crm_api_error():
             await SubtaskManager().create_subtask(
                 parent_item_id=1, title="X", description=""
             )
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_create_subtask_with_creator_email():
+    """create_subtask передаёт email создателя, если он указан."""
+    _FIELD_CREATOR_EMAIL = f"field_{SubtaskManager.FIELD_CREATOR_EMAIL}"
+    patcher, mock_http = _patch_httpx(_resp({"id": "1"}))
+    try:
+        await SubtaskManager().create_subtask(
+            parent_item_id=1, title="X", description="", creator_email="user@example.com"
+        )
+        payload = mock_http.post.call_args.kwargs["json"]
+        assert payload["items"][0][_FIELD_CREATOR_EMAIL] == "user@example.com"
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_create_subtask_without_creator_email_omits_field():
+    """creator_email=None (дефолт) — поле в CRM не отправляется вовсе."""
+    _FIELD_CREATOR_EMAIL = f"field_{SubtaskManager.FIELD_CREATOR_EMAIL}"
+    patcher, mock_http = _patch_httpx(_resp({"id": "1"}))
+    try:
+        await SubtaskManager().create_subtask(parent_item_id=1, title="X", description="")
+        payload = mock_http.post.call_args.kwargs["json"]
+        assert _FIELD_CREATOR_EMAIL not in payload["items"][0]
     finally:
         patcher.stop()
 

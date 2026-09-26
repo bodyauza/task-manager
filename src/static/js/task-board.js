@@ -57,8 +57,7 @@ document.addEventListener('click', function(e) {
 // ── Chat history (Redis List на сервере, GET /chat/history) ────────────────
 // Единственный источник истории — сервер (src/realtime/chat_history.py):
 // общая для всех пользователей и вкладок, переживает перезагрузку страницы
-// и переподключение WS. localStorage не используется вовсе — см.
-// docs/chat_history_redis_list_guide.md.
+// и переподключение WS. localStorage не используется вовсе.
 
 const CHAT_HISTORY_PAGE_SIZE = 50;
 let oldestLoadedChatId = null;    // курсор для подгрузки более старых сообщений — id самого старого отрисованного
@@ -185,7 +184,7 @@ const MESSAGE_HANDLERS = {
     // renderChatMessage — единая функция рендера и для живых WS-событий, и
     // для восстановленной истории (buildEventMessage внутри неё); персистируются
     // "chat" и 6 CRUD-типов ниже (src/realtime/events.py::_PERSISTED_EVENT_TYPES) —
-    // переживают перезагрузку страницы, см. docs/chat_history_redis_list_guide.md.
+    // переживают перезагрузку страницы.
     chat: (data) => renderLiveMessage(data),
 
     task_created: (data) => {

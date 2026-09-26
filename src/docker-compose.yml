@@ -55,10 +55,19 @@ services:
   # интерфейсах — тот же принцип, что и у flower ниже. Межконтейнерный
   # трафик (web/celery-* → redis:6379) идёт по внутренней docker-сети и
   # этой директивой не затрагивается вообще: она управляет только тем, что
-  # видно СНАРУЖИ Docker. localhost:6379 с этого же хоста (redis-cli,
-  # инструкция про AOF в README) продолжает работать без изменений.
+  # видно СНАРУЖИ Docker. localhost:6379 с этого же хоста (redis-cli)
+  # продолжает работать без изменений.
   redis:
     image: redis:7-alpine
+    # AOF: журнал команд записи на диск, fsync раз в секунду (потеря ≤ ~1 с
+    # при аварии) — без этого история WS-чата (chat:history) пропадает при
+    # пересоздании контейнера (down, up --force-recreate, пересборка). Задачи/
+    # подзадачи это не касается — они и так лежат в PostgreSQL (crm_outbox).
+    # command переопределяет команду образа целиком — поэтому в начале
+    # обязательно redis-server.
+    command: redis-server --appendonly yes --appendfsync everysec
+    volumes:
+      - redis-data:/data        # образ redis пишет данные в /data
     ports:
       - "127.0.0.1:6379:6379"
     restart: unless-stopped
@@ -189,3 +198,8 @@ services:
     environment:
       DB_HOST: host.docker.internal
       REDIS_URL: redis://redis:6379/0
+
+# Именованный том для AOF-журнала redis (см. command сервиса redis выше) —
+# переживает docker compose down/пересборку; удаляется только явным down -v.
+volumes:
+  redis-data:

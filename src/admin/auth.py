@@ -39,9 +39,7 @@ class AdminAuth(AuthenticationBackend):
 
         async with async_session_maker() as session:
             user_db = SQLAlchemyUserDatabase(session, User)
-            # crm_registrar=None: authenticate() его не вызывает (только
-            # get_by_email/password_helper) — CRM при входе в /admin не нужен.
-            manager = UserManager(user_db, crm_registrar=None)
+            manager = UserManager(user_db)
             user = await manager.authenticate(_LoginCredentials(email, password))
             if user is None or not user.is_active or not await is_admin(session, user.id):
                 return False

@@ -12,8 +12,6 @@ from pwdlib.hashers.bcrypt import BcryptHasher
 
 from sqlalchemy import select
 
-from src.crm.user_service import UserRegistrar, get_user_registrar
-
 from .user_models import Role, User
 from .user_repository import get_user_db
 
@@ -43,14 +41,8 @@ class UserManager(IntegerIDMixin, BaseUserManager[User, int]):
     # пароли хешируются bcrypt'ом (реально — argon2id). Админ-форма
     # (admin/user_admin.py) берёт тот же помощник из экземпляра менеджера.
 
-    def __init__(self, user_db, crm_registrar: UserRegistrar):
-        # crm_registrar внедряется через get_user_manager (Depends(get_user_registrar)) —
-        # UserManager зависит от протокола UserRegistrar, а не от конкретного CRMClient (DIP).
-        super().__init__(user_db)
-        self.crm_registrar = crm_registrar
-
     async def on_after_register(self, user: User, request: Optional[Request] = None):
-        # CRM-регистрация выполнена в create() до этого вызова — здесь только аудит.
+        # Только аудит.
         logger.info("User %d registered (email=%s)", user.id, user.email)
 
     async def create(
@@ -100,45 +92,8 @@ class UserManager(IntegerIDMixin, BaseUserManager[User, int]):
             )
         user_dict["roles"] = [default_role]
         # username в Task Manager = часть email до '@'.
-        # Та же логика применяется для username-поля при регистрации в CRM.
         user_dict["username"] = user_create.email.split("@")[0]
 
-        # CRM-регистрация — best-effort, а не блокирующее условие: недоступность
-        # CRM (сеть, таймаут, невалидный ответ) НЕ прерывает регистрацию и не
-        # мешает создать пользователя в PostgreSQL. Раньше здесь при любой
-        # ошибке CRM бросался CRMUnavailableError, что превращало временный сбой
-        # внешнего сервиса в невозможность зарегистрироваться вовсе — риск,
-        # который тогда обосновывался тем, что "пользователь есть в БД, но не
-        # может войти, т.к. отсутствует в CRM" (login-эндпоинт якобы проверял
-        # наличие в CRM). Этот риск больше не существует: /auth/login (см.
-        # auth/endpoints.py) к CRM не обращается вообще — аутентификация целиком
-        # на локальной БД (см. также mock_crm в tests/conftest.py). Блокировать
-        # регистрацию из-за CRM смысла больше нет.
-        #
-        # Если CRM-регистрация не удалась, ошибка только логируется — в CRM не
-        # появится соответствующей записи "Пользователь", пока кто-то не
-        # заведёт её вручную; durable retry (по аналогии с CrmOutbox для Task/
-        # Subtask) для этого случая не реализован — не запрошено.
-        from src.crm.crm_config import crm_settings
-
-        try:
-            await self.crm_registrar.register_user(
-                group_id=crm_settings.USER_GROUP_ID,
-                firstname=user_dict.get("firstname", ""),
-                lastname=user_dict.get("lastname", ""),
-                username=user_create.email.split("@")[0],
-                email=user_create.email,
-                password=password,
-                notify=False,
-            )
-            logger.info("CRM: user %s registered successfully", user_create.email)
-        except Exception as exc:
-            logger.error(
-                "CRM registration failed for %s: %s — пользователь всё равно "
-                "будет создан в PostgreSQL", user_create.email, exc,
-            )
-
-        # INSERT выполняется независимо от результата CRM-регистрации (см. выше).
         created_user = await self.user_db.create(user_dict)
         await self.on_after_register(created_user, request)
         return created_user
@@ -204,7 +159,6 @@ class UserManager(IntegerIDMixin, BaseUserManager[User, int]):
 
 async def get_user_manager(
     user_db=Depends(get_user_db),
-    crm_registrar: UserRegistrar = Depends(get_user_registrar),
 ):
     # Генератор-dependency: FastAPI вызывает его только для тех запросов,
     # route handler которых объявляет Depends(get_user_manager) в параметрах.
@@ -212,8 +166,6 @@ async def get_user_manager(
     # yield (а не return) оставляет точку для cleanup-кода после отправки ответа.
     # user_db — SQLAlchemyUserDatabase, внедрённый через Depends(get_user_db);
     # он уже содержит открытую сессию, привязанную к текущему запросу.
-    # crm_registrar — UserRegistrar, внедрённый через Depends(get_user_registrar);
-    # тесты подменяют его через app.dependency_overrides, не патчингом импорта.
     # Новый экземпляр UserManager на каждый запрос гарантирует изоляцию состояния:
     # нет разделяемых атрибутов между параллельными обработчиками.
-    yield UserManager(user_db, crm_registrar)
+    yield UserManager(user_db)

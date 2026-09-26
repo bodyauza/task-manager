@@ -395,7 +395,7 @@ async function saveSubtask() {
             renderSubtask(s);
             closeEditForm();
         // Namespace-проверка владельца намеренно не выполняется — Shared board.
-        // См. src/services/subtasks.py::update_subtask и docs/task-manager-documentation.md.
+        // См. src/services/subtasks.py::update_subtask.
         } else if (resp.status === 422) {
             const err = await resp.json();
             const msg = Array.isArray(err.detail) ? err.detail.map(e => e.msg).join('; ') : err.detail;
@@ -418,7 +418,7 @@ async function deleteSubtask() {
         if (resp.ok) {
             window.location.href = `/subtask-board/${taskId}`;
         // Namespace-проверка владельца намеренно не выполняется — Shared board.
-        // См. src/services/subtasks.py::delete_subtask и docs/task-manager-documentation.md.
+        // См. src/services/subtasks.py::delete_subtask.
         } else {
             const err = await resp.json();
             alert(`Ошибка: ${err.detail}`);

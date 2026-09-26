@@ -55,6 +55,7 @@ async def test_create_task_success(mock_outbox_dispatch):
         assert rows[0].status == "pending"
         assert rows[0].payload == {
             "title": "My Task", "description": "desc", "completed": False, "project": None,
+            "creator_email": "alice@example.com",
         }
         mock_outbox_dispatch.assert_called_once()
 

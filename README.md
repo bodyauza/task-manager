@@ -46,11 +46,6 @@
 
 ![Registration step three](src/screenshots/registration_step_three.png)
 
-### Users entity in CRM
-
-![Users entity in CRM](src/screenshots/crm_user.png)
-![Users entity in CRM](src/screenshots/crm_user_1.png)
-
 ### CRM synchronization status visibility — administrator only
 
 ![CRM synchronization status visibility — administrator only](src/screenshots/CRM_synchronization_status_visibility.png)
@@ -130,19 +125,19 @@ flowchart LR
     user(["👤 Пользователь<br/>сотрудник"])
     admin(["🛡️ Администратор"])
     tm["<b>Task Manager</b><br/>веб-приложение: задачи, подзадачи, файлы,<br/>WebSocket-чат, фоновая синхронизация с CRM"]
-    crm["🏢 CRM «Руководитель»<br/>REST API (внешняя система):<br/>пользователи, задачи, подзадачи, справочник «Проект»"]
+    crm["🏢 CRM «Руководитель»<br/>REST API (внешняя система):<br/>задачи, подзадачи, справочник «Проект»"]
     smtp["📧 SMTP-сервер<br/>(внешняя система)"]
 
     user -->|"браузер: задачи, файлы, чат<br/>HTTP / WebSocket"| tm
     admin -->|"браузер: /users, /admin (sqladmin)<br/>Flower :5555"| tm
-    tm -->|"регистрация пользователя — из веб-процесса, best-effort;<br/>задачи, подзадачи, файлы, справочники — из Celery-воркеров"| crm
+    tm -->|"задачи, подзадачи, файлы, справочники — из Celery-воркеров"| crm
     tm -->|"коды подтверждения email<br/>SMTP SSL"| smtp
 ```
 
 Пользователь и администратор работают через браузер; CRM — единственная
 система, куда уходят данные задач, и вызывается она **не из HTTP-запроса**,
-а фоновыми Celery-воркерами (исключение — best-effort регистрация пользователя
-при `POST /auth/register/complete`). Вход в приложение CRM не проверяет.
+а исключительно фоновыми Celery-воркерами. Регистрация и вход в приложение
+CRM не затрагивают вообще.
 
 ### 2. Диаграмма контейнеров
 
@@ -179,7 +174,6 @@ flowchart LR
     redis <-->|"задачи"| celery
     pg <-->|"SQL"| celery
     fs -.->|"чтение"| wshard
-    web -.->|"регистрация"| crm
     wshard -.->|"insert / update / delete"| crm
 ```
 
@@ -343,7 +337,6 @@ flowchart LR
     admin --> uc13
 
     uc1 -.->|"код подтверждения"| smtp
-    uc1 -.->|"регистрация, best-effort"| crm
     uc3 -.->|"фоновая синхронизация"| crm
     uc4 -.->|"фоновая синхронизация"| crm
     uc5 -.->|"фоновая синхронизация"| crm
@@ -366,10 +359,9 @@ sequenceDiagram
     participant S as ⚙️ Сервер
     participant D as 🗄️ PostgreSQL
     participant M as 📧 SMTP
-    participant R as 🏢 CRM
 
     rect rgb(219, 234, 254)
-        Note over C,R: Шаг 1 — Запрос кода подтверждения
+        Note over C,M: Шаг 1 — Запрос кода подтверждения
         C->>S: POST /auth/register/request-code
         Note left of C: body: email
         S->>D: SELECT person WHERE email=?
@@ -384,7 +376,7 @@ sequenceDiagram
     end
 
     rect rgb(254, 243, 199)
-        Note over C,R: Шаг 2 — Верификация кода
+        Note over C,M: Шаг 2 — Верификация кода
         C->>S: POST /auth/register/verify-code
         Note left of C: body: email, code
         S->>D: SELECT registration_pending WHERE email=?
@@ -396,13 +388,10 @@ sequenceDiagram
     end
 
     rect rgb(209, 250, 229)
-        Note over C,R: Шаг 3 — Создание пользователя
+        Note over C,M: Шаг 3 — Создание пользователя
         C->>S: POST /auth/register/complete
         Note left of C: Cookie: reg_token=eyJ...<br/>body: firstname, lastname, patronymic?, password
         Note right of S: jwt.decode(reg_token) → email<br/>purpose != registration → 401<br/>password regex fail → 422
-        S->>R: action=insert, entity_id=1
-        Note right of S: items: group_id, firstname, lastname, username, email<br/>best-effort: сбой CRM только логируется, регистрация продолжается
-        R-->>S: status=success, data.id=42
         S->>D: INSERT INTO person
         S-->>C: 201 Created
         Note left of C: message: Registration complete<br/>reg_token cookie удалена (Max-Age=0)
@@ -426,7 +415,7 @@ sequenceDiagram
 | `complete` | 409 | `EMAIL_ALREADY_REGISTERED` | Гонка: email зарегистрирован параллельным запросом |
 | `complete` | 422 | текст требований к паролю / ошибка валидации | Пароль не соответствует требованиям (заглавная буква, цифра, спецсимвол, 5–72 символа) или не заполнены имя/фамилия |
 
-Недоступность CRM при `complete` больше не в этой таблице: регистрация в CRM — best-effort (см. `auth/manager.py::create`), сбой только логируется и не блокирует создание пользователя в PostgreSQL — 503 `CRM_UNAVAILABLE` эндпоинт больше не возвращает.
+`complete` в CRM не обращается вообще — регистрация пользователя в CRM (была best-effort) удалена целиком, поэтому 503 `CRM_UNAVAILABLE` эндпоинт не возвращает и не возвращал бы даже при недоступной CRM.
 
 ---
 
@@ -471,9 +460,9 @@ sequenceDiagram
 отсутствует в CRM» удалена целиком (была реализована через
 `CRMUserSelector.find_user_by_email`, вызывавшийся на каждый `/auth/login`).
 Единственная проверка на вход теперь — совпадение пароля с хешем в
-PostgreSQL. Регистрация (`POST /auth/register/complete`) по-прежнему создаёт
-запись в CRM первым шагом (см. [«Регистрация пользователя»](#регистрация-пользователя)
-ниже) — изменилась только логика входа, не регистрации.
+PostgreSQL. Регистрация (`POST /auth/register/complete`) тоже больше не
+обращается к CRM — раньше она best-effort создавала там запись пользователя
+первым шагом, это убрано целиком (см. «CRM «Руководитель»» ниже).
 
 ### Токены
 
@@ -641,7 +630,7 @@ PostgreSQL. Регистрация (`POST /auth/register/complete`) по-пре�
 
 Остальные части приложения:
 
-- **`src/auth/`** — fastapi-users: `UserManager` (хеш пароля argon2id, роль по умолчанию, best-effort регистрация в CRM), JWT-стратегии, трёхшаговая регистрация с кодом на email.
+- **`src/auth/`** — fastapi-users: `UserManager` (хеш пароля argon2id, роль по умолчанию), JWT-стратегии, трёхшаговая регистрация с кодом на email.
 - **`src/routers/`** — REST-роутеры задач, подзадач, файлов и пользователей; HTML-страницы (`pages.py`); раздача `/uploads/*`; маршруты `/admin/crm-*`.
 - **`src/services/`** — бизнес-логика (`tasks.py`, `subtasks.py`, `attachments.py`, `access.py`, `admin_sync.py`): изменение и строка `crm_outbox` в одной транзакции, блокировки строк, события WebSocket.
 - **`src/task_logic/`** — ORM-модели (`Task`, `Subtask`, `Project`, `CrmOutbox`) и Pydantic-схемы.
@@ -763,18 +752,17 @@ registration_pending
 ## CRM «Руководитель»
 
 Task Manager интегрирован с CRM-системой [«Руководитель»](https://rukovoditel.net/) (open-source PHP/MySQL).
-Интеграция работает через REST API CRM и затрагивает два процесса: регистрацию пользователей и управление задачами.
+Интеграция работает через REST API CRM и затрагивает управление задачами: создание, изменение, удаление
+задач и подзадач, а также синхронизацию справочника «Проект».
 
-### Регистрация пользователя
-
-При регистрации (`POST /auth/register/complete`) выполняются две операции:
-
-1. **CRM** — `action=insert`, entity_id=1 (Пользователи): `group_id`, `firstname`, `lastname`, `username`, `email`.
-2. **PostgreSQL** — `INSERT INTO person`.
-
-Регистрация в CRM — best-effort, а не блокирующее условие: если CRM недоступна (сеть, таймаут, невалидный ответ), ошибка только логируется (`auth/manager.py::create`) — `INSERT INTO person` выполняется в любом случае, эндпоинт не возвращает `503` из-за CRM. Раньше порядок был строгим (при сбое CRM пользователь не создавался вовсе) — это ограничение снято, так как ниже перестало быть верным то, чем оно обосновывалось: `/auth/login` больше не проверяет наличие пользователя в CRM, значит нет риска создать пользователя, который не сможет войти.
-
-`POST /auth/login` к CRM не обращается вообще — единственная проверка на вход теперь совпадение пароля с хешем в PostgreSQL (см. [«Authentication Flow»](#authentication-flow) выше). Раньше при каждом входе дополнительно выполнялся `action=select` по email в CRM (`403`, если запись не найдена, `503`, если CRM недоступна) — эта проверка удалена как отдельный вектор отказа входа, не влияющий на корректность самой аутентификации.
+Ни регистрация (`POST /auth/register/complete`), ни вход (`POST /auth/login`) к CRM не обращаются вообще.
+Раньше регистрация best-effort создавала запись пользователя в CRM (`action=insert`, entity_id=1,
+«Пользователи») первым шагом — сбой CRM только логировался и не блокировал создание пользователя в
+PostgreSQL; сама эта интеграция впоследствии была убрана целиком, а не только сделана best-effort.
+Проверка входа через CRM (`action=select` по email, `403`/`503`) была удалена ещё раньше, как отдельный
+вектор отказа входа, не влияющий на корректность самой аутентификации (см. [«Authentication
+Flow»](#authentication-flow) выше) — единственная проверка на вход сегодня — совпадение пароля с хешем
+в PostgreSQL.
 
 ### Синхронизация задач (полностью асинхронно, через Celery/Redis)
 
@@ -809,6 +797,35 @@ Task Manager интегрирован с CRM-системой [«Руковод�
 для которых у той же задачи/подзадачи уже есть более новое успешно синхронизированное событие — иначе повтор
 применил бы устаревшие данные поверх уже отправленных в CRM свежих.
 
+**Порядок событий одной сущности — структурный запрет на обгон, а не проверка постфактум.**
+Топология деплоя (один `celery-worker-shard-N` процесс на шард, `--pool=solo`) не даёт двум ПРОЦЕССАМ
+читать одну очередь одновременно, но не гарантирует, что ОДИН и тот же воркер обработает события
+строго по `id`: у строки с растущей паузой перед повтором (60 → 120 → 240 → 480 с) есть окно, в которое
+более новое событие той же задачи/подзадачи, поставленное в очередь сразу после вставки, успевает
+пройти вперёд и завершиться раньше. `_has_older_unfinished` (`src/tasks/crm_outbox_tasks.py`) закрывает
+это структурно: воркер не начинает попытку, пока у той же сущности есть более старое ещё не
+завершённое (`pending`/`blocked`) событие — строка просто откладывается без траты попытки, следующий
+тик `reconcile_pending_outbox` найдёт её снова.
+
+Раньше этой проверки не было — устаревшее событие (например, `sync_files` для файла, который
+пользователь успел заменить, пока воркер ещё не дошёл до предыдущей строки) могло довыполниться
+ПОСЛЕ более нового и применить в CRM старые данные поверх уже отправленных свежих, а `sync_status`
+либо откатывался на `failed`, либо навсегда зависал в `pending` — эти два симптома лечили две отдельные
+заплатки. Обе больше не нужны и удалены: раз обгон структурно невозможен, `sync_status`
+(`_refresh_sync_status`) можно не «записывать» условно, а просто ПЕРЕСЧИТЫВАТЬ из текущего состояния
+событий сущности при каждом терминальном исходе — `failed` безусловно (младшее событие физически не
+могло выполниться раньше и «испортить» его нечем), `synced`/`pending` — по критерию «остались ли ещё
+незавершённые соседи» (`_other_unfinished_events_exist`, та же проверка, что и раньше защищала от
+преждевременного `synced` при параллельных событиях). Единая точка пересчёта работает для любой
+операции (`create`/`update`/`delete`/`sync_files`), а не только для `update`/`sync_files`, как было
+раньше — `create` больше не выставляет `sync_status` сам.
+
+Это не отменяет проверку `has_newer_done_sibling` в действии «Повторить» sqladmin
+(`src/admin/outbox_admin.py`) — структурный запрет действует, пока строка сама ещё не завершилась;
+администратор же вручную возвращает в очередь уже терминальную (`failed`) строку спустя произвольное
+время, когда порядок никем больше не контролируется, поэтому там своя, независимая проверка на
+устаревание остаётся нужна.
+
 Retry шардирован по `id % N` (`task.crm_shard`, sticky-присвоение) — все события одной задачи и её подзадач гарантированно обрабатываются в одной очереди и в порядке создания. Повтор `create` идемпотентен: `TaskManager.find_task`/`SubtaskManager.find_subtask` ищут уже созданную запись по совпадению `title`+`description` перед повторной вставкой, чтобы не задублировать запись в CRM.
 
 Таблица `crm_outbox` не растёт бесконечно: Celery Beat-задача `cleanup_done_outbox` раз в сутки (03:00 UTC)
@@ -816,9 +833,46 @@ Retry шардирован по `id % N` (`task.crm_shard`, sticky-присво�
 не трогаются никогда, а строка, на которую ещё ссылается `depends_on_event_id` другой, ещё не удалённой строки, не удаляется,
 пока эта ссылка не исчезнет.
 
+### Таймауты HTTP-запросов к CRM и большие файлы
+
+Файлы ТЗ и «иных документов» передаются в CRM (`sync_files`) закодированными в base64
+одним JSON-телом (`_file_to_crm`, `src/crm/client.py`) — при `MAX_FILE_SIZE=100` МБ
+(`src/utils/file_utils.py`) это до ~133 МБ на файл, до ~1.33 ГБ, если в одной операции
+уходит сразу весь лимит «иных документов» (`MAX_OTHER_FILES=10`).
+
+Общий HTTP-клиент к CRM (`_get_shared_http_client`, `src/crm/client.py`) использует
+`httpx.Timeout(connect=30.0, write=120.0, read=120.0, pool=30.0)` — **не** один общий
+таймаут на весь запрос: httpx разворачивает `timeout=<float>` в четыре независимых
+бюджета (connect/write/read/pool), и каждый применяется к своей фазе отдельно. Раньше
+здесь стоял единый `timeout=30.0`, и достаточно крупный файл (наблюдалось на реальном
+файле 93.6 МБ) не укладывался в 30 секунд на фазу передачи (`write`) или ответа CRM
+(`read`) — запрос падал с `httpx.TimeoutException` ("CRM request timed out" в
+`crm_outbox.last_error`), `sync_status` задачи оставался `pending`, пока durable-retry
+(см. выше) не исчерпывал 5 попыток. `connect`/`pool` оставлены на 30 с — там таймаут не
+наблюдался (быстрый TCP/TLS-хендшейк; воркер обрабатывает CRM-вызовы строго
+последовательно, `--pool=solo`, конкуренции за пул соединений внутри процесса нет).
+
+Redlock-лок шарда (`shard_lock`, `src/tasks/crm_shard_lock.py`) держится на время
+всего вызова CRM и рассчитан на тот же худший сценарий: `_LOCK_TIMEOUT_SECONDS = 300` —
+запас (~30 с на чтение файла с диска, сериализацию JSON, запись в БД) поверх потолка
+`connect(<30) + write(<120) + read(<120) = 270` секунд честной последовательной
+обработки. Эти два числа связаны: изменение таймаутов `httpx`-клиента требует
+пересчитать `_LOCK_TIMEOUT_SECONDS` — иначе лок истечёт раньше, чем закончится ещё
+идущий легитимный (не упавший по таймауту) CRM-вызов, и его сможет перехватить другой
+процесс.
+
 ### Поле «Проект»
 
 Задачи (не подзадачи) могут ссылаться на опцию глобального справочника CRM «Проект» (`list_id=11`, поле `field_327` сущности «Задачи»). Локальная таблица `project` — зеркало этого списка, наполняется периодической Celery-задачей `sync_project_table` (раз в `CRM_PROJECT_SYNC_INTERVAL_SECONDS`, по умолчанию 180 сек) — веб-процесс не ходит в CRM за этим списком на каждый запрос. Ручной триггер синхронизации без ожидания расписания: `POST /admin/crm-options/refresh` (только роль `admin`).
+
+### Email создателя
+
+Задача/подзадача при создании отправляет в CRM email пользователя, который её создал
+(`field_328`/`field_329`). Email берётся сервером из `current_user` (`user.email`) в
+`src/services/tasks.py::create_task`/`src/services/subtasks.py::create_subtask` — тело запроса
+клиента (`TaskCreate`/`SubtaskCreate`) email вообще не содержит, поэтому подделать его через
+DevTools нельзя. Поле заполняется только при создании — `update_task`/`update_subtask` его не
+трогают (создатель записи не меняется при редактировании).
 
 ### Сущности CRM
 
@@ -826,9 +880,8 @@ Retry шардирован по `id % N` (`task.crm_shard`, sticky-присво�
 
 | Сущность | entity_id | Поля |
 |---|---|---|
-| Пользователи | 1 | `group_id`, `firstname`, `lastname`, `username` (= email до `@`), `email`, `password` |
-| Задачи | 29 | `field_317` — название, `field_318` — описание, `field_319` — статус (чекбокс: `"true"` / `"false"`), `field_320` — ТЗ (файл), `field_321` — иные документы (файлы), `field_327` — «Проект» (выпадающий список, ссылка на глобальный справочник `list_id=11`) |
-| Подзадачи | 30 | `field_322` — название, `field_323` — описание, `field_324` — статус (чекбокс: `"true"` / `"false"`), `field_325` — ТЗ (файл), `field_326` — иные документы (файлы). Поля «Проект» нет — только у задач |
+| Задачи | 29 | `field_317` — название, `field_318` — описание, `field_319` — статус (чекбокс: `"true"` / `"false"`), `field_320` — ТЗ (файл), `field_321` — иные документы (файлы), `field_327` — «Проект» (выпадающий список, ссылка на глобальный справочник `list_id=11`), `field_328` — email создателя (заполняется только при создании) |
+| Подзадачи | 30 | `field_322` — название, `field_323` — описание, `field_324` — статус (чекбокс: `"true"` / `"false"`), `field_325` — ТЗ (файл), `field_326` — иные документы (файлы), `field_329` — email создателя (заполняется только при создании). Поля «Проект» нет — только у задач |
 
 Файловые поля (`field_320`/`field_321`, `field_325`/`field_326`) принимают массив объектов `{"name": "...", "content": "<base64>"}`. Полная замена содержимого поля: `other_file_abs_paths=[]` очищает поле, `[p1, p2]` заменяет весь список — передать только новый файл нельзя, CRM потеряет остальные.
 
@@ -843,7 +896,6 @@ CRM_API_USER=api_user
 CRM_API_PASSWORD=api_password
 CRM_LOGIN_URL=https://your-crm-host/index.php?module=users/login
 CRM_DEMO_ID=          # оставить пустым для production, заполнить для demo-инстанса
-CRM_USER_GROUP_ID=6   # ID группы «Сотрудник» в CRM
 
 # entity_id сущностей/подсущностей и ID их полей (field_<ID> в payload) —
 # генерируются внутри конкретной инсталляции CRM, при смене инстанса меняются
@@ -851,19 +903,20 @@ CRM_USER_GROUP_ID=6   # ID группы «Сотрудник» в CRM
 # совпадают со значениями ниже — переменные можно не задавать, если инстанс тот же.
 CRM_TASK_ENTITY_ID=29
 CRM_SUBTASK_ENTITY_ID=30
-CRM_USER_ENTITY_ID=1
 
 CRM_TASK_FIELD_TITLE=317
 CRM_TASK_FIELD_DESCRIPTION=318
 CRM_TASK_FIELD_COMPLETED=319
 CRM_TASK_FIELD_SPECIFICATION=320
 CRM_TASK_FIELD_OTHER_FILES=321
+CRM_TASK_FIELD_CREATOR_EMAIL=328       # email создателя задачи; отправляется только при создании
 
 CRM_SUBTASK_FIELD_TITLE=322
 CRM_SUBTASK_FIELD_DESCRIPTION=323
 CRM_SUBTASK_FIELD_COMPLETED=324
 CRM_SUBTASK_FIELD_SPECIFICATION=325
 CRM_SUBTASK_FIELD_OTHER_FILES=326
+CRM_SUBTASK_FIELD_CREATOR_EMAIL=329    # email создателя подзадачи; отправляется только при создании
 
 # Глобальный справочник «Проект» (см. раздел «Поле «Проект»» выше)
 CRM_LIST_PROJECT=11                    # ID справочника в CRM
@@ -882,29 +935,21 @@ CRM_OUTBOX_RETENTION_DAYS=30   # сколько дней хранить обра
 src/crm/
 ├── crm_config.py           # чтение CRM_* переменных окружения через os.getenv(), включая entity_id/field_<ID>
 ├── client.py               # базовый HTTP-клиент (httpx async), метод _call(); CRMRecordNotFoundError
-├── user_service.py         # CRMUserRegistrar — регистрация (register_user)
 ├── task_service.py         # CRUD-операции с задачами (entity_id по умолчанию 29) + find_task (идемпотентный retry create)
 ├── subtask_service.py      # CRUD-операции с подзадачами (entity_id по умолчанию 30) + find_subtask
 └── global_lists_service.py # GlobalListsManager.get_choices(list_id) — чтение глобальных справочников (напр. «Проект»)
 ```
 
-`user_service.py` дополнительно экспортирует пару «`Protocol` + `Depends`-провайдер» —
-`UserRegistrar`/`get_user_registrar()` — используемую внутри `UserManager.create()`
-(`src/auth/manager.py`) при регистрации, чтобы доменный слой не был завязан на
-конкретный класс `CRMUserRegistrar` напрямую (Dependency Inversion). Это
-единственная оставшаяся в проекте пара такого вида: `TaskCRMSync`/`SubtaskCRMSync`
-(для CRM-синхронизации задач/подзадач) и `UserLookup` (для проверки пользователя
-в CRM при входе) были удалены вместе с самими механизмами, которые они
-обслуживали, — CRM-синхронизация задач/подзадач переехала на durable outbox +
-Celery, а проверка существования
-пользователя в CRM при `POST /auth/login` убрана целиком (см.
-[«Регистрация пользователя»](#регистрация-пользователя) выше). `register_user()` — метод только
-`CRMUserRegistrar`, не базового `CRMClient`: `TaskManager`/`SubtaskManager` его
-не наследуют (Interface Segregation).
+Пар вида «`Protocol` + `Depends`-провайдер» вокруг CRM-классов в проекте больше не осталось: `TaskCRMSync`/
+`SubtaskCRMSync` (для CRM-синхронизации задач/подзадач), `UserLookup` (для проверки пользователя в CRM при
+входе) и `UserRegistrar`/`get_user_registrar()` (для регистрации пользователя в CRM) были удалены вместе с
+самими механизмами, которые они обслуживали — CRM-синхронизация задач/подзадач переехала на durable outbox +
+Celery, проверка пользователя в CRM при `POST /auth/login` и сама регистрация пользователя в CRM убраны
+целиком.
 
 ### HTTP-клиент
 
-Один `httpx.AsyncClient` на весь срок жизни процесса, общий для всех CRM-классов (`TaskManager`, `SubtaskManager`, `CRMUserRegistrar`) — module-level singleton (`_shared_http_client` в `src/crm/client.py`), а не атрибут класса `CRMClient`. Ранее это была class-переменная с ленивой инициализацией через `classmethod`, но `cls._http = ...` внутри `classmethod` пишет атрибут в `__dict__` того класса, что передан как `cls`, а не мутирует `CRMClient` — при инстанцировании только через подклассы (`CRMClient` напрямую нигде не создаётся) каждый из наследников заводил свой собственный `AsyncClient` вместо одного разделяемого. Module-level переменная вне иерархии классов этой проблеме не подвержена. TCP-соединение к CRM переиспользуется между вызовами через HTTP/1.1 keep-alive.
+Один `httpx.AsyncClient` на весь срок жизни процесса, общий для всех CRM-классов (`TaskManager`, `SubtaskManager`) — module-level singleton (`_shared_http_client` в `src/crm/client.py`), а не атрибут класса `CRMClient`. Ранее это была class-переменная с ленивой инициализацией через `classmethod`, но `cls._http = ...` внутри `classmethod` пишет атрибут в `__dict__` того класса, что передан как `cls`, а не мутирует `CRMClient` — при инстанцировании только через подклассы (`CRMClient` напрямую нигде не создаётся) каждый из наследников заводил свой собственный `AsyncClient` вместо одного разделяемого. Module-level переменная вне иерархии классов этой проблеме не подвержена. TCP-соединение к CRM переиспользуется между вызовами через HTTP/1.1 keep-alive.
 
 `aclose_http_client()` вызывается явно в `lifespan()` (`src/main.py`) при shutdown — graceful-закрытие с drain in-flight запросов до `SIGKILL`, парная операция к ленивой инициализации при первом CRM-запросе.
 
@@ -947,30 +992,6 @@ Celery, а проверка существования
 }
 ```
 
-Для сущности «Пользователи» (entity_id=1) используются встроенные имена полей,
-а не `field_<N>`. Дополнительные параметры `notify` и `login_url` инициируют
-отправку приветственного письма:
-
-```json
-{
-    "key": "...", "username": "...", "password": "...",
-    "action": "insert",
-    "entity_id": 1,
-    "items": [
-        {
-            "group_id":  6,
-            "firstname": "Иван",
-            "lastname":  "Иванов",
-            "username":  "ivan.ivanov",
-            "email":     "ivan@example.com",
-            "password":  ""
-        }
-    ],
-    "notify":    true,
-    "login_url": "https://crm.example.com/index.php?module=users/login"
-}
-```
-
 Ответ на успешный `insert` содержит ID созданной записи. ID возвращается строкой:
 
 ```json
@@ -981,23 +1002,10 @@ Celery, а проверка существования
 
 Поле `select_fields` — идентификаторы полей через запятую.
 Поле `filters` — словарь `{ID_поля: {value, condition}}`.
-Условие `"include"` означает точное совпадение (не LIKE).
-Идентификаторы полей сущности «Пользователи»: 6=группа, 7=имя, 8=фамилия, 9=email, 12=логин.
-
-```json
-{
-    "key": "...", "username": "...", "password": "...",
-    "action": "select",
-    "entity_id": 1,
-    "select_fields": "9,7,8,12,6",
-    "filters": {
-        "9": {
-            "value":     "ivan@example.com",
-            "condition": "include"
-        }
-    }
-}
-```
+Условие `"include"` означает точное совпадение (не LIKE). Используется, например,
+`TaskManager.find_task`/`SubtaskManager.find_subtask` для идемпотентного retry
+`create` (поиск уже созданной записи по совпадению `title`+`description` перед
+повторной вставкой).
 
 **action = update — обновление записей**
 
@@ -1048,364 +1056,672 @@ CRM «Руководитель» не стандартизирует форма�
 
 ---
 
-## Local Development
+## Deployment on a server running Ubuntu OS
 
-### 1. Создать виртуальное окружение
+«Голое железо»: приложение и все фоновые процессы запускаются напрямую на Ubuntu через
+systemd, без контейнеров, а Nginx стоит перед uvicorn как reverse proxy и сам отдаёт
+статику. Альтернатива — Docker (см. главу [«Docker Deployment»](#docker-deployment)
+ниже: одна команда поднимает `web`, `redis`, `celery-*` и `flower` сразу). Ниже — полная
+последовательность для чистого сервера Ubuntu 22.04/24.04 LTS с root/sudo-доступом и
+доменным именем, у которого A-запись уже указывает на IP этого сервера. Как и в
+Docker-варианте, PostgreSQL остаётся нативной службой ОС — единственный компонент,
+который в обоих вариантах деплоя ставится и живёт одинаково.
 
-```
-python -m venv .venv
-```
+Все пути ниже — `/opt/task-manager`; замените на свой, если используете другой. Везде, где встречается
+`example.com` — подставьте свой домен.
 
-### 2. Активировать
+### 1. Обновление системы и системные пакеты
 
-Windows:
-```
-.venv\Scripts\activate
-```
-Linux/macOS:
-```
-source .venv/bin/activate
-```
-
-### 3. Установить зависимости
-
-```
-pip install -r requirements.txt
+```bash
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y curl git nginx redis-server software-properties-common ca-certificates
 ```
 
-Для запуска тестов:
+`redis-server` из стандартного репозитория Ubuntu уже включает systemd-юнит `redis-server.service` и
+автозапуск — отдельная настройка не нужна. Проверка:
 
+```bash
+sudo systemctl enable --now redis-server
+redis-cli ping   # ожидаемый ответ: PONG
 ```
-pip install -r requirements-dev.txt
+
+**Python 3.13.** В репозиториях Ubuntu 22.04/24.04 его нет — используем PPA
+[deadsnakes](https://launchpad.net/~deadsnakes/+archive/ubuntu/ppa):
+
+```bash
+sudo add-apt-repository -y ppa:deadsnakes/ppa
+sudo apt update
+sudo apt install -y python3.13 python3.13-venv python3.13-dev
 ```
 
-### 4. Переменные окружения
+`python3.13-venv` обязателен отдельно от самого `python3.13` — без него `python3.13 -m venv` падает с
+ошибкой `ensurepip is not available`. `python3.13-dev` — на случай, если какой-то пакет из
+`requirements.txt` не найдёт готовое wheel-колесо под конкретную архитектуру сервера и pip придётся
+собирать его из исходников (для типовой связки Ubuntu x86_64 такого не происходит — все зависимости
+проекта, включая `asyncpg`, ставятся из готовых wheel'ов).
 
-Заполните `src/.dev.env`. Обязательные секции:
+**Системные библиотеки, нужные самому приложению** (см. `src/Dockerfile` — тот же список для Docker-образа):
 
-**База данных и JWT**
+```bash
+sudo apt install -y libpq5 libmagic1
+```
+
+`libpq5` — рантайм-библиотека PostgreSQL для `asyncpg`. `libmagic1` — определение MIME-типа файла по
+сигнатуре байтов (`python-magic`, см. «Файлы задач» выше) — без неё `import magic` в `src/utils/file_utils.py` падает `OSError`
+ещё на старте приложения.
+
+### 2. PostgreSQL 18
+
+В стандартных репозиториях Ubuntu обычно более старая версия PostgreSQL, чем требуемая проектом `18.0`
+(см. [«Technological Stack»](#technological-stack) выше). Подключаем официальный репозиторий PGDG:
+
+```bash
+sudo install -d /usr/share/postgresql-common/pgdg
+sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+    https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+    > /etc/apt/sources.list.d/pgdg.list'
+sudo apt update
+sudo apt install -y postgresql-18
+```
+
+Пакет сам создаёт systemd-юнит и сразу его запускает:
+
+```bash
+sudo systemctl status postgresql   # active (exited) — управляющий юнит; сам процесс — postgresql@18-main
+```
+
+По умолчанию Ubuntu-сборка PostgreSQL уже слушает только `localhost` (`listen_addresses = 'localhost'`
+в `/etc/postgresql/18/main/postgresql.conf`) и уже разрешает TCP-подключения с паролем с этого же хоста
+(`host all all 127.0.0.1/32 scram-sha-256` в `/etc/postgresql/18/main/pg_hba.conf`) — это ровно то, что
+нужно приложению (`DB_HOST=localhost` в `.env`, см. ниже). Отдельно редактировать эти файлы нужно, только
+если PostgreSQL и приложение окажутся на разных хостах — это не наш случай.
+
+Создаём роль и базу данных (пароль придумайте свой, он же пойдёт в `DB_PASS` ниже):
+
+```bash
+sudo -u postgres psql -c "CREATE USER task_manager_user WITH PASSWORD 'придумайте-надёжный-пароль';"
+sudo -u postgres psql -c "CREATE DATABASE task_manager OWNER task_manager_user;"
+```
+
+### 3. Системный пользователь для приложения
+
+Отдельная учётная запись ОС без права входа — то же соображение, что и `USER appuser` в
+`src/Dockerfile` (не запускать процесс от root):
+
+```bash
+sudo useradd --system --shell /usr/sbin/nologin --home-dir /opt/task-manager --no-create-home taskmanager
+sudo mkdir -p /opt/task-manager
+sudo chown taskmanager:taskmanager /opt/task-manager
+```
+
+### 4. Код и виртуальное окружение
+
+```bash
+sudo -u taskmanager git clone --branch main https://github.com/bodyauza/task-manager.git /opt/task-manager
+cd /opt/task-manager
+sudo -u taskmanager python3.13 -m venv .venv
+sudo -u taskmanager .venv/bin/pip install --no-cache-dir --upgrade pip
+sudo -u taskmanager .venv/bin/pip install --no-cache-dir -r requirements.txt
+```
+
+`requirements-dev.txt` (pytest и т.п.) на production-сервере не нужен — это зависимости для запуска тестов,
+не для работы приложения.
+
+### 5. `src/.env` — переменные окружения для `API_MODE=prod`
+
+`src/config.py` при `API_MODE=prod` читает `src/.env` (см. [«CRM «Руководитель» →
+Конфигурация»](#конфигурация) выше — полный список CRM-переменных; здесь — итоговый файл
+для production и то, чем он обязан отличаться от `.dev.env`). Файл не поставляется в
+репозитории (гитигнорится, как и `.dev.env`/`.tests.env`) — создаём с нуля:
+
+```bash
+sudo -u taskmanager nano /opt/task-manager/src/.env
+```
+
 ```ini
-API_MODE=dev          # dev отключает флаг Secure на куках (нет TLS на localhost)
+API_MODE=prod
 APP_NAME=Task_Manager
-ALGORITHM=HS256       # алгоритм подписи JWT
-ADMIN_EMAIL=admin@example.com  # обязательное поле Settings (в коде приложения не используется)
+ALGORITHM=HS256
+ADMIN_EMAIL=admin@example.com
 DB_DRIVER_SYNC=psycopg2
 DB_DRIVER_ASYNC=asyncpg
 DB_HOST=localhost
 DB_PORT=5432
-DB_USER=...
-DB_PASS=...
+DB_USER=task_manager_user
+DB_PASS=тот-же-пароль-что-и-в-CREATE-USER
 DB_NAME=task_manager
 
-ACCESS_SECRET=...     # случайная строка ≥ 32 символов
-ACCESS_EXP=1800       # TTL access_token, сек (30 мин)
-REFRESH_SECRET=...    # другая случайная строка ≥ 32 символов
-REFRESH_EXP=604800    # TTL refresh_token, сек (7 дней)
-REG_TOKEN_SECRET=...  # секрет JWT для reg_token (шаг 2→3 регистрации)
-REG_TOKEN_EXP=1200    # TTL reg_token, сек (20 мин)
-```
+# Каждый — отдельная случайная строка ≥ 32 символов, три РАЗНЫХ значения.
+# Быстро сгенерировать: python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+ACCESS_SECRET=сгенерируйте-своё-значение
+ACCESS_EXP=1800
+REFRESH_SECRET=сгенерируйте-своё-значение-другое
+REFRESH_EXP=604800
+REG_TOKEN_SECRET=сгенерируйте-своё-значение-третье
+REG_TOKEN_EXP=1200
 
-**SMTP (подтверждение email при регистрации)**
-
-Нет значения по умолчанию у `SMTP_HOST` — переменная обязательна: скрытый дефолт вида
-`smtp.yandex.ru` молча привязал бы любое развёртывание к конкретному провайдеру.
-
-```ini
 SMTP_HOST=smtp.yandex.ru
 SMTP_PORT=465
 SMTP_USER=your@yandex.ru
-SMTP_PASSWORD=app_password   # пароль приложения, не пароль от аккаунта
-```
+SMTP_PASSWORD=app_password
 
-HTML-тело письма с кодом подтверждения рендерится через Jinja2 из
-`src/templates/email/confirmation-code.html` (`src/auth/email_service.py`), не хранится
-как inline-строка в коде.
+# Реальный домен, а не localhost — иначе браузер заблокирует запросы фронтенда (CORS).
+CORS_ORIGINS_CSV=https://example.com
 
-**CORS**
+# Redis слушает localhost — не в Docker-сети, отдельный "хост redis" не нужен.
+REDIS_URL=redis://localhost:6379/0
 
-`CORS_ORIGINS_CSV` — список разрешённых origin через запятую (не JSON-массив: так удобнее
-писать в `.env`). Дефолт покрывает только `localhost`/`127.0.0.1` для dev/test — для
-production **обязательно** переопределить реальным доменом фронтенда, иначе браузер
-будет блокировать запросы.
-
-```ini
-CORS_ORIGINS_CSV=http://localhost,http://localhost:8080,http://127.0.0.1:8000,http://localhost:3000,http://127.0.0.1:3000
-```
-
-**Redis / Celery**
-
-Нужен для WebSocket-рассылки между несколькими uvicorn-воркерами (Redis Pub/Sub),
-durable-retry очереди CRM-синхронизации (`crm_outbox`) и периодической загрузки
-справочника «Проект». Есть рабочий дефолт для локальной разработки без Docker —
-переменную можно не задавать, если Redis слушает `localhost:6379`. Как установить
-и запустить сам Redis + Celery — раздел [«8. Celery + Redis»](#8-celery--redis-docker--windows--ubuntu) ниже.
-
-```ini
-REDIS_URL=redis://localhost:6379/0   # в docker-compose переопределяется на redis://redis:6379/0
-```
-
-**Необязательные настройки** (у всех есть значения по умолчанию):
-
-```ini
-ADMIN_TIMEZONE=Europe/Moscow    # часовой пояс отображения дат в sqladmin
-CHAT_HISTORY_MAX_LEN=500        # сколько последних записей истории чата хранить в Redis
-DB_POOL_SIZE=5                  # размер пула соединений на процесс
-DB_MAX_OVERFLOW=10              # сверх пула
-FLOWER_BASIC_AUTH=admin:пароль  # пароль Flower (без него Flower доступен только с 127.0.0.1 без входа)
-DOCS_ENABLED=true               # /docs, /redoc, /openapi.json; не задана — включено везде, кроме API_MODE=prod
-```
-
-**CRM «Руководитель»**
-
-Переменные ниже обязательны для старта приложения (см. `src/crm/crm_config.py`) —
-без них процесс не запустится. Но сама интеграция с CRM не блокирует ключевые
-сценарии: `POST /auth/login` в CRM вообще не обращается (только локальная БД),
-`POST /auth/register/complete` регистрирует пользователя в CRM best-effort —
-при недоступности CRM ошибка только логируется, пользователь всё равно
-создаётся в PostgreSQL.
-
-```ini
-CRM_API_URL=https://your-crm-host/api/rest.php
-CRM_API_KEY=...            # API-ключ из раздела Settings → API в CRM
-CRM_API_USER=api_user      # логин пользователя с ролью API
-CRM_API_PASSWORD=...
-CRM_LOGIN_URL=https://your-crm-host/index.php?module=users/login
-CRM_DEMO_ID=               # пусто для production; номер demo-инстанса для тестовой среды
-CRM_USER_GROUP_ID=6        # ID группы «Сотрудник» в CRM (entity_id=1, поле group_id)
-```
-
-`entity_id` сущностей/подсущностей CRM и ID их полей тоже настраиваются через `.env`
-(`CRM_TASK_ENTITY_ID`, `CRM_TASK_FIELD_TITLE`, `CRM_SUBTASK_*`) —
-полный список см. в разделе [«CRM «Руководитель» → Конфигурация»](#конфигурация) выше.
-
-`API_MODE=dev` отключает флаг `Secure` на куках — браузер отправляет их по `http://localhost`.
-В production `API_MODE=prod` допустим только при работе через HTTPS.
-
-### 5. Создать базу данных
-
-```sql
-CREATE DATABASE task_manager;
-```
-
-### 6. Применить миграции
-
-```
-alembic upgrade head
-```
-
-Миграции создают таблицы `role`, `user_role`, `person`, `task`, `subtask`, `project`, `crm_outbox`, `registration_pending`.
-При первом запуске приложения lifespan заполняет `role` базовыми ролями (`user`, `admin`).
-
-**Роль `admin` этим не назначается никому** — при регистрации новый пользователь всегда получает только роль `user` (см. [«Регистрация пользователя»](#регистрация-пользователя) выше). `PATCH /users/{user_id}` умеет назначать роли через `role_ids`, но сам требует роль `admin` у вызывающего (`require_role("admin")`) — циклическая зависимость для самого первого администратора. Чтобы её разорвать, назначьте роль `admin` напрямую в БД (замените email на нужный):
-
-```sql
-INSERT INTO user_role (person_id, role_id)
-SELECT id, 2 FROM person WHERE email = 'you@mail.ru'
-ON CONFLICT (person_id, role_id) DO NOTHING;
-```
-
-Колонка называется `person_id`, а не `user_id` — таблица связки называется `user_role`, но ссылается на `person.id` (см. [«Схема БД»](#database-schema) выше); `role_id=2` — `admin` (см. [«Миграции Alembic»](#миграции-alembic), `role` заполняется `id=1 → user`, `id=2 → admin`). Изменение применяется сразу, без повторного логина: `require_role()` проверяет роли живым запросом к БД при каждом запросе, а не читает их из JWT (в токене ролей нет вообще). Дальнейших администраторов можно назначать уже через `PATCH /users/{user_id}` от имени первого.
-
-Добавить новую миграцию после изменения моделей:
-
-```
-alembic revision --autogenerate -m "describe change"
-alembic upgrade head
-```
-
-`alembic/env.py` загружает все ORM-модели через `import src.models`. `src/models/__init__.py` — единый реестр: импортирует `src.auth.user_models` (`User`, `Role`, `RegistrationPending`) и `src.task_logic.models` (`Task`, `Subtask`, `Project`, `CrmOutbox`). При добавлении новой модели достаточно добавить импорт в `src/models/__init__.py` — `alembic/env.py` менять не нужно.
-
-### 7. Запустить сервер
-
-```
-uvicorn src.main:app --reload
-```
-
-После запуска: приложение — http://localhost:8000, Swagger UI — http://localhost:8000/docs, ReDoc — http://localhost:8000/redoc.
-
-### 8. Celery + Redis (Docker / Windows / Ubuntu)
-
-Нужно только если проверяете периодическую синхронизацию справочника «Проект»,
-durable-retry очередь `crm_outbox` (устойчивую к падению сервера CRM-синхронизацию
-задач/подзадач), WebSocket-рассылку между несколькими uvicorn-воркерами или ручной
-эндпоинт `POST /admin/crm-options/refresh` — для обычного однопроцессного CRUD
-задач/подзадач этот шаг не обязателен: без Redis приложение всё равно запускается,
-`ConnectionManager.broadcast()` просто логирует предупреждение о неудачной публикации
-и продолжает работать только локально, в рамках одного процесса.
-
-Ниже — три независимых варианта; выберите тот, что соответствует вашему сценарию
-развёртывания. Все три запускают одну и ту же связку (Celery worker + Celery beat +
-Redis-брокер), различается только способ установки самого Redis и способ запуска
-процессов.
-
-#### Вариант A — Docker (рекомендуется, одинаково для любой ОС)
-
-Самый простой путь: `docker-compose.yml` уже описывает и `redis`, и `celery-worker`,
-и `celery-beat`, и шардированные `celery-worker-shard-0..3` — поднимаются одной
-командой вместе с самим приложением. Подробности и команды — раздел
-[«Docker Deployment»](#docker-deployment) ниже, здесь Redis/Celery отдельно
-устанавливать не нужно.
-
-```bash
-docker compose --env-file src/.dev.env -f src/docker-compose.yml up --build
-```
-
-**Flower** (веб-мониторинг Celery: воркеры по шардам, задачи, ретраи, очереди
-`crm_sync.shard_N`) поднимается тем же `docker compose` и доступен на
-<http://localhost:5555> — **только с loopback** (порт опубликован на
-`127.0.0.1`). Пароль необязателен: чтобы включить аутентификацию, добавьте в
-`src/.dev.env`
-
-```
+ADMIN_TIMEZONE=Europe/Moscow
+CHAT_HISTORY_MAX_LEN=500
+DB_POOL_SIZE=5
+DB_MAX_OVERFLOW=10
+# Публичный сервер — Swagger/ReDoc посторонним не нужны; DOCS_ENABLED не задан
+# даёт тот же эффект (см. src/config.py::docs_enabled), но лучше явно.
+DOCS_ENABLED=false
 FLOWER_BASIC_AUTH=admin:придумайте-пароль
+
+# ── CRM «Руководитель» — обязательные, без них приложение не стартует ──
+# (см. src/crm/crm_config.py, _required_env/_required_int_env). Значения зависят от
+# вашей инсталляции CRM — заполните каждое поле ниже, оставлять пустым нельзя.
+CRM_API_URL=
+CRM_API_KEY=
+CRM_API_USER=
+CRM_API_PASSWORD=
+CRM_LOGIN_URL=
+
+CRM_TASK_ENTITY_ID=
+CRM_SUBTASK_ENTITY_ID=
+
+CRM_TASK_FIELD_TITLE=
+CRM_TASK_FIELD_DESCRIPTION=
+CRM_TASK_FIELD_COMPLETED=
+CRM_TASK_FIELD_SPECIFICATION=
+CRM_TASK_FIELD_OTHER_FILES=
+CRM_TASK_FIELD_CREATOR_EMAIL=
+
+CRM_SUBTASK_FIELD_TITLE=
+CRM_SUBTASK_FIELD_DESCRIPTION=
+CRM_SUBTASK_FIELD_COMPLETED=
+CRM_SUBTASK_FIELD_SPECIFICATION=
+CRM_SUBTASK_FIELD_OTHER_FILES=
+CRM_SUBTASK_FIELD_CREATOR_EMAIL=
+
+CRM_LIST_PROJECT=
+CRM_TASK_FIELD_PROJECT=
+
+# ── CRM «Руководитель» — необязательные, есть безопасный дефолт в src/crm/crm_config.py ──
+CRM_DEMO_ID=                            # пусто для production; номер demo-инстанса для тестовой среды
+CRM_PROJECT_SYNC_INTERVAL_SECONDS=180
+CRM_OUTBOX_SHARD_COUNT=4
+CRM_RATE_LIMIT_PER_SECOND=5
+CRM_OUTBOX_RETENTION_DAYS=30
 ```
 
-Без этой переменной Flower запускается без аутентификации (в логе контейнера —
-предупреждение). Для окружения с внешним доступом пароль обязателен.
+Значения обязательных `CRM_*`-переменных выше оставлены пустыми намеренно: `entity_id` и
+номера полей (`field_<ID>`) генерируются внутри конкретной инсталляции CRM «Руководитель»
+и отличаются между demo/production/другими клиентами — заполните их своими значениями
+из панели администратора CRM. Таблицу соответствия полей и demo-значения, на которых
+разрабатывался проект (для сверки формата) — см. [«CRM «Руководитель» →
+Конфигурация»](#конфигурация) выше. `CRM_OUTBOX_SHARD_COUNT=4` — держите в уме это число,
+оно определит, сколько systemd-юнитов шардов понадобится в шаге 10.
 
-#### Вариант B — Windows (локально, без Docker)
-
-**1. Установить и запустить Redis.** Официальной Windows-сборки от Redis Ltd нет —
-вариант на выбор:
-
-- **WSL** (наиболее близко к продакшен-окружению):
-  ```bash
-  wsl --install -d Ubuntu
-  ```
-  затем внутри дистрибутива — команды из варианта «Ubuntu» ниже (`apt install redis-server`).
-- **Нативный порт для Windows** — не требует WSL:
-  - [Memurai](https://www.memurai.com/) (Redis-совместимый форк, Developer-редакция
-    бесплатна, ставится как служба Windows — не нужно держать терминал открытым);
-  - сборка [tporadowski/redis](https://github.com/tporadowski/redis/releases) —
-    скачать `Redis-x64-*.zip`, распаковать, запустить `redis-server.exe` в отдельном
-    терминале (без установки службы).
-
-По умолчанию `src/.dev.env` уже содержит `REDIS_URL=redis://localhost:6379/0` —
-править не нужно, если Redis слушает порт 6379 на localhost (проверить: `redis-cli ping`
-должен ответить `PONG`, если `redis-cli` доступен, либо через `Test-NetConnection
-localhost -Port 6379` в PowerShell).
-
-**2. Установить Python-зависимости** (если ещё не установлены — `celery`/`redis` уже
-входят в `requirements.txt`, см. шаг 3 выше):
-
-```powershell
-pip install -r requirements.txt
-```
-
-**3. Запустить Celery worker и beat — в двух отдельных терминалах** (venv активирован
-в каждом: `.venv\Scripts\Activate.ps1`):
-
-```powershell
-celery -A src.celery_app worker --loglevel=info --pool=solo
-```
-
-```powershell
-celery -A src.celery_app beat --loglevel=info
-```
-
-Этот воркер обслуживает только **дефолтную** очередь (`sync_project_table`, `reconcile_*`). CRM-события
-идут в шардированные очереди `crm_sync.shard_0 … shard_{N-1}` (`N` = `CRM_OUTBOX_SHARD_COUNT`, по умолчанию 4) —
-на **каждый** шард нужен отдельный воркер с `--pool=solo` (один процесс на шард гарантирует порядок событий одной
-задачи), иначе `crm_outbox` будет копить строки `pending` и в CRM ничего не уйдёт. По одному терминалу на шард:
-
-```powershell
-celery -A src.celery_app worker --loglevel=info --pool=solo -Q crm_sync.shard_0 -n shard0@%h
-celery -A src.celery_app worker --loglevel=info --pool=solo -Q crm_sync.shard_1 -n shard1@%h
-celery -A src.celery_app worker --loglevel=info --pool=solo -Q crm_sync.shard_2 -n shard2@%h
-celery -A src.celery_app worker --loglevel=info --pool=solo -Q crm_sync.shard_3 -n shard3@%h
-```
-
-`--pool=solo` **обязателен** на Windows: дефолтный `prefork`-пул Celery использует
-`os.fork()`, которого в Windows нет — без этого флага воркер не запустится вообще.
-`beat` этого ограничения не имеет (это только планировщик, он ничего не форкает).
-
-**4. Проверить, что всё подключено** (не дожидаясь расписания Celery Beat):
-
-```powershell
-celery -A src.celery_app call src.tasks.global_lists_tasks.sync_project_table
-```
-
-Если в терминале с `celery worker` появилась строка о выполнении задачи —
-Redis/Celery связаны корректно.
-
-#### Вариант C — Ubuntu (сервер, без Docker)
-
-**1. Установить и запустить Redis** через системный пакетный менеджер (в отличие от
-Windows, для Linux есть официальный пакет):
+Права на файл с секретами — читает только владелец:
 
 ```bash
-sudo apt update
-sudo apt install -y redis-server
-sudo systemctl enable --now redis-server   # автозапуск при перезагрузке сервера
-redis-cli ping                              # должен ответить PONG
+sudo chmod 600 /opt/task-manager/src/.env
 ```
 
-По умолчанию Redis слушает `127.0.0.1:6379` — `REDIS_URL=redis://localhost:6379/0`
-из `src/.dev.env` подходит без изменений. Для внешнего доступа (Redis на отдельном
-хосте) отредактируйте `bind`/`requirepass` в `/etc/redis/redis.conf` и обновите
-`REDIS_URL` соответственно (`redis://:<пароль>@<хост>:6379/0`).
-
-**2. Установить Python-зависимости** (в активированном `.venv`, см. шаги 1–3 выше):
+### 6. Миграции Alembic и первый администратор
 
 ```bash
-source .venv/bin/activate
-pip install -r requirements.txt
+cd /opt/task-manager
+sudo -u taskmanager env API_MODE=prod .venv/bin/alembic upgrade head
 ```
 
-**3. Запустить Celery worker и beat.** На Linux `--pool=solo` не нужен — работает
-дефолтный `prefork`-пул (параллелизм через `fork()`, доступный на этой ОС):
+Миграции создают все таблицы (`role`, `user_role`, `person`, `task`, `subtask`, `project`, `crm_outbox`,
+`registration_pending`); `role` заполняется ролями `user`/`admin` при первом старте приложения (lifespan,
+не миграцией). Зарегистрируйте обычного пользователя через будущий `https://example.com/register`, затем
+назначьте ему роль `admin` напрямую в БД — циклическая зависимость для самого первого администратора
+(`PATCH /users/{id}` требует уже существующего admin'а):
 
 ```bash
-celery -A src.celery_app worker --loglevel=info &
-celery -A src.celery_app beat --loglevel=info &
+sudo -u postgres psql -d task_manager -c "
+INSERT INTO user_role (person_id, role_id)
+SELECT id, 2 FROM person WHERE email = 'you@example.com'
+ON CONFLICT (person_id, role_id) DO NOTHING;"
 ```
 
-Воркер без `-Q` обслуживает только дефолтную очередь. Для CRM-событий нужен **отдельный воркер на каждый
-шард** очереди `crm_sync.shard_N` (`N` от 0 до `CRM_OUTBOX_SHARD_COUNT - 1`, по умолчанию 4) с `--pool=solo`
-и `-Q crm_sync.shard_N` — по одному процессу на шард, иначе теряется порядок событий одной задачи, а без этих
-воркеров строки `crm_outbox` остаются `pending`:
+### 7. Каталог загруженных файлов
 
 ```bash
-for n in 0 1 2 3; do
-  celery -A src.celery_app worker --loglevel=info --pool=solo -Q crm_sync.shard_$n -n shard$n@%h &
-done
+sudo -u taskmanager mkdir -p /opt/task-manager/src/uploads
+sudo chmod 750 /opt/task-manager/src/uploads
 ```
 
-Для постоянно работающего сервера предпочтительнее systemd-юниты вместо фонового
-`&` (переживают отключение SSH-сессии, автоматически перезапускаются при падении).
-Пример юнита для worker (`/etc/systemd/system/task-manager-celery-worker.service`);
-для `beat` — отдельный файл `task-manager-celery-beat.service` с тем же содержимым,
-кроме `ExecStart` (`celery -A src.celery_app beat --loglevel=info` вместо `worker`)
-и имени сервиса. Для воркеров шардов — по одному юниту `task-manager-celery-shard-N.service` с
-`ExecStart=... worker --loglevel=info --pool=solo -Q crm_sync.shard_N -n shardN@%h`:
+`src/uploads/` — НЕ статика: `GET /uploads/{path}` защищён `Depends(current_user)` (см. «Файлы задач»
+выше), Nginx не должен получить к нему прямой доступ через `alias`, поэтому владелец — только `taskmanager`, группа
+`taskmanager` (не `www-data`), права `750`. Ниже в конфигурации Nginx (шаг 11) для этого каталога
+намеренно нет отдельного `location` — запрос идёт в общий проксирующий `location /`, как и положено
+для маршрута с проверкой авторизации.
+
+### 8. Ручная проверка перед systemd
+
+```bash
+cd /opt/task-manager
+sudo -u taskmanager env API_MODE=prod .venv/bin/uvicorn src.main:app --host 127.0.0.1 --port 8000
+# в отдельном терминале:
+curl -i http://127.0.0.1:8000/tasks/   # ожидаем 401 (валидной куки access_token нет) — значит приложение работает
+```
+
+Остановите (`Ctrl+C`) перед переходом к systemd — постоянную работу возьмёт на себя юнит ниже.
+
+### 9. systemd — веб-приложение
+
+```bash
+sudo nano /etc/systemd/system/task-manager-web.service
+```
 
 ```ini
 [Unit]
-Description=Task Manager Celery worker
-After=network.target redis-server.service
+Description=Task Manager — FastAPI web (uvicorn)
+After=network.target postgresql.service redis-server.service
+Wants=postgresql.service redis-server.service
 
 [Service]
 Type=simple
-User=www-data
-WorkingDirectory=/path/to/task-manager
-Environment="PATH=/path/to/task-manager/.venv/bin"
-ExecStart=/path/to/task-manager/.venv/bin/celery -A src.celery_app worker --loglevel=info
+User=taskmanager
+Group=taskmanager
+WorkingDirectory=/opt/task-manager
+Environment="API_MODE=prod"
+Environment="UVICORN_WORKERS=2"
+# --proxy-headers: доверять X-Forwarded-For/-Proto от Nginx (стоящего перед uvicorn) —
+# без флага FastAPI видел бы во всех запросах адрес и протокол самого Nginx (127.0.0.1, http),
+# а не реального клиента. По умолчанию uvicorn доверяет этим заголовкам только от 127.0.0.1 —
+# Nginx именно там и работает, --forwarded-allow-ips не требуется отдельно.
+ExecStart=/opt/task-manager/.venv/bin/uvicorn src.main:app --host 127.0.0.1 --port 8000 --workers ${UVICORN_WORKERS} --proxy-headers
 Restart=always
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 ```
 
+Число воркеров (`UVICORN_WORKERS`) подбирается так же, как для Docker-варианта — см. «Число воркеров
+uvicorn (`UVICORN_WORKERS`)» ниже (≈ число ядер CPU, не `(2×CPU)+1`).
+
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now task-manager-celery-worker
+sudo systemctl enable --now task-manager-web
+sudo systemctl status task-manager-web
+sudo journalctl -u task-manager-web -f   # логи в реальном времени; Ctrl+C для выхода
 ```
 
-**4. Проверить, что всё подключено:**
+### 10. systemd — Celery: worker, шарды, beat, Flower
+
+Ровно то же разделение процессов, что и в `src/docker-compose.yml` (см. [«Docker
+Deployment»](#docker-deployment) ниже — там же список контейнеров), только вместо
+контейнеров — systemd-юниты. Общий шаблон окружения — везде одинаковые
+`User`/`Group`/`WorkingDirectory`/`Environment="API_MODE=prod"`, различается только `ExecStart`.
+
+**10.1. Воркер дефолтной очереди** (`sync_project_table`, `reconcile_*`, `cleanup_done_outbox` —
+несшардированные периодические задачи):
 
 ```bash
-celery -A src.celery_app call src.tasks.global_lists_tasks.sync_project_table
+sudo nano /etc/systemd/system/task-manager-celery-worker.service
 ```
+
+```ini
+[Unit]
+Description=Task Manager — Celery worker (default queue)
+After=network.target postgresql.service redis-server.service
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=taskmanager
+Group=taskmanager
+WorkingDirectory=/opt/task-manager
+Environment="API_MODE=prod"
+ExecStart=/opt/task-manager/.venv/bin/celery -A src.celery_app worker --loglevel=info
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**10.2. Шардированные воркеры CRM-outbox-очереди** — по одному процессу на шард, `concurrency=1`
+(`--pool=solo`, тот же принцип, что и в Docker-варианте: ровно один процесс на шард, без параллелизма
+внутри процесса — иначе теряется гарантия строгого порядка обработки событий одной задачи). Вместо
+четырёх (по числу `CRM_OUTBOX_SHARD_COUNT`) почти одинаковых файлов — один **шаблонный** systemd-юнит
+с параметром `%i` (тот же принцип DRY, что и YAML-якорь `&celery-worker-shard-base` в
+`src/docker-compose.yml`):
+
+```bash
+sudo nano /etc/systemd/system/task-manager-celery-shard@.service
+```
+
+```ini
+[Unit]
+Description=Task Manager — Celery worker, outbox shard %i
+After=network.target postgresql.service redis-server.service
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=taskmanager
+Group=taskmanager
+WorkingDirectory=/opt/task-manager
+Environment="API_MODE=prod"
+# %i — номер шарда (подставляется systemd из имени экземпляра юнита, например "0" из "...@0.service").
+# %%h — экранированный литерал: без вторых % systemd попытался бы сам подставить сюда домашний
+# каталог пользователя (это ЕГО спецификатор %h) вместо того, чтобы передать "%h" самой Celery,
+# у которой это свой, отдельный спецификатор хоста воркера.
+ExecStart=/opt/task-manager/.venv/bin/celery -A src.celery_app worker --loglevel=info --pool=solo -Q crm_sync.shard_%i -n shard%i@%%h
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Число экземпляров обязано совпадать с `CRM_OUTBOX_SHARD_COUNT` из `src/.env` (в примере выше — 4,
+шарды `0`..`3`):
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now task-manager-celery-shard@0 task-manager-celery-shard@1 \
+    task-manager-celery-shard@2 task-manager-celery-shard@3
+```
+
+Увеличение `CRM_OUTBOX_SHARD_COUNT` в будущем — правка `.env` + `systemctl enable --now
+task-manager-celery-shard@4` для нового шарда, без изменения самого юнита. Уменьшать число шардов
+нельзя, пока в `task.crm_shard` есть значения снятых шардов (то же ограничение, что и в Docker-варианте).
+
+**10.3. Планировщик Beat** — ровно один экземпляр на весь деплой (иначе периодические задачи
+ставились бы в очередь дважды):
+
+```bash
+sudo nano /etc/systemd/system/task-manager-celery-beat.service
+```
+
+```ini
+[Unit]
+Description=Task Manager — Celery beat (scheduler)
+After=network.target postgresql.service redis-server.service
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=taskmanager
+Group=taskmanager
+WorkingDirectory=/opt/task-manager
+Environment="API_MODE=prod"
+ExecStart=/opt/task-manager/.venv/bin/celery -A src.celery_app beat --loglevel=info
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`WorkingDirectory=/opt/task-manager` — важно именно для Beat: файл `celerybeat-schedule`
+создаётся в текущей рабочей директории процесса; `taskmanager` — владелец
+`/opt/task-manager`, писать туда может.
+
+**10.4. Flower (опционально)** — веб-мониторинг Celery, только на loopback, как и в Docker-варианте:
+
+```bash
+sudo nano /etc/systemd/system/task-manager-flower.service
+```
+
+```ini
+[Unit]
+Description=Task Manager — Flower (Celery monitoring)
+After=network.target redis-server.service
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=taskmanager
+Group=taskmanager
+WorkingDirectory=/opt/task-manager
+Environment="API_MODE=prod"
+ExecStart=/opt/task-manager/.venv/bin/celery -A src.celery_app flower --address=127.0.0.1 --port=5555
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`--address=127.0.0.1` — то же соображение, что и `ports: - "127.0.0.1:5555:5555"` в
+`docker-compose.yml`: Flower отдаёт содержимое задач и умеет управлять воркерами, наружу торчать не
+должен. `FLOWER_BASIC_AUTH` подхватывается из `src/.env` (шаг 5) — без неё Flower стартует без
+аутентификации (безопасно только пока порт не наружу). Доступ снаружи — через SSH-туннель:
+`ssh -L 5555:127.0.0.1:5555 user@example.com`, затем `http://localhost:5555` в браузере на своей машине.
+
+**Запуск всех юнитов и проверка:**
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now task-manager-celery-worker task-manager-celery-beat task-manager-flower
+sudo systemctl status "task-manager-*"
+```
+
+### 11. Nginx — reverse proxy, статика, WebSocket
+
+Директива `map` не может стоять внутри `server {}` — выносим её в отдельный файл, который nginx.conf
+на Ubuntu уже подключает через `include /etc/nginx/conf.d/*.conf;`:
+
+```bash
+sudo nano /etc/nginx/conf.d/websocket-upgrade.conf
+```
+
+```nginx
+map $http_upgrade $connection_upgrade {  # если заголовок Upgrade есть → "upgrade"; иначе → "close"
+    default  upgrade;
+    ''       close;
+}
+```
+
+Сам конфиг сайта — сначала только HTTP (порт 443 добавит `certbot` в шаге 12, ссылаться на
+несуществующие пока файлы сертификата нельзя — Nginx не запустится):
+
+```bash
+sudo nano /etc/nginx/sites-available/task-manager.conf
+```
+
+```nginx
+upstream task_manager_backend {
+    server 127.0.0.1:8000;
+}
+
+server {
+    listen 80;
+    server_name example.com;
+
+    # Лимит размера тела запроса — приложение само разрешает файлы до 100 МБ;
+    # дефолтный лимит Nginx (1 МБ) вернул бы 413 раньше, чем запрос вообще дошёл бы до FastAPI.
+    client_max_body_size 100M;
+
+    # --- Статика: css/js/img из src/static — Nginx отдаёт напрямую, в обход
+    # Python-процесса (быстрее: sendfile() с нулевым копированием вместо
+    # чтения файла в Python-объект и записи обратно). Те же файлы, что при
+    # разработке отдаёт StaticFiles-mount в src/main.py — переопределять код
+    # приложения не нужно, mount продолжает работать как фолбэк, если
+    # когда-нибудь запустите uvicorn без Nginx перед ним.
+    location /static/ {
+        alias /opt/task-manager/src/static/;
+
+        location ~* \.(css|js|png|jpg|jpeg|svg|ico|woff|woff2|ttf|eot)$ {
+            expires 30d;
+            add_header Cache-Control "public, no-transform";
+            access_log off;
+        }
+    }
+
+    # --- /uploads/{path} НАМЕРЕННО не описан отдельным location. Это защищённый
+    # маршрут (Depends(current_user) в src/routers/uploads.py) — файлы задач и
+    # подзадач видны только аутентифицированным пользователям. Alias в духе
+    # location /static/ выше сделал бы их доступными БЕЗ проверки авторизации
+    # напрямую с диска — запрос должен идти в приложение и проверяться там же,
+    # поэтому /uploads/* обрабатывается общим location / ниже, как обычный маршрут.
+
+    # --- WebSocket ---
+    location /ws/ {
+        proxy_pass http://task_manager_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600;   # WS-соединения живут часами; дефолтный таймаут 60с их обрывал бы
+        proxy_send_timeout 3600;
+    }
+
+    # --- Всё остальное: REST API, HTML-страницы, /admin (sqladmin), /docs, /uploads/* ---
+    location / {
+        proxy_pass http://task_manager_backend;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Активируем сайт, отключаем дефолтный (иначе он конфликтует по `server_name`/`default_server`):
+
+```bash
+sudo ln -s /etc/nginx/sites-available/task-manager.conf /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
+```
+
+Права на чтение статики для пользователя, от которого работает Nginx (`www-data`) — сам процесс
+приложения (`taskmanager`) владеет файлами, `www-data` в эту группу не входит, поэтому нужны явные
+права на обход каталогов и чтение файлов (`711`/`755`, не смена владельца):
+
+```bash
+sudo chmod 711 /opt/task-manager
+sudo chmod -R 755 /opt/task-manager/src/static
+```
+
+`711` на корень проекта даёт только «право войти» (execute) кому угодно, но не «право посмотреть
+список файлов» (read) — `www-data` может дойти до `src/static` по фиксированному пути из `alias`,
+но не может просмотреть остальное содержимое `/opt/task-manager` (там же лежат `src/.env` с секретами
+и `src/uploads` с чужими файлами). Проверяем конфигурацию и перезапускаем:
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+curl -i http://example.com/static/js/swagger-ui-bundle.js   # должен отдать файл, не 404/403
+curl -i http://example.com/tasks/                            # должен вернуть 401 (проксируется в приложение)
+```
+
+### 12. SSL — Let's Encrypt через certbot
+
+```bash
+sudo apt install -y snapd
+sudo snap install core && sudo snap refresh core
+sudo snap install --classic certbot
+sudo ln -s /snap/bin/certbot /usr/bin/certbot
+sudo certbot --nginx -d example.com
+```
+
+`certbot --nginx` сам находит блок `server { listen 80; server_name example.com; }` в
+`/etc/nginx/sites-available/task-manager.conf`, получает сертификат (HTTP-01 challenge — поэтому
+DNS должен уже указывать на сервер и порт 80 быть доступен снаружи), дописывает `listen 443 ssl;` с
+путями к сертификату в тот же server-блок и добавляет отдельный `server { listen 80; ...; return 301
+https://...; }` для редиректа — вручную переписывать конфиг не нужно. Автопродление сертификата
+certbot ставит сам как systemd-таймер:
+
+```bash
+sudo systemctl list-timers | grep certbot
+sudo certbot renew --dry-run   # проверка, что автопродление сработает, без реального обновления
+```
+
+### 13. Firewall (ufw)
+
+```bash
+sudo ufw allow OpenSSH
+sudo ufw allow 'Nginx Full'   # открывает и 80, и 443 одним профилем
+sudo ufw enable
+sudo ufw status
+```
+
+PostgreSQL (5432), Redis (6379), сам uvicorn (8000) и Flower (5555) наружу не открываются вообще —
+все слушают только `127.0.0.1`/`localhost` (см. шаги 2, 9, 10.4) и не упомянуты в правилах `ufw`
+намеренно, тем же принципом, что и `ports: "127.0.0.1:6379:6379"` в `docker-compose.yml` для Redis.
+
+### 14. Итоговая проверка всего стека
+
+```bash
+sudo systemctl status task-manager-web task-manager-celery-worker task-manager-celery-beat \
+    "task-manager-celery-shard@0" "task-manager-celery-shard@1" \
+    "task-manager-celery-shard@2" "task-manager-celery-shard@3" task-manager-flower nginx \
+    postgresql redis-server
+
+# Приложение доступно снаружи по HTTPS
+curl -I https://example.com/
+
+# Celery видит все запущенные воркеры (в т.ч. по шардам)
+cd /opt/task-manager && sudo -u taskmanager env API_MODE=prod .venv/bin/celery -A src.celery_app inspect ping
+```
+
+**Redis через командную строку.** `redis-server` слушает `localhost:6379` (шаг 1), поэтому `redis-cli`
+без дополнительных флагов идёт прямо на него:
+
+```bash
+# Все сообщения WS-чата — Redis List "chat:history" (RPUSH/LTRIM, см. src/realtime/chat_history.py).
+# Каждый элемент — JSON-строка одного события (чат или CRUD-событие задачи/подзадачи), от старых к новым.
+redis-cli LRANGE chat:history 0 -1
+
+# Необработанные строки crm_outbox, ожидающие в очереди шарда 0 (та же схема шардирования, что и в
+# Docker-варианте, здесь без Docker). В здоровой системе список короткий или пустой —
+# task-manager-celery-shard@0 разбирает его почти сразу; длинный и растущий список — сигнал, что
+# этот шардовый воркер не поднят или не справляется.
+redis-cli LRANGE crm_sync.shard_0 0 -1
+
+# Сколько задач сейчас ждёт в очереди каждого шарда (0..CRM_OUTBOX_SHARD_COUNT-1, по умолчанию 0-3)
+for n in 0 1 2 3; do echo "shard_$n: $(redis-cli LLEN crm_sync.shard_$n)"; done
+```
+
+Дальше — как в обычном чек-листе после любого деплоя: открыть `https://example.com/register` в браузере,
+пройти регистрацию, зайти, создать задачу с файлом (проверит `/uploads/*` через приложение, а не Nginx
+напрямую), убедиться, что бейдж синхронизации доходит до `synced` (Celery-воркер шарда обработал
+outbox-строку), открыть `/admin` под назначенным на шаге 6 администратором.
+
+### 15. Обновление приложения (redeploy)
+
+```bash
+cd /opt/task-manager
+sudo -u taskmanager git pull
+sudo -u taskmanager .venv/bin/pip install --no-cache-dir -r requirements.txt
+sudo -u taskmanager env API_MODE=prod .venv/bin/alembic upgrade head
+sudo systemctl restart task-manager-web task-manager-celery-worker task-manager-celery-beat \
+    "task-manager-celery-shard@0" "task-manager-celery-shard@1" \
+    "task-manager-celery-shard@2" "task-manager-celery-shard@3" task-manager-flower
+```
+
+Порядок важен только в одном месте: `alembic upgrade head` — до перезапуска сервисов, иначе воркеры и
+веб-процесс на короткое время окажутся на новом коде со старой схемой БД.
+
+### 16. Логи и типичные проблемы
+
+| Симптом | Где смотреть | Частая причина |
+|---|---|---|
+| `task-manager-web` не стартует | `journalctl -u task-manager-web -e` | Не создан `src/.env` (шаг 5) или ошибка в нём — `pydantic.ValidationError` в самом начале лога |
+| `502 Bad Gateway` от Nginx | `journalctl -u task-manager-web -e`, `sudo tail -f /var/log/nginx/error.log` | `task-manager-web` упал или ещё не поднялся; `systemctl status task-manager-web` |
+| Статика 403/404 через Nginx, но напрямую по `curl` с сервера работает | `sudo nginx -t`, права каталогов | Забыли `chmod 711 /opt/task-manager` (шаг 11) — `www-data` не может дойти по пути до `src/static` |
+| Задачи не долетают до CRM, бейдж навсегда `pending` | `journalctl -u "task-manager-celery-shard@*" -e` | Не запущен(ы) шардированный(е) воркер(ы) — строка `crm_outbox` остаётся `pending`, пока `reconcile_pending_outbox` не подберёт её на следующий тик, но обработать её всё равно некому |
+| WebSocket не подключается (в консоли браузера — сразу `close`) | `sudo tail -f /var/log/nginx/error.log`, `journalctl -u task-manager-web -e` | Не подключён `map` из `/etc/nginx/conf.d/websocket-upgrade.conf`, либо запрос ушёл не в `location /ws/`, а в `location /` (нет заголовков `Upgrade`/`Connection`) |
+| `413 Request Entity Too Large` при загрузке файла ТЗ | `sudo tail -f /var/log/nginx/error.log` | Забыт `client_max_body_size 100M;` в конфиге Nginx (шаг 11) — приложение разрешает файлы крупнее дефолтного лимита Nginx в 1 МБ |
+| `X-Forwarded-Proto`/реальный IP клиента не доходят до приложения | — | Забыт `--proxy-headers` в `ExecStart` юнита `task-manager-web` (шаг 9) |
 
 ---
 
@@ -1489,8 +1805,8 @@ outbox + `reconcile_pending_outbox` как подстраховка). Измен
 
 ### Конфигурация
 
-Перед первым запуском заполните `src/.dev.env` (полный список переменных — «Local Development → 4. Переменные окружения»).
-Минимум для запуска в Docker:
+Перед первым запуском заполните `src/.dev.env`. Полный список CRM-переменных — [«CRM «Руководитель» →
+Конфигурация»](#конфигурация) выше. Минимум для запуска в Docker:
 
 ```ini
 DB_USER=your_db_user
@@ -1527,6 +1843,22 @@ docker compose --env-file src/.dev.env -f src/docker-compose.yml logs -f celery-
 docker compose --env-file src/.dev.env -f src/docker-compose.yml exec celery-worker \
   celery -A src.celery_app call src.tasks.global_lists_tasks.sync_project_table
 
+# Redis работает в контейнере — redis-cli запускается ВНУТРИ него через "exec".
+
+# Все сообщения WS-чата — Redis List "chat:history" (RPUSH/LTRIM, см. src/realtime/chat_history.py).
+# Каждый элемент — JSON-строка одного события, от старых к новым.
+docker compose --env-file src/.dev.env -f src/docker-compose.yml exec redis redis-cli LRANGE chat:history 0 -1
+
+# Необработанные строки crm_outbox, ожидающие в очереди шарда 0. Короткий/пустой список — норма
+# (celery-worker-shard-0 разбирает его почти сразу); длинный и растущий — сигнал, что этот
+# шардовый воркер не поднят или не справляется.
+docker compose --env-file src/.dev.env -f src/docker-compose.yml exec redis redis-cli LRANGE crm_sync.shard_0 0 -1
+
+# Сколько задач сейчас ждёт в очереди каждого шарда (0..CRM_OUTBOX_SHARD_COUNT-1, по умолчанию 0-3)
+for n in 0 1 2 3; do
+  docker compose --env-file src/.dev.env -f src/docker-compose.yml exec redis redis-cli LLEN crm_sync.shard_$n
+done
+
 # Остановка
 docker compose --env-file src/.dev.env -f src/docker-compose.yml down
 
@@ -1547,7 +1879,7 @@ docker compose --env-file src/.dev.env -f src/docker-compose.yml down -v
 |---|---|---|
 | **История WS-чата** | список `chat:history`, счётчик `chat:history:next_id` | История чата и действий исчезает целиком, нумерация `id` начинается заново. Единственные данные, которые нигде больше не хранятся. |
 | Очереди Celery | `celery`, `crm_sync.shard_N` и служебные ключи | Не потеряется главное: CRM-события лежат в PostgreSQL (`crm_outbox`), а `reconcile_pending_outbox` заново ставит зависшие строки в очередь. Потеряется только то, что было «в полёте» (например, разовый запуск `sync_project_table`). |
-| Служебные ключи | `crm_rate_limit` (TTL 1 с), `crm_shard_lock:*` (TTL 30 с) | Ничего: живут секунды. |
+| Служебные ключи | `crm_rate_limit` (TTL 1 с), `crm_shard_lock:*` (TTL 300 с, см. «Таймауты HTTP-запросов к CRM и большие файлы» выше) | Ничего: живут секунды/минуты. |
 
 Значит, том нужен в первую очередь ради истории WS-чата. Ограничить её размер можно
 переменной `CHAT_HISTORY_MAX_LEN` (по умолчанию 500 записей).
@@ -1706,8 +2038,9 @@ pip install -r requirements-dev.txt
 Переключение на тестовую БД происходит автоматически: корневой `conftest.py` выставляет
 `os.environ["API_MODE"] = "test"` до первого импорта `src.*`, а `src/config.py` сам
 загружает файл текущего режима (`.tests.env`) первым — независимо от того, что лежит
-в `.dev.env`. CRM и SMTP не нужны — фикстуры `mock_crm` и `mock_smtp` перехватывают
-все обращения к ним.
+в `.dev.env`. Реальная CRM не нужна — веб-процесс к ней вообще не обращается
+(только Celery-воркер, замоканный отдельно, см. `mock_outbox_dispatch` ниже); SMTP
+перехватывает фикстура `mock_smtp`.
 
 **4. Запустить тесты**
 
@@ -1758,7 +2091,6 @@ docker exec task-manager-web-1 python -m pytest tests/ -v
 | `setup_and_reset` | function, autouse | `TRUNCATE ... RESTART IDENTITY CASCADE` всех таблиц + вставка ролей (`user`=1, `admin`=2). Повторная проверка имени БД (`_test`) — защита от запуска на рабочей БД. **Не запускайте два `pytest` одновременно**: они делят одну тестовую БД |
 | `fast_registration_code_hash` | function, autouse | Подменяет bcrypt-помощник кода подтверждения регистрации (rounds=14 → 4): экономит секунды на каждой регистрации; пароли пользователей (argon2id) не затрагивает |
 | `client` | function | `httpx.AsyncClient` с `ASGITransport` — HTTP-запросы к приложению без TCP |
-| `mock_crm` | function, autouse | `app.dependency_overrides[get_user_registrar]` — подмена CRM-регистрации (`/auth/register`) на уровне графа зависимостей FastAPI. `/auth/login` к CRM не обращается вообще (проверка убрана), мокать там нечего. CRM-синхронизацию задач/подзадач тоже не мокает — веб-процесс её не вызывает вовсе, см. `mock_outbox_dispatch` ниже |
 | `mock_outbox_dispatch` | function, autouse | Патчит `dispatch_outbox_row` в `src.services.tasks`/`subtasks`/`attachments` — без него create/update/delete задачи или подзадачи в любом тесте пытались бы поставить настоящую Celery-задачу в очередь (реального брокера в тестах нет). Сама CRM-синхронизация проверяется через содержимое вставленных строк `crm_outbox`, не через мок CRM-клиента |
 | `mock_realtime_redis` | function, autouse | Патчит `src.realtime.connection_manager._get_redis` — `broadcast_task_event` (вызывается из любого теста, создающего/меняющего/удаляющего задачу или подзадачу) не открывает реальное TCP-соединение к Redis |
 | `mock_smtp` | function, autouse | Перехват `send_confirmation_code`; код сохраняется в `dict[email, code]` |
@@ -1785,7 +2117,7 @@ docker exec task-manager-web-1 python -m pytest tests/ -v
 | `test_task_service.py` | Юнит-тесты `src/services/tasks.py` напрямую, без HTTP — сервис CRM не вызывает вовсе, только вставляет `crm_outbox` и диспатчит её (`dispatch_outbox_row` замокан фикстурой `mock_outbox_dispatch`): создание (успех, payload/`pending`-статус outbox-строки / дубль title не создаёт вторую строку), список (пагинация), обновление (404 / outbox поставлена, если задача уже синхронизирована / иначе пропущена), удаление (удаление строки + outbox поставлена / 404) |
 | `test_subtask_service.py` | Юнит-тесты `src/services/subtasks.py` напрямую — тот же подход, что и `test_task_service.py`; в т.ч. `create_subtask` ставит outbox независимо от того, синхронизирован ли родитель (различается только `depends_on_event_id`) |
 | `test_users.py` | Список (admin — успех / 403 / 401, без `hashed_password`), удаление (успех с проверкой БД / 403 / 404 / **запрет самоудаления** / каскад задач и подзадач), редактирование (успех / частичное / замена `role_ids` / неверные роли → 400 без изменений / 403 / 404) |
-| `test_crm.py` | `CRMUserRegistrar`: register_user (успех / ConnectError / таймаут / CRM API error / невалидный JSON); `TaskManager`: create_task / update_task / delete_task (успех и ошибки); _bool_to_crm |
+| `test_crm.py` | `TaskManager`: create_task / update_task / delete_task (успех и ошибки); _bool_to_crm |
 | `test_pages.py` | HTML-маршруты: login / register / task-board (аутентифицированный и нет) |
 | `test_subtasks.py` | Создание (успех / 401 / 404 / пустой title / whitespace нормализация / дубль в задаче / одинаковый title в разных задачах / без описания / outbox ставится независимо от синхронизации родителя), чтение списка (пустой / 401 / пагинация / вторая страница / невалидный limit/skip / несуществующий task_id), чтение по ID (успех / 404 / 401), обновление (успех / частичное / 404 / 401 / дубль title), удаление (успех / 404 / 401 / физическое удаление / cascade при удалении задачи) |
 | `test_crm_subtask.py` | SubtaskManager: create_subtask (dict-ответ / list-ответ / completed=True / ConnectError / таймаут / CRM API error / невалидный JSON), update_subtask (успех / нет полей / ConnectError / CRM API error), delete_subtask (успех / ConnectError / CRM API error), _bool_to_crm |

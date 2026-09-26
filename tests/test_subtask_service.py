@@ -54,6 +54,10 @@ async def test_create_subtask_enqueues_outbox_when_parent_task_synced(mock_outbo
         assert len(rows) == 1
         assert rows[0].operation == "create"
         assert rows[0].status == "pending"
+        assert rows[0].payload == {
+            "title": "Sub", "description": "d", "completed": False,
+            "creator_email": "alice@example.com",
+        }
         # Родитель уже синхронизирован — зависимости нет, можно обрабатывать сразу.
         assert rows[0].depends_on_event_id is None
         mock_outbox_dispatch.assert_called_once()

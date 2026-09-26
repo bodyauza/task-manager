@@ -176,13 +176,13 @@ async def test_verify_code_too_short(client: AsyncClient, mock_smtp: dict):
 
 # ─── complete ─────────────────────────────────────────────────────────────────
 
-async def test_complete_success(client: AsyncClient, mock_smtp: dict, mock_crm: dict):
+async def test_complete_success(client: AsyncClient, mock_smtp: dict):
     await _request_code(client)
     await _verify_code(client, mock_smtp)
     r = await _complete(client)
     assert r.status_code == 201
 
-    # Пользователь реально создан и зарегистрирован в CRM, а не только «формально успешен».
+    # Пользователь реально создан, а не только «формально успешен».
     async with async_session_maker() as session:
         user = (await session.execute(
             select(User).options(selectinload(User.roles)).where(User.email == VALID_EMAIL)
@@ -196,32 +196,6 @@ async def test_complete_success(client: AsyncClient, mock_smtp: dict, mock_crm: 
     assert [role.name for role in user.roles] == ["user"]  # роль по умолчанию
     assert user.hashed_password != VALID_PASSWORD          # пароль не хранится в открытом виде
     assert pending is None                                 # заявка на регистрацию израсходована
-    mock_crm["crm"].register_user.assert_awaited_once()
-    assert mock_crm["crm"].register_user.call_args.kwargs["email"] == VALID_EMAIL
-
-
-async def test_complete_succeeds_even_if_crm_registration_fails(
-    client: AsyncClient, mock_smtp: dict, mock_crm: dict,
-):
-    """Регистрация в CRM — best-effort (auth/manager.py::create): недоступность
-    CRM (сеть, таймаут, невалидный ответ) не должна останавливать регистрацию
-    пользователя. Раньше любая ошибка CRM превращалась в CRMUnavailableError и
-    503 клиенту, а person не создавался вовсе — это ограничение снято, т.к.
-    /auth/login больше не проверяет наличие пользователя в CRM (см. mock_crm
-    ниже и docstring этой фикстуры в tests/conftest.py)."""
-    mock_crm["crm"].register_user.side_effect = Exception("CRM недоступна")
-
-    await _request_code(client)
-    await _verify_code(client, mock_smtp)
-    r = await _complete(client)
-
-    assert r.status_code == 201
-    # Пользователь реально создан в PostgreSQL, а не только формально "успешен" —
-    # логин работает как для обычной, полностью успешной регистрации.
-    login = await client.post(
-        "/auth/login", data={"username": VALID_EMAIL, "password": VALID_PASSWORD}
-    )
-    assert login.status_code == 200
 
 
 async def test_complete_no_token(client: AsyncClient):

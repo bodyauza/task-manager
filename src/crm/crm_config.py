@@ -60,18 +60,16 @@ class CRMSettings:
     # demo_id в URL), а не сентинел «забыли настроить» — в отличие от полей
     # выше, оставлен как есть.
     DEMO_ID: str = os.getenv("CRM_DEMO_ID", "")
-    USER_GROUP_ID: int = _required_int_env("CRM_USER_GROUP_ID")
 
     # entity_id сущностей/подсущностей CRM «Руководитель» и ID их полей (field_<ID>
     # в payload). Эти номера генерируются ВНУТРИ конкретной инсталляции CRM и могут
     # отличаться между demo/production/другими клиентами — поэтому не хардкодятся
-    # в TaskManager/SubtaskManager/CRMUserRegistrar, а читаются отсюда, без
+    # в TaskManager/SubtaskManager, а читаются отсюда, без
     # дефолта (см. _required_int_env выше) — смена инстанса CRM требует правки
     # .env и НЕМЕДЛЕННО проявится как ошибка при старте, если её забыли сделать,
     # а не тихой отправкой запросов со значениями прежнего инстанса.
     TASK_ENTITY_ID:    int = _required_int_env("CRM_TASK_ENTITY_ID")
     SUBTASK_ENTITY_ID: int = _required_int_env("CRM_SUBTASK_ENTITY_ID")
-    USER_ENTITY_ID:    int = _required_int_env("CRM_USER_ENTITY_ID")
 
     # Поля сущности «Задачи»
     TASK_FIELD_TITLE:         int = _required_int_env("CRM_TASK_FIELD_TITLE")
@@ -79,6 +77,7 @@ class CRMSettings:
     TASK_FIELD_COMPLETED:     int = _required_int_env("CRM_TASK_FIELD_COMPLETED")
     TASK_FIELD_SPECIFICATION: int = _required_int_env("CRM_TASK_FIELD_SPECIFICATION")
     TASK_FIELD_OTHER_FILES:   int = _required_int_env("CRM_TASK_FIELD_OTHER_FILES")
+    TASK_FIELD_CREATOR_EMAIL: int = _required_int_env("CRM_TASK_FIELD_CREATOR_EMAIL")
 
     # Поля подсущности «Подзадачи»
     SUBTASK_FIELD_TITLE:         int = _required_int_env("CRM_SUBTASK_FIELD_TITLE")
@@ -86,6 +85,7 @@ class CRMSettings:
     SUBTASK_FIELD_COMPLETED:     int = _required_int_env("CRM_SUBTASK_FIELD_COMPLETED")
     SUBTASK_FIELD_SPECIFICATION: int = _required_int_env("CRM_SUBTASK_FIELD_SPECIFICATION")
     SUBTASK_FIELD_OTHER_FILES:   int = _required_int_env("CRM_SUBTASK_FIELD_OTHER_FILES")
+    SUBTASK_FIELD_CREATOR_EMAIL: int = _required_int_env("CRM_SUBTASK_FIELD_CREATOR_EMAIL")
 
     # ── Глобальный список «Проект» ──
     # ID самого справочника (не ID опций внутри него) — используется
