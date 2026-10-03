@@ -1,7 +1,6 @@
-"""Управление пользователями (admin-only): src/routers/users.py.
+"""Управление пользователями (admin-only, src/routers/users.py).
 
-Проверяется не только код ответа, но и состояние БД после операции — иначе тест
-прошёл бы и при «пустой» реализации, которая отвечает 200, ничего не меняя.
+Проверяется и состояние БД после операции — иначе тест прошёл бы при реализации, отвечающей 200 без изменений.
 """
 
 import json
@@ -12,7 +11,7 @@ from sqlalchemy.orm import selectinload
 
 from src.auth.user_models import User
 from src.database import async_session_maker
-from src.task_logic.models import Subtask, Task
+from src.task_logic.models import CrmOutbox, Subtask, Task
 from tests.conftest import login_as_admin, register_and_login
 
 ADMIN_EMAIL = "admin@example.com"
@@ -31,8 +30,6 @@ async def _target_id(client: AsyncClient, email: str) -> int:
     users = (await client.get("/users/")).json()
     return next(u["id"] for u in users if u["email"] == email)
 
-
-# ── list users ───────────────────────────────────────────────────────────────
 
 async def test_list_users_as_admin(client: AsyncClient, mock_smtp: dict):
     await login_as_admin(client, mock_smtp, ADMIN_EMAIL)
@@ -60,8 +57,6 @@ async def test_list_users_does_not_expose_password_hash(client: AsyncClient, moc
     assert "hashed_password" not in r.text
     assert "$argon2" not in r.text and "$2b$" not in r.text
 
-
-# ── delete user ──────────────────────────────────────────────────────────────
 
 async def test_delete_user_as_admin(client: AsyncClient, mock_smtp: dict):
     await register_and_login(client, mock_smtp, USER_EMAIL)
@@ -106,9 +101,7 @@ async def test_delete_own_account_is_rejected(client: AsyncClient, mock_smtp: di
 
 
 async def test_delete_user_cascades_tasks_and_subtasks(client: AsyncClient, mock_smtp: dict):
-    # Регрессия на ondelete="CASCADE" + passive_deletes=True (User.tasks):
-    # удаление пользователя через ORM (session.delete) должно каскадно
-    # удалить его задачи, а через них — и подзадачи.
+    # ondelete="CASCADE" + passive_deletes=True (User.tasks): удаление пользователя через ORM каскадно удаляет его задачи и подзадачи.
     await register_and_login(client, mock_smtp, USER_EMAIL)
     task_r = await client.post(
         "/create-task/", data={"data": json.dumps({"title": "Owned task", "description": "desc"})}
@@ -135,14 +128,64 @@ async def test_delete_user_cascades_tasks_and_subtasks(client: AsyncClient, mock
         ).scalar_one_or_none() is None
 
 
+async def test_delete_user_cleans_up_files_and_crm(
+    client: AsyncClient, mock_smtp: dict, mock_magic, upload_root, mock_outbox_dispatch,
+):
+    # DELETE /users/{id} удаляет каждую задачу как DELETE /delete-task/{id}: чистятся каталоги uploads и ставится outbox-строка 'delete'
+    # (раньше полагались только на ON DELETE CASCADE).
+    await register_and_login(client, mock_smtp, USER_EMAIL)
+    task_id = (await client.post(
+        "/create-task/", data={"data": json.dumps({"title": "Task with files", "description": "d"})}
+    )).json()["id"]
+    subtask_id = (await client.post(
+        "/create-subtask/",
+        data={"data": json.dumps({"task_id": task_id, "title": "Subtask with files", "description": "d"})},
+    )).json()["id"]
+    pdf = ("tz.pdf", b"%PDF-1.4 fake pdf content for tests", "application/pdf")
+    r = await client.post(f"/tasks/{task_id}/specification", files={"file": pdf})
+    assert r.status_code == 200
+    r = await client.post(f"/subtasks/{subtask_id}/files", files=[("files", pdf)])
+    assert r.status_code == 200
+
+    task_dir = upload_root / "tasks" / str(task_id)
+    subtask_dir = upload_root / "subtasks" / str(subtask_id)
+    assert task_dir.exists() and subtask_dir.exists()
+
+    # Симулируем уже выполненный Celery 'create' (реального воркера в тестах нет).
+    async with async_session_maker() as session:
+        (await session.get(Task, task_id)).crm_task_id = 7
+        (await session.get(Subtask, subtask_id)).crm_subtask_id = 8
+        await session.commit()
+
+    await login_as_admin(client, mock_smtp, ADMIN_EMAIL)
+    target_id = await _target_id(client, USER_EMAIL)
+    mock_outbox_dispatch.reset_mock()
+
+    r = await client.delete(f"/users/{target_id}")
+    assert r.status_code == 200
+
+    assert not task_dir.exists()
+    assert not subtask_dir.exists()
+
+    async with async_session_maker() as session:
+        delete_rows = (await session.execute(
+            select(CrmOutbox).where(
+                CrmOutbox.aggregate_type == "task",
+                CrmOutbox.aggregate_id == task_id,
+                CrmOutbox.operation == "delete",
+            )
+        )).scalars().all()
+    assert len(delete_rows) == 1
+    assert delete_rows[0].payload == {"crm_task_id": 7, "crm_subtask_ids": [8]}
+    assert [call.args[0].id for call in mock_outbox_dispatch.call_args_list] == [delete_rows[0].id]
+
+
 async def test_delete_user_not_found(client: AsyncClient, mock_smtp: dict):
     await login_as_admin(client, mock_smtp, ADMIN_EMAIL)
 
     r = await client.delete("/users/99999")
     assert r.status_code == 404
 
-
-# ── update user ──────────────────────────────────────────────────────────────
 
 async def test_update_user_as_admin(client: AsyncClient, mock_smtp: dict):
     await register_and_login(client, mock_smtp, USER_EMAIL)

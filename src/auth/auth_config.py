@@ -8,12 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.config import settings
 from src.database import get_async_session
 
-# secure=True только в production: в dev HTTP нет TLS, браузер не отправит Secure-куку.
+# secure=True только в production: в dev нет TLS, браузер не отправит Secure-куку.
 _cookie_secure = settings.is_production
 
-# SameSite=lax: кука отправляется при top-level navigation (переход по ссылке),
-# но блокируется при cross-site subresource-запросах — достаточно для защиты от CSRF
-# без ограничений на OAuth-редиректы.
+# SameSite=lax: кука идёт при top-level navigation, но не при cross-site subresource-запросах — защита от CSRF.
 cookie_transport = CookieTransport(
     cookie_name="access_token",
     cookie_max_age=settings.access_exp,
@@ -22,9 +20,7 @@ cookie_transport = CookieTransport(
     cookie_samesite="lax",
 )
 
-# Отдельная кука refresh_token с TTL 7 дней позволяет выдать новый access_token
-# без повторного логина. Хранится отдельно от access_token: компрометация одной
-# куки не даёт доступа к другой (разные секреты, разные TTL).
+# Отдельная кука refresh_token (7 дней) с другим секретом: компрометация одной куки не даёт доступа к другой.
 refresh_cookie_transport = CookieTransport(
     cookie_name="refresh_token",
     cookie_max_age=settings.refresh_exp,
@@ -34,8 +30,7 @@ refresh_cookie_transport = CookieTransport(
 )
 
 
-# JWTStrategy создаётся через callable, а не как синглтон: fastapi-users вызывает
-# get_strategy() при каждом запросе, что позволяет подменять секреты без перезапуска.
+# JWTStrategy создаётся callable: fastapi-users вызывает get_strategy() на каждый запрос.
 def get_access_strategy() -> JWTStrategy:
     return JWTStrategy(
         secret=settings.access_secret,
@@ -45,8 +40,7 @@ def get_access_strategy() -> JWTStrategy:
 
 
 def get_refresh_strategy() -> JWTStrategy:
-    # Отдельный секрет: компрометация access_secret не позволяет подделать
-    # refresh-токен и получить долгосрочный доступ к сессии.
+    # Отдельный секрет: компрометация access_secret не позволяет подделать refresh-токен.
     return JWTStrategy(
         secret=settings.refresh_secret,
         lifetime_seconds=settings.refresh_exp,
@@ -69,22 +63,15 @@ fastapi_users = FastAPIUsers[User, int](
     [auth_backend]
 )
 
-# active=True: неактивные пользователи (is_active=False) получают 401,
-# даже если их токен действителен.
+# active=True: неактивные пользователи получают 401, даже с действительным токеном.
 current_user = fastapi_users.current_user(active=True)
 
 
 def require_role(required_role: str):
-    # Фабрика dependency: каждый вызов возвращает новую async-функцию.
-    # Вызывается один раз на уровне модуля: _guard = require_role("admin"),
-    # затем используется как Depends(_guard) в маршрутах.
+    # Фабрика dependency; вызывается один раз на уровне модуля: _guard = require_role("admin").
     #
-    # roles — many-to-many (user_role): у пользователя может быть несколько ролей
-    # одновременно, поэтому доступ разрешён, если ХОТЯ БЫ ОДНА из его ролей называется
-    # required_role (union, а не единственное сравнение). Явный select().join() вместо
-    # user.roles — та же конвенция, что и везде в проекте (см. pages.py::profile_page):
-    # обращение к незагруженной lazy-relationship в async-коде роняет запрос
-    # MissingGreenlet, явный запрос этой проблеме не подвержен.
+    # Роли many-to-many: доступ есть, если хотя бы одна роль называется required_role. Явный select().join(),
+    # а не user.roles — иначе MissingGreenlet.
     async def _dependency(
         user: User = Depends(current_user),
         db: AsyncSession = Depends(get_async_session),

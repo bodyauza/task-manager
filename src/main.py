@@ -24,38 +24,18 @@ from src.realtime import connection_manager, websocket_router
 from src.routers.admin import admin_router
 from src.routers.pages import router as pages_router
 from src.routers.subtask_routers import router as subtasks_router
-from src.routers.subtask_files import router as subtask_files_router   # файлы подзадач
+from src.routers.subtask_files import router as subtask_files_router
 from src.routers.task_routers import router as tasks_router
-from src.routers.task_files import router as task_files_router         # файлы задач
-from src.routers.uploads import router as uploads_router               # раздача /uploads/*
+from src.routers.task_files import router as task_files_router
+from src.routers.uploads import router as uploads_router
 from src.routers.users import router as users_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# async def create_tables():
-#     """
-#     Создаёт таблицы через Base.metadata.create_all.
-#
-#     НЕ использовать вместе с Alembic: create_all обходит таблицу
-#     alembic_version, и следующий `alembic upgrade head` упадёт с ошибкой
-#     "table already exists".
-#
-#     Для инициализации схемы использовать:
-#         alembic upgrade head
-#
-#     Если схема уже создана через create_all и нужно перейти на Alembic:
-#         alembic stamp head   # зафиксировать текущую ревизию без применения
-#     """
-#     async with engine.begin() as conn:
-#         await conn.run_sync(Base.metadata.create_all)
-
-
 async def create_initial_roles():
-    # Alembic управляет схемой, не данными — начальные роли не закладываются в миграции.
-    # Идемпотентность: INSERT выполняется только для отсутствующих id;
-    # повторный запуск приложения не дублирует записи.
+    # Миграции не создают начальные роли; INSERT только для отсутствующих id (идемпотентно).
     try:
         async with async_session_maker() as session:
             result = await session.execute(select(Role).where(Role.id.in_([1, 2])))
@@ -79,22 +59,11 @@ async def create_initial_roles():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # lifespan заменяет устаревший on_event("startup"/"shutdown") начиная с FastAPI 0.93.
-    # Код до yield — инициализация при старте; после yield — завершение при остановке.
-    #
-    # Директория uploads/ отдельно здесь не создаётся: src.routers.uploads (импортирован
-    # выше, до определения lifespan) уже гарантирует её существование на уровне модуля —
-    # через UPLOAD_ROOT.mkdir(...), путь к которому вычисляется от __file__, а не от cwd
-    # процесса.
     await create_initial_roles()
-    # Фоновая подписка на Redis Pub/Sub для WebSocket-рассылки между
-    # несколькими uvicorn-воркерами — см. src/realtime/connection_manager.py.
     connection_manager.start_listening()
     yield
     await connection_manager.stop_listening()
-    # Закрываем разделяемый httpx.AsyncClient CRM-модуля, иначе TCP-соединения
-    # из его пула остаются открытыми до завершения процесса. Парная операция к
-    # ленивому созданию клиента в src/crm/client.py::_get_shared_http_client().
+    # Закрываем общий httpx.AsyncClient CRM, иначе соединения пула остаются открытыми.
     await aclose_http_client()
 
 """
@@ -113,14 +82,9 @@ uvicorn запускает приложение
 
 
 def register_docs_routes(app: FastAPI) -> None:
-    """Swagger UI/ReDoc с бандлами, раздаваемыми локально из /static, а не с CDN.
+    """Swagger UI/ReDoc с локальными бандлами из /static (без CDN в CSP).
 
-    Иначе пришлось бы разрешать cdn.jsdelivr.net/unpkg.com в CSP (см. register_middlewares).
-    Favicon и шрифты тоже локальные: по умолчанию FastAPI тянет favicon с
-    fastapi.tiangolo.com, а ReDoc — шрифты с fonts.googleapis.com.
-
-    Маршруты регистрируются только если settings.docs_enabled (по умолчанию — не в
-    production, см. DOCS_ENABLED в src/config.py).
+    Регистрируется только при settings.docs_enabled.
     """
     if not settings.docs_enabled:
         return
@@ -167,67 +131,45 @@ def register_docs_routes(app: FastAPI) -> None:
 
 
 def create_app() -> FastAPI:
-    """Собирает и настраивает FastAPI-приложение.
-
-    Application Factory: main.py — только сборочное место (создать app, вызвать
-    регистрирующие функции, подключить роутеры), а не файл, где вперемешку
-    определены middleware, обработчики ошибок и docs-маршруты. Сами middleware/
-    обработчики ошибок вынесены в src/middlewares.py и src/errors_handlers.py —
-    каждая забота в своём модуле, main.py их только связывает.
-    """
+    """Собирает FastAPI-приложение: middleware, обработчики ошибок и роутеры."""
     app = FastAPI(
         title="Task Manager",
         lifespan=lifespan,
         docs_url=None,
         redoc_url=None,
-        # openapi_url=None отключает и /openapi.json: без него Swagger/ReDoc бесполезны,
-        # а схема API сама по себе раскрывает все маршруты.
+        # openapi_url=None отключает и /openapi.json: схема раскрывает все маршруты.
         openapi_url="/openapi.json" if settings.docs_enabled else None,
     )
 
     register_docs_routes(app)
     register_errors_handlers(app)
 
-    # __file__ — абсолютный путь к main.py в файловой системе.
-    # os.path.abspath(__file__) защищает от случаев, когда __file__ содержит
-    # относительный путь (зависит от способа запуска: uvicorn, pytest, IDE).
-    # os.path.dirname(...) обрезает имя файла, оставляя директорию src/.
-    # os.path.join(..., "static") добавляет подпапку → абсолютный путь к src/static/.
     _static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
-    # app.mount регистрирует отдельное ASGI-приложение (StaticFiles) на префиксе /static.
-    # Все запросы вида GET /static/js/task-board.js перехватываются StaticFiles
-    # и не доходят до обычных FastAPI-роутеров.
-    # name="static" — псевдоним для url_path_for("static", path="...") в шаблонах Jinja2.
     app.mount("/static",
               StaticFiles(directory=_static_dir),
               name="static")
 
     register_middlewares(app)
 
-    app.include_router(registration_router)   # /auth/register/request-code, verify-code, complete
-    app.include_router(auth_router)           # /auth/login, /auth/logout, /auth/access-token
+    app.include_router(registration_router)
+    app.include_router(auth_router)
     app.include_router(tasks_router)
-    app.include_router(websocket_router)      # /ws/tasks/{client_id}
-    app.include_router(task_files_router)     # /tasks/{id}/specification, /tasks/{id}/files
+    app.include_router(websocket_router)
+    app.include_router(task_files_router)
     app.include_router(subtasks_router)
-    app.include_router(subtask_files_router)  # /subtasks/{id}/specification, /subtasks/{id}/files
-    app.include_router(uploads_router)        # /uploads/{file_path} — аутентифицированная раздача файлов
+    app.include_router(subtask_files_router)
+    app.include_router(uploads_router)
     app.include_router(users_router)
-    # admin_router — ДО setup_admin(app): sqladmin монтируется как Mount на /admin, а
-    # Starlette матчит маршруты в порядке регистрации и не проваливается дальше после
-    # совпадения префикса Mount — /admin/crm-sync и т.п., зарегистрированные позже,
-    # получили бы 404 от sqladmin (см. src/routers/admin.py).
-    app.include_router(admin_router)          # /admin/crm-sync, /admin/crm-sync-status/*, /admin/crm-options/refresh
-    setup_admin(app)                          # /admin — sqladmin-панель (User/Role/Task/Subtask/...)
-    app.include_router(pages_router)          # HTML-страницы монтируются последними
+    # admin_router — ДО setup_admin(): Mount на /admin перехватил бы /admin/* и ответил 404.
+    app.include_router(admin_router)
+    setup_admin(app)
+    app.include_router(pages_router)
 
     return app
 
 
-# Module-level app — нужен для `uvicorn src.main:app` (см. Dockerfile CMD) и для
-# `from src.main import app` в тестах (tests/conftest.py); create_app() выше делает
-# всю реальную работу, здесь только один вызов.
+# Нужен для `uvicorn src.main:app` и тестов.
 app = create_app()
 
 

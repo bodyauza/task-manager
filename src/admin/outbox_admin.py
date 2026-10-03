@@ -1,14 +1,8 @@
 """ModelView для crm_outbox — очередь CRM-синхронизации Task/Subtask.
 
-Нужна для отладки: видно, какие события pending/blocked/failed, сколько было
-попыток, на каком шарде и от какого события зависят. Строки пишут продюсеры
-(services/tasks.py, services/subtasks.py) и обрабатывает Celery
-(src/tasks/crm_outbox_tasks.py), поэтому create/edit/delete отключены — ручная
-правка сломала бы гарантии доставки. payload (снимок данных задачи) и
-last_error (причина последнего сбоя) видны только на детальной странице.
-
-Единственная запись — действие «Повторить» (см. retry ниже): возвращает
-failed-событие в очередь после устранения причины сбоя.
+Нужна для отладки: видно pending/blocked/failed, число попыток, шард и зависимость. create/edit/delete отключены —
+ручная правка сломала бы гарантии доставки. payload и last_error видны только на детальной странице.
+Единственная запись — действие «Повторить» (retry): возвращает failed-событие в очередь.
 """
 
 from sqladmin import ModelView, action
@@ -27,8 +21,7 @@ from src.tasks.crm_outbox_tasks import (
 
 
 def flash(request: Request, text: str, level: str = "success") -> None:
-    """Одноразовое сообщение для следующей страницы: sqladmin не имеет flash-
-    механизма, поэтому кладём его в сессию, а layout.html показывает и удаляет."""
+    """Одноразовое сообщение для следующей страницы: sqladmin не имеет flash-механизма, поэтому кладём его в сессию."""
     request.session["admin_flash"] = {"text": text, "level": level}
 
 
@@ -68,20 +61,12 @@ class CrmOutboxAdmin(ModelView, model=CrmOutbox):
         add_in_detail=True,
     )
     async def retry(self, request: Request) -> RedirectResponse:
-        """failed → pending с attempts = 0 (без сброса attempts строка после
-        одной же неудачи снова стала бы failed) и немедленный диспатч в
-        очередь её шарда. Зависимые blocked-строки разблокирует
-        reconcile_blocked_outbox (раз в 5 минут), когда эта станет done.
-        Затрагиваются только failed — pending/done/blocked пропускаются
-        (blocked разблокируется сам, когда выполнится его зависимость).
+        """failed → pending с attempts = 0 и немедленный диспатч в очередь шарда. Затрагиваются только failed.
+        Зависимые blocked-строки разблокирует reconcile_blocked_outbox.
 
-        Защита порядка: failed-строка, для которой у той же сущности
-        (aggregate_type, aggregate_id) уже есть более новое (больший id) 'done'
-        событие, НЕ переставляется в очередь — иначе повтор применил бы
-        устаревшие данные ПОВЕРХ уже синхронизированных свежих (например,
-        failed update #10 после того, как update #11 той же задачи уже успешно
-        применился). Такая строка считается устаревшей и попадает в отдельную
-        категорию flash-сообщения, а не в «возвращено в очередь»."""
+        Failed-строка, у сущности которой уже есть более новое 'done' событие, не переставляется (иначе устаревшие данные
+        перезаписали бы свежие) и попадает в отдельную категорию flash-сообщения.
+        """
         pks = [int(p) for p in request.query_params.get("pks", "").split(",") if p.strip().isdigit()]
         requeued: list[CrmOutbox] = []
         stale: list[CrmOutbox] = []
@@ -102,10 +87,9 @@ class CrmOutboxAdmin(ModelView, model=CrmOutbox):
                         await set_aggregate_sync_status(session, row, "pending", only_from=("failed",))
                     requeued.append(row)
                 await session.commit()
-            # После commit: диспатч — оптимизация задержки, не механизм
-            # надёжности (сбой брокера проглатывается, строку подберёт reconcile).
+            # После commit: диспатч — оптимизация задержки; сбой брокера проглатывается, строку подберёт reconcile.
             for row in requeued:
-                dispatch_outbox_row(row)
+                await dispatch_outbox_row(row)
 
         not_failed = len(set(pks)) - len(requeued) - len(stale)
         if not pks:

@@ -1,16 +1,14 @@
-"""Тесты sqladmin-панели (/admin): доступ только admin, отображение списков,
-скрытые/read-only поля и отсутствие конфликта с другими маршрутами /admin/*
-(src/admin/, src/routers/admin.py)."""
+"""Тесты sqladmin-панели (/admin): доступ только admin, списки, скрытые/read-only поля, отсутствие конфликта с /admin/*."""
 
 import datetime
 
 import pytest
 from httpx import AsyncClient
 
-from src.admin.formatters import local_datetime_formatter
+from src.admin.formatters import _encode_upload_path, local_datetime_formatter
 from src.database import async_session_maker
 from src.task_logic.models import CrmOutbox, Project, Subtask, Task
-from tests.conftest import ADMIN_PANEL_EMAIL, promote_to_admin, register_user
+from tests.conftest import ADMIN_PANEL_EMAIL, login_as_admin, promote_to_admin, register_user
 
 ADMIN_EMAIL = ADMIN_PANEL_EMAIL
 USER_EMAIL = "user_panel@example.com"
@@ -42,6 +40,23 @@ async def test_wrong_password_rejected(client: AsyncClient, mock_smtp: dict):
     await promote_to_admin(ADMIN_EMAIL)
     r = await _admin_login(client, ADMIN_EMAIL, "wrong")
     assert r.status_code == 400
+
+
+async def test_admin_session_cookie_has_hardened_attributes(client: AsyncClient, mock_smtp: dict):
+    """Сессионная кука sqladmin: SameSite=Strict и срок 4 часа — защита от CSRF через GET-действие CrmOutboxAdmin (ссылка с чужого сайта)."""
+    await register_user(client, mock_smtp, ADMIN_EMAIL, PASSWORD)
+    await promote_to_admin(ADMIN_EMAIL)
+
+    r = await _admin_login(client, ADMIN_EMAIL, PASSWORD)
+
+    set_cookie = r.headers.get("set-cookie", "")
+    assert "session=" in set_cookie
+    assert "samesite=strict" in set_cookie.lower()
+    assert "max-age=14400" in set_cookie.lower()  # 4 часа, а не 14 дней по умолчанию
+    # https_only=settings.is_production — тесты идут не в проде, Secure не ожидается;
+    # settings.is_production=True в реальном деплое включит его отдельно (не наша ветка).
+    from src.config import settings
+    assert ("secure" in set_cookie.lower()) == settings.is_production
 
 
 @pytest.mark.parametrize(
@@ -104,6 +119,31 @@ async def test_task_details_show_file_links(admin_client: AsyncClient):
     assert "/uploads/tasks/1/other/b.pdf" in r.text
 
 
+async def test_task_details_file_link_with_special_chars_is_url_encoded(admin_client: AsyncClient):
+    """URL-кодирование href: без него имя с "#"/"?" обрывало бы ссылку."""
+    async with async_session_maker() as session:
+        task = Task(
+            title="t2", description="d", owner_id=1,
+            specification_path="tasks/2/specification/a1b2c3d4_отчёт #1.pdf",
+        )
+        session.add(task)
+        await session.commit()
+        task_id = task.id
+    r = await admin_client.get(f"/admin/task/details/{task_id}")
+    assert r.status_code == 200
+    assert 'href="/uploads/tasks/2/specification/a1b2c3d4_%D0%BE%D1%82%D1%87%D1%91%D1%82%20%231.pdf"' in r.text
+    # Необработанный "#" в href не встречается — иначе он оборвал бы путь на fragment.
+    assert 'href="/uploads/tasks/2/specification/a1b2c3d4_отчёт #1.pdf"' not in r.text
+
+
+def test_encode_upload_path_percent_encodes_reserved_chars_but_keeps_slash():
+    assert _encode_upload_path("tasks/2/specification/a1b2c3d4_отчёт #1.pdf") == (
+        "tasks/2/specification/a1b2c3d4_%D0%BE%D1%82%D1%87%D1%91%D1%82%20%231.pdf"
+    )
+    # Обычное имя без спецсимволов не меняется (не ломает уже существующий тест выше).
+    assert _encode_upload_path("tasks/1/specification/a_tz.pdf") == "tasks/1/specification/a_tz.pdf"
+
+
 async def test_outbox_details_show_payload(admin_client: AsyncClient):
     async with async_session_maker() as session:
         session.add(CrmOutbox(
@@ -153,10 +193,23 @@ async def test_other_admin_routes_not_shadowed_by_sqladmin(client: AsyncClient, 
     assert r.status_code == 403
 
 
+async def test_refresh_crm_options_as_admin_queues_sync_project_table(client: AsyncClient, mock_smtp: dict):
+    """/admin/crm-options/refresh: .delay() вызывается через asyncio.to_thread — проверяем, что вызов доходит до Celery и ответ 202.
+    Эндпоинт защищён require_role("admin") (JWT), а не сессией sqladmin, поэтому нужен client + login_as_admin.
+    """
+    from unittest.mock import Mock, patch
+
+    await login_as_admin(client, mock_smtp, "refresh_crm_admin@example.com")
+
+    with patch("src.routers.admin.sync_project_table.delay", Mock()) as delay:
+        r = await client.post("/admin/crm-options/refresh")
+    assert r.status_code == 202
+    assert r.json() == {"status": "queued"}
+    delay.assert_called_once_with()
+
+
 async def test_retry_action_requeues_only_failed_rows(admin_client: AsyncClient):
-    """failed-строка требуется вернуть в очередь; done-строка ДРУГОЙ задачи —
-    просто чужое событие в выборке pks, не имеет отношения к порядку той же
-    сущности (это отдельно проверяют test_retry_*_stale_* ниже)."""
+    """failed-строка возвращается в очередь; done-строка другой задачи порядка не касается."""
     from unittest.mock import patch
 
     async with async_session_maker() as session:
@@ -192,9 +245,7 @@ async def test_retry_action_requeues_only_failed_rows(admin_client: AsyncClient)
 
 
 async def test_retry_action_skips_failed_row_with_newer_done_sibling(admin_client: AsyncClient):
-    """failed-строка ТОЙ ЖЕ задачи, у которой уже есть более новое (больший id)
-    успешно синхронизированное событие, — устарела: повтор применил бы старые
-    данные поверх свежих. Не переставляется в очередь, статус не меняется."""
+    """failed-строка той же задачи при более новом 'done' — устарела: не переставляется в очередь, статус не меняется."""
     from unittest.mock import patch
 
     async with async_session_maker() as session:
@@ -233,9 +284,7 @@ async def test_retry_action_skips_failed_row_with_newer_done_sibling(admin_clien
 
 
 async def test_retry_action_requeues_failed_row_when_done_sibling_is_older(admin_client: AsyncClient):
-    """done-строка ТОЙ ЖЕ задачи, но СТАРШЕ (меньший id, произошла раньше) —
-    не мешает повтору: failed-строка новее и представляет более позднее
-    событие, её и нужно вернуть в очередь."""
+    """done-строка той же задачи, но старше, повтору не мешает: failed-строка новее и возвращается в очередь."""
     from unittest.mock import patch
 
     async with async_session_maker() as session:
@@ -274,9 +323,8 @@ async def _make_outbox_rows(statuses: list[str], *, same_task: bool = True) -> l
             if same_task and shared_task_id is not None:
                 task_id = shared_task_id
             else:
-                # title уникален на (title, owner_id) — uq_task_title_owner:
-                # каждая НЕ-shared задача должна иметь своё название.
-                task = Task(title=f"t{i}", description="d", owner_id=1, crm_task_id=42, sync_status="failed")
+                # title уникален на (title, owner_id), crm_task_id — на ix_task_crm_task_id_unique: у каждой задачи своё название и свой crm_task_id.
+                task = Task(title=f"t{i}", description="d", owner_id=1, crm_task_id=42 + i, sync_status="failed")
                 session.add(task)
                 await session.flush()
                 task_id = task.id
@@ -309,9 +357,7 @@ async def test_retry_flash_success_when_all_failed(admin_client: AsyncClient):
 
 
 async def test_retry_flash_reports_skipped_rows(admin_client: AsyncClient):
-    # same_task=False: done-строка ДРУГОЙ задачи — проверяем именно категорию
-    # «статус не failed», без пересечения с защитой порядка (см. отдельные
-    # test_retry_action_*_stale_* / *_newer_done_sibling* для неё).
+    # same_task=False: done другой задачи — проверяем категорию «статус не failed» без защиты порядка.
     failed_id, done_id = await _make_outbox_rows(["failed", "done"], same_task=False)
     html = await _retry_and_read_flash(admin_client, f"{failed_id},{done_id}")
     assert "Возвращено в очередь: 1." in html

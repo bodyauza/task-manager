@@ -1,12 +1,8 @@
-"""Тесты эндпоинтов загрузки файлов для задач.
+"""Тесты эндпоинтов файлов задач.
 
-Покрытие:
-  POST   /tasks/{id}/specification  — загрузка ТЗ: успех, замена, 413, 422 (ext), 422 (MIME), 404, 401
-  DELETE /tasks/{id}/specification  — удаление ТЗ: успех, 404 (нет файла)
-  POST   /tasks/{id}/files          — добавление иных документов: успех, превышение лимита
-  DELETE /tasks/{id}/files/{name}   — удаление одного файла: успех, 404
-  WS-рассылка broadcast_task_event ("task_files_updated") — все 4 эндпоинта выше
-  Конкурентная загрузка (FOR NO KEY UPDATE) — lost update на other_file_paths
+POST/DELETE /tasks/{id}/specification, POST /tasks/{id}/files, DELETE /tasks/{id}/files/{name}
+(успех, замена, 413, 422 по расширению и MIME, 404, 401, лимит файлов), WS-рассылка task_files_updated и
+конкурентная загрузка (FOR NO KEY UPDATE).
 """
 
 import asyncio
@@ -25,9 +21,7 @@ EMAIL = "file_task@example.com"
 
 
 async def _set_task_crm_id(task_id: int, crm_task_id: int) -> None:
-    """Симулирует то, что Celery уже выполнил 'create' для этой задачи —
-    напрямую в БД, так как реального Celery-воркера в тестах нет (см.
-    tests/conftest.py::mock_outbox_dispatch)."""
+    """Имитирует выполненный Celery 'create' задачи напрямую в БД (воркера в тестах нет)."""
     async with async_session_maker() as session:
         task = await session.get(Task, task_id)
         task.crm_task_id = crm_task_id
@@ -50,13 +44,9 @@ _OBSERVER_ID = 999999
 
 
 class _ObserverWebSocket:
-    """Минимальная замена starlette.WebSocket — только фиксирует отправленное.
+    """Минимальная замена starlette.WebSocket: фиксирует отправленное.
 
-    В отличие от FakeBroadcaster в tests/test_realtime.py (юнит-тест самой
-    broadcast_task_event), здесь проверяется факт вызова broadcast_task_event
-    из реального HTTP-эндпоинта: подключаемся к process-wide connection_manager,
-    который эндпоинт использует по умолчанию (без broadcaster=), и читаем,
-    что реально дошло бы до чужого WebSocket-соединения.
+    Проверяет вызов broadcast_task_event из HTTP-эндпоинта через process-wide connection_manager.
     """
 
     def __init__(self):
@@ -65,8 +55,6 @@ class _ObserverWebSocket:
     async def send_text(self, data: str) -> None:
         self.sent.append(data)
 
-
-# ── Тестовые байты с правильными magic-сигнатурами ───────────────────────────
 
 def _pdf() -> bytes:
     # %PDF-1.4: magic bytes, по которым mock_magic вернёт "application/pdf"
@@ -82,8 +70,6 @@ def _garbage() -> bytes:
     # Нет стандартной сигнатуры; mock_magic вернёт "application/octet-stream"
     return b'not any known binary format'
 
-
-# ── Вспомогательные функции ──────────────────────────────────────────────────
 
 async def _auth(client: AsyncClient, mock_smtp: dict) -> None:
     """Регистрирует и авторизует тестового пользователя."""
@@ -108,8 +94,6 @@ def _other_uploads(*pairs: tuple[bytes, str]) -> list[tuple]:
     # Несколько файлов в одном поле "files": list of ("field", (name, data, ct))
     return [("files", (name, data, "application/octet-stream")) for data, name in pairs]
 
-
-# ── Техническое задание: загрузка ─────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_upload_spec_success(client, mock_smtp, mock_magic, upload_root):
@@ -165,6 +149,153 @@ async def test_upload_spec_size_limit(client, mock_smtp, mock_magic, upload_root
 
 
 @pytest.mark.asyncio
+async def test_upload_spec_disk_failure_returns_500_not_unhandled(
+    client, mock_smtp, mock_magic, upload_root, monkeypatch,
+):
+    """Сбой записи ТЗ на диск раньше давал необработанный 500, теперь — HTTPException(500) в штатном JSON-формате."""
+    def _boom(dest_dir, filename, content, upload_root):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr("src.services.attachments.save_file", _boom)
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    r = await client.post(f"/tasks/{task['id']}/specification", files=_spec_upload(_pdf()))
+    assert r.status_code == 500
+    assert "detail" in r.json()  # штатный JSON-ответ, а не голая трасса FastAPI
+
+
+@pytest.mark.asyncio
+async def test_upload_spec_commit_failure_deletes_orphaned_file(
+    client, mock_smtp, mock_magic, upload_root, monkeypatch,
+):
+    """Файл уже на диске до commit; при падении commit транзакция откатывается, и файл остался бы сиротой. Теперь он удаляется в except-ветке,
+    а сбой всплывает клиенту.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+
+    original_commit = AsyncSession.commit
+    calls = {"n": 0}
+
+    async def _commit_raises_once(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated commit failure")
+        return await original_commit(self, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "commit", _commit_raises_once)
+
+    # Голое исключение долетает до httpx как исключение (ASGITransport raise_app_exceptions=True), а не response(500); важно, что сбой не проглочен.
+    with pytest.raises(RuntimeError, match="simulated commit failure"):
+        await client.post(f"/tasks/{task['id']}/specification", files=_spec_upload(_pdf()))
+
+    # Файл был записан на диск ДО неудавшегося commit — except-ветка должна была его удалить.
+    assert [p for p in upload_root.rglob("*") if p.is_file()] == []
+
+
+@pytest.mark.asyncio
+async def test_upload_other_files_commit_failure_deletes_orphaned_files(
+    client, mock_smtp, mock_magic, upload_root, monkeypatch,
+):
+    """Симметрично test_upload_spec_commit_failure_deletes_orphaned_file для «Иных документов»: save_errors прикрывали сбой save_file,
+    но не сбой commit после успешной записи всех файлов.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+
+    original_commit = AsyncSession.commit
+    calls = {"n": 0}
+
+    async def _commit_raises_once(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated commit failure")
+        return await original_commit(self, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "commit", _commit_raises_once)
+
+    # См. комментарий про pytest.raises в test_upload_spec_commit_failure_deletes_orphaned_file
+    # выше — ASGITransport тестового клиента, не поведение продакшена.
+    with pytest.raises(RuntimeError, match="simulated commit failure"):
+        await client.post(
+            f"/tasks/{task['id']}/files", files=_other_uploads((_pdf(), "a.pdf"), (_pdf(), "b.pdf")),
+        )
+
+    # Оба файла успели сохраниться на диск ДО неудавшегося commit — оба должны быть удалены.
+    assert [p for p in upload_root.rglob("*") if p.is_file()] == []
+
+
+@pytest.mark.asyncio
+async def test_upload_other_files_partial_disk_failure_rolls_back(
+    client, mock_smtp, mock_magic, upload_root, monkeypatch,
+):
+    """Если один из нескольких файлов не сохраняется, весь батч откатывается: записанные файлы удаляются, ответ — понятный 500."""
+    import src.services.attachments as attachments_module
+
+    real_save_file = attachments_module.save_file
+    call_count = {"n": 0}
+
+    def _flaky_save_file(dest_dir, filename, content, upload_root):
+        call_count["n"] += 1
+        if filename.endswith("_bad.pdf"):
+            raise OSError("simulated disk failure")
+        return real_save_file(dest_dir, filename, content, upload_root)
+
+    monkeypatch.setattr(attachments_module, "save_file", _flaky_save_file)
+
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    tid = task["id"]
+    r = await client.post(
+        f"/tasks/{tid}/files",
+        files=_other_uploads((_pdf(), "good.pdf"), (_pdf(), "bad.pdf")),
+    )
+
+    assert r.status_code == 500
+    assert call_count["n"] == 2  # оба файла реально пытались сохраниться (gather, не короткое замыкание)
+    # good.pdf успел сохраниться в этой же попытке — должен быть удалён при откате.
+    assert [p for p in upload_root.rglob("*") if p.is_file()] == []
+
+    # Задача осталась в исходном состоянии — ни одного файла не подтверждено.
+    detail = await client.get(f"/tasks/{tid}")
+    assert detail.json()["other_file_paths"] is None
+
+
+@pytest.mark.asyncio
+async def test_upload_spec_forbidden_filename_chars(client, mock_smtp, mock_magic, upload_root):
+    """Имя с запрещённым символом (FORBIDDEN_FILENAME_CHARS) → 422 до проверки расширения/MIME, файл на диск не пишется."""
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    r = await client.post(
+        f"/tasks/{task['id']}/specification",
+        files={"file": ("tz?.pdf", _pdf(), "application/octet-stream")},
+    )
+    assert r.status_code == 422
+    assert "?" in r.json()["detail"]
+    assert [p for p in upload_root.rglob("*") if p.is_file()] == []
+
+
+@pytest.mark.asyncio
+async def test_upload_other_files_forbidden_filename_chars(client, mock_smtp, mock_magic, upload_root):
+    """То же для «Иных документов»: один файл с запрещённым символом блокирует весь батч.
+
+    Символ "*", а не '"': httpx сам percent-кодирует кавычку в Content-Disposition, и тест не нашёл бы нарушения.
+    """
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    r = await client.post(
+        f"/tasks/{task['id']}/files",
+        files=_other_uploads((_pdf(), "good.pdf"), (_pdf(), "bad*name.pdf")),
+    )
+    assert r.status_code == 422
+    assert [p for p in upload_root.rglob("*") if p.is_file()] == []
+
+
+@pytest.mark.asyncio
 async def test_upload_spec_bad_extension(client, mock_smtp, mock_magic, upload_root):
     """Расширение не из белого списка (.exe) → 422, сообщение упоминает "Расширение"."""
     await _auth(client, mock_smtp)
@@ -175,6 +306,59 @@ async def test_upload_spec_bad_extension(client, mock_smtp, mock_magic, upload_r
     )
     assert r.status_code == 422
     assert "Расширение" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_upload_spec_real_size_limit_is_10_mb(client, mock_smtp, mock_magic, upload_root):
+    """Без monkeypatch: ровно 10 МБ принимается, 10 МБ + 1 байт → 413 с «10 МБ» в тексте."""
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    limit = 10 * 1024 * 1024
+    exact = _pdf() + b"0" * (limit - len(_pdf()))
+
+    r = await client.post(f"/tasks/{task['id']}/specification", files=_spec_upload(exact))
+    assert r.status_code == 200
+
+    r = await client.post(f"/tasks/{task['id']}/specification", files=_spec_upload(exact + b"0"))
+    assert r.status_code == 413
+    assert "10 МБ" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_upload_spec_jpeg_accepted(client, mock_smtp, mock_magic, upload_root):
+    """JPEG — один из трёх поддерживаемых форматов (PDF, JPEG, PNG)."""
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    r = await client.post(
+        f"/tasks/{task['id']}/specification",
+        files=_spec_upload(b"\xff\xd8\xff\xe0 fake jpeg", "scan.jpg"),
+    )
+    assert r.status_code == 200
+    assert r.json()["specification_path"].endswith("_scan.jpg")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("filename, content", [
+    ("tz.docx", b"PK\x03\x04 fake docx"),
+    ("tz.doc", b"\xd0\xcf\x11\xe0 fake doc"),
+    ("tz.xlsx", b"PK\x03\x04 fake xlsx"),
+    ("tz.xls", b"\xd0\xcf\x11\xe0 fake xls"),
+    ("tz.txt", b"plain text"),
+])
+async def test_upload_spec_formats_no_longer_allowed(
+    client, mock_smtp, mock_magic, upload_root, filename, content,
+):
+    """Word, Excel и TXT больше не поддерживаются — отклоняются по расширению (422)."""
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    r = await client.post(
+        f"/tasks/{task['id']}/specification", files=_spec_upload(content, filename)
+    )
+    assert r.status_code == 422
+    assert r.json()["detail"] == (
+        f"Расширение '.{filename.rsplit('.', 1)[1]}' не разрешено. Допустимые: .jpeg, .jpg, .pdf, .png"
+    )
+    assert [p for p in upload_root.rglob("*") if p.is_file()] == []
 
 
 @pytest.mark.asyncio
@@ -208,8 +392,6 @@ async def test_upload_spec_unauthenticated(client, upload_root):
     assert r.status_code == 401
 
 
-# ── Техническое задание: удаление ─────────────────────────────────────────────
-
 @pytest.mark.asyncio
 async def test_delete_spec_success(client, mock_smtp, mock_magic, upload_root):
     """DELETE после загрузки → 200, specification_path=None."""
@@ -234,8 +416,6 @@ async def test_delete_spec_no_file_uploaded(client, mock_smtp, upload_root):
     r = await client.delete(f"/tasks/{task['id']}/specification")
     assert r.status_code == 404
 
-
-# ── Иные документы ───────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_upload_other_files_success(client, mock_smtp, mock_magic, upload_root):
@@ -300,16 +480,9 @@ async def test_delete_other_file_not_found(client, mock_smtp, upload_root):
     assert r.status_code == 404
 
 
-# ── Конкурентность / блокировки ───────────────────────────────────────────────
-
 @pytest.mark.asyncio
 async def test_concurrent_uploads_do_not_lose_files(client, mock_smtp, mock_magic, upload_root):
-    """Регрессионный тест на FOR NO KEY UPDATE в upload_task_files: два
-    по-настоящему параллельных запроса на загрузку разных файлов в одну и ту
-    же задачу не должны терять ни один из путей в other_file_paths (lost
-    update) — без блокировки строки здесь мог бы остаться только 1 файл
-    из 2 загруженных.
-    """
+    """FOR NO KEY UPDATE в upload_task_files: два параллельных запроса на загрузку разных файлов не теряют пути в other_file_paths."""
     await _auth(client, mock_smtp)
     task = await _make_task(client)
     tid = task["id"]
@@ -325,13 +498,35 @@ async def test_concurrent_uploads_do_not_lose_files(client, mock_smtp, mock_magi
     assert len(r.json()["other_file_paths"]) == 2
 
 
-# ── CRM синхронизация ─────────────────────────────────────────────────────────
-#
-# CRM-вызов теперь целиком в Celery-воркере — веб-процесс его не делает (см.
-# src/tasks/crm_outbox_tasks.py::dispatch_outbox_row). Проверяется появление
-# outbox-строки operation='sync_files' с нужным payload, а не факт прямого
-# CRM-вызова. Задача синхронизирована с CRM напрямую через _set_task_crm_id
-# (в тестах нет живого Celery, который выполнил бы 'create' сам).
+async def test_concurrent_spec_uploads_do_not_orphan_loser_file(client, mock_smtp, mock_magic, upload_root):
+    """upload_specification без блокировки: два параллельных запроса читают один old_path и оба пишут файл; файл «проигравшего»
+    остаётся сиротой. FOR NO KEY UPDATE сериализует запросы: второй видит specification_path первого как свой old_path
+    и удаляет его при замене.
+    """
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    tid = task["id"]
+
+    r1, r2 = await asyncio.gather(
+        client.post(f"/tasks/{tid}/specification", files=_spec_upload(_pdf(), "spec_a.pdf")),
+        client.post(f"/tasks/{tid}/specification", files=_spec_upload(_pdf(), "spec_b.pdf")),
+    )
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+
+    detail = await client.get(f"/tasks/{tid}")
+    winner_path = detail.json()["specification_path"]
+    assert winner_path is not None
+
+    on_disk = [p for p in upload_root.rglob("*") if p.is_file()]
+    # Ровно один файл на диске — тот, на который ссылается БД. Без блокировки
+    # здесь остались бы ДВА файла (spec_a и spec_b), а в БД — только один из них.
+    assert len(on_disk) == 1
+    assert on_disk[0] == upload_root / winner_path
+
+
+# CRM-синхронизация: проверяем outbox-строку 'sync_files' с нужным payload, а не прямой CRM-вызов. Задача «синхронизирована»
+# через _set_task_crm_id (воркера в тестах нет).
 
 @pytest.mark.asyncio
 async def test_upload_spec_enqueues_sync_files_row(client, mock_smtp, mock_magic, upload_root):
@@ -345,24 +540,32 @@ async def test_upload_spec_enqueues_sync_files_row(client, mock_smtp, mock_magic
     sync_rows = [r for r in rows if r.operation == "sync_files"]
     assert len(sync_rows) == 1
     assert sync_rows[0].payload["crm_task_id"] == 42
-    assert sync_rows[0].payload["specification_path"] is not None
+    # payload несёт флаг «слот ТЗ затронут», а не путь.
+    assert sync_rows[0].payload["sync_specification"] is True
     assert sync_rows[0].depends_on_event_id is None  # crm_task_id уже известен — не зависит от create
 
 
 @pytest.mark.asyncio
-async def test_upload_spec_skips_outbox_when_task_not_in_crm(client, mock_smtp, mock_magic, upload_root):
-    """Задача ещё не синхронизирована с CRM (crm_task_id is None) — синхронизировать
-    нечего, outbox-строка не создаётся вовсе."""
+async def test_upload_spec_enqueues_dependent_row_when_task_not_in_crm(client, mock_smtp, mock_magic, upload_root):
+    """Задача ещё не в CRM (crm_task_id is None): загрузка ТЗ ставит sync_files-строку, зависимую от 'create' через depends_on_event_id;
+    она дождётся create и прочитает актуальные crm_task_id/specification_path из БД (раньше строки не было).
+    """
     await _auth(client, mock_smtp)
     task = await _make_task(client)
     await client.post(f"/tasks/{task['id']}/specification", files=_spec_upload(_pdf()))
 
     rows = await _outbox_rows_for_task(task["id"])
-    assert not any(r.operation == "sync_files" for r in rows)
+    create_rows = [r for r in rows if r.operation == "create"]
+    sync_rows = [r for r in rows if r.operation == "sync_files"]
+    assert len(create_rows) == 1
+    assert len(sync_rows) == 1
+    assert sync_rows[0].payload["crm_task_id"] is None
+    assert sync_rows[0].payload["sync_specification"] is True
+    assert sync_rows[0].depends_on_event_id == create_rows[0].id
 
 
 @pytest.mark.asyncio
-async def test_delete_spec_enqueues_clear_specification_row(client, mock_smtp, mock_magic, upload_root):
+async def test_delete_spec_enqueues_sync_specification_row(client, mock_smtp, mock_magic, upload_root):
     await _auth(client, mock_smtp)
     task = await _make_task(client)
     tid = task["id"]
@@ -374,7 +577,8 @@ async def test_delete_spec_enqueues_clear_specification_row(client, mock_smtp, m
     rows = await _outbox_rows_for_task(tid)
     sync_rows = [r for r in rows if r.operation == "sync_files"]
     assert len(sync_rows) == 2  # upload, затем delete
-    assert sync_rows[-1].payload["clear_specification"] is True
+    # Тот же флаг sync_specification, что у upload: обработчик сам увидит, что specification_path None, и очистит поле в CRM.
+    assert sync_rows[-1].payload["sync_specification"] is True
 
 
 @pytest.mark.asyncio
@@ -391,7 +595,8 @@ async def test_upload_other_files_enqueues_sync_files_row(client, mock_smtp, moc
     rows = await _outbox_rows_for_task(task["id"])
     sync_rows = [r for r in rows if r.operation == "sync_files"]
     assert len(sync_rows) == 1
-    assert len(sync_rows[0].payload["other_file_paths"]) == 2
+    # payload несёт флаг «слот иных документов затронут», а не список; фактический список проверяется через ответ API.
+    assert sync_rows[0].payload["sync_other_files"] is True
 
 
 @pytest.mark.asyncio
@@ -411,12 +616,10 @@ async def test_delete_other_file_enqueues_sync_files_row(client, mock_smtp, mock
     rows = await _outbox_rows_for_task(tid)
     sync_rows = [r for r in rows if r.operation == "sync_files"]
     assert len(sync_rows) == 2  # upload, затем delete
-    assert len(sync_rows[-1].payload["other_file_paths"]) == 1
+    assert sync_rows[-1].payload["sync_other_files"] is True
 
 
-# ── WS-рассылка событий (broadcast_task_event) ───────────────────────────────
-# exclude_user_id=user.id в эндпоинте исключает из рассылки самого актёра —
-# поэтому наблюдатель регистрируется под отдельным (заведомо иным) user_id.
+# WS-рассылка событий. exclude_user_id исключает актора, поэтому наблюдатель регистрируется под другим user_id.
 
 @pytest.mark.asyncio
 async def test_upload_spec_broadcasts_ws_event(client, mock_smtp, mock_magic, upload_root):
@@ -502,8 +705,6 @@ async def test_delete_other_file_broadcasts_ws_event(client, mock_smtp, mock_mag
     assert payload["task_id"] == tid
 
 
-# ── Интеграция GET ────────────────────────────────────────────────────────────
-
 @pytest.mark.asyncio
 async def test_spec_appears_in_get_task(client, mock_smtp, mock_magic, upload_root):
     """После загрузки ТЗ GET /tasks/{id} возвращает непустой specification_path."""
@@ -531,8 +732,6 @@ async def test_other_files_appear_in_get_task(client, mock_smtp, mock_magic, upl
     assert len(paths) == 1
 
 
-# ── Граничный случай: последний файл ─────────────────────────────────────────
-
 @pytest.mark.asyncio
 async def test_delete_last_other_file(client, mock_smtp, mock_magic, upload_root):
     """Удаление последнего файла из other_file_paths → ответ содержит пустой список."""
@@ -545,8 +744,6 @@ async def test_delete_last_other_file(client, mock_smtp, mock_magic, upload_root
     assert r_del.status_code == 200
     assert r_del.json()["other_file_paths"] == []
 
-
-# ── Каскадная очистка файлов подзадач ────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_delete_task_removes_subtask_files(client, mock_smtp, mock_magic, upload_root):

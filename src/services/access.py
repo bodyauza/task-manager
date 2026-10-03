@@ -1,8 +1,4 @@
-"""Проверка ролей вне FastAPI-dependency (require_role/_is_admin в роутерах).
-
-Нужна коду, который не может использовать Depends: AdminAuth для sqladmin
-(src/admin/auth.py) работает со своей сессией и своим Request.
-"""
+"""Проверка ролей вне FastAPI-dependency (нужна AdminAuth в src/admin/auth.py)."""
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,9 +7,7 @@ from src.auth.user_models import Role, user_role
 
 
 async def has_role(db: AsyncSession, user_id: int, role_name: str) -> bool:
-    """Явный select() по user_role, а не user.roles: связь не lazy="selectin" —
-    обращение к ней в async-коде роняет MissingGreenlet (та же конвенция, что в
-    require_role() и pages.py::_is_admin)."""
+    """Явный select() по user_role: связь user.roles не lazy="selectin", обращение к ней в async роняет MissingGreenlet."""
     found = (
         await db.execute(
             select(Role.id).join(user_role).where(

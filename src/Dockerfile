@@ -45,4 +45,4 @@ ENV UVICORN_WORKERS=2
 
 # Shell-форма CMD (не JSON-массив): нужна подстановка переменной окружения
 # ${UVICORN_WORKERS} на старте контейнера — JSON-форма exec её не раскрывает.
-CMD uvicorn src.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS}
+CMD uvicorn src.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS} --ws-max-size 65536

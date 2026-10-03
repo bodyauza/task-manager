@@ -1,14 +1,8 @@
-"""Сборка sqladmin-панели (/admin): Admin(...) + AuthenticationBackend + views.
+"""Сборка sqladmin-панели (/admin): Admin + AuthenticationBackend + views.
 
-Панель — дополнительный инструмент для admin (просмотр/точечная правка данных
-напрямую в БД), а НЕ замена продуктовых роутов: запись через форму sqladmin
-идёт в обход CRM-синхронизации (outbox), WebSocket-событий и файловой логики,
-поэтому CRM-id, sync_status и файловые поля из форм исключены (см. task_admin.py,
-user_admin.py).
-
-setup_admin() монтирует sqladmin как Mount на /admin — все остальные маршруты
-под /admin/* (admin_router в routers/admin.py) обязаны быть подключены в
-main.py ДО вызова setup_admin(), иначе Mount перехватит их и ответит своим 404.
+Панель — инструмент администратора, а не замена продуктовых роутов: запись через форму идёт мимо outbox,
+WebSocket и файловой логики, поэтому CRM-id, sync_status и файловые поля исключены из форм.
+Маршруты /admin/* (routers/admin.py) должны быть подключены в main.py ДО setup_admin().
 """
 
 import os
@@ -26,9 +20,7 @@ from src.admin.user_admin import UserAdmin
 from src.config import settings
 from src.database import async_session_maker, engine
 
-# Абсолютный путь (не от cwd процесса — он зависит от способа запуска):
-# здесь лежат только переопределения sqladmin/layout.html и login.html;
-# Jinja2 ChoiceLoader сначала ищет шаблон тут, потом — в пакете sqladmin.
+# Абсолютный путь (не от cwd): здесь переопределения sqladmin/layout.html и login.html.
 _TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
 
 
@@ -39,9 +31,8 @@ def setup_admin(app: FastAPI) -> None:
         session_maker=async_session_maker,
         title="Task Manager — админ-панель",
         templates_dir=_TEMPLATES_DIR,
-        # access_secret — ключ подписи сессионной куки sqladmin (Starlette
-        # SessionMiddleware, см. auth.py): независимая кука от JWT основного логина.
-        authentication_backend=AdminAuth(secret_key=settings.access_secret),
+        # ADMIN_SESSION_SECRET — ключ подписи сессионной куки sqladmin, независимый от JWT основного логина.
+        authentication_backend=AdminAuth(secret_key=settings.ADMIN_SESSION_SECRET),
     )
     admin.add_view(UserAdmin)
     admin.add_view(RoleAdmin)

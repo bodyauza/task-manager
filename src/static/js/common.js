@@ -16,20 +16,42 @@
 // поменять константу здесь, а не литерал в нескольких файлах:
 //   TITLE_MAX_LENGTH      — max_length=100 в task_schemas.py/subtask_schemas.py
 //                           (String(100) в src/task_logic/models.py)
-//   OTHER_FILES_MAX_SIZE  — MAX_FILE_SIZE в src/utils/file_utils.py (100 МБ);
+//   OTHER_FILES_MAX_SIZE  — MAX_FILE_SIZE в src/utils/file_utils.py (10 МБ);
 //                           дублируется на клиенте только для мгновенной
 //                           обратной связи до отправки — сервер всё равно
 //                           перепроверяет размер и MIME-тип сам.
+//   OTHER_FILES_ALLOWED_EXT — ALLOWED в src/utils/file_utils.py (pdf/jpg/jpeg/png)
 //   MAX_OTHER_FILES       — одноимённая константа там же (10 файлов)
 //   TASKS_PAGE_SIZE        — limit=, который task-board.js передаёт в GET /tasks/
 //   SUBTASKS_PAGE_SIZE     — limit=, который subtask-board.js передаёт в GET /subtasks/
 //   WS_RECONNECT_DELAY_MS — пауза перед повторным connectWebSocket() при разрыве соединения
 const TITLE_MAX_LENGTH = 100;
-const OTHER_FILES_MAX_SIZE = 100 * 1024 * 1024;
+const OTHER_FILES_MAX_SIZE = 10 * 1024 * 1024;
+const OTHER_FILES_ALLOWED_EXT = ['.pdf', '.jpg', '.jpeg', '.png'];
 const MAX_OTHER_FILES = 10;
 const TASKS_PAGE_SIZE = 5;
 const SUBTASKS_PAGE_SIZE = 5;
 const WS_RECONNECT_DELAY_MS = 3000;
+
+function encodeUploadPath(relPath) {
+    // Кодируем по сегментам: целиком encodeURIComponent заэкранировал бы и "/".
+    // Без кодирования "#"/"%" в имени файла обрывают путь или декодируются как другой символ.
+    return relPath.split('/').map(encodeURIComponent).join('/');
+}
+
+// Символы, запрещённые в имени файла (набор Windows Explorer; см. FORBIDDEN_FILENAME_CHARS в src/utils/file_utils.py).
+// Защита от проблем при работе с каталогом uploads/ в обход приложения; "#"/"%" не запрещены — их решает кодирование URL.
+const FORBIDDEN_FILENAME_CHARS = '\\/:*?"<>|';
+
+function findForbiddenFilenameChars(filename) {
+    // Возвращает массив НАЙДЕННЫХ запрещённых символов без дублей (для сообщения
+    // пользователю, может быть больше одного) либо [] — имя в порядке.
+    const found = [];
+    for (const ch of FORBIDDEN_FILENAME_CHARS) {
+        if (filename.includes(ch) && !found.includes(ch)) found.push(ch);
+    }
+    return found;
+}
 
 function escapeHtml(value) {
     // Экранирует HTML-спецсимволы: < → &lt;  > → &gt;  & → &amp;  " → &quot;

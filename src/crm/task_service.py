@@ -10,41 +10,35 @@ logger = logging.getLogger(__name__)
 
 
 class TaskManager(CRMClient):
-    """CRUD-операции с сущностью «Задачи» (entity_id из crm_settings.TASK_ENTITY_ID).
-
-    Поля:
-        FIELD_TITLE — Название    (строка, уникальное)
-        FIELD_DESCR — Описание    (текст)
-        FIELD_DONE  — Статус      (чекбокс: "true" / "false")
-        FIELD_CREATOR_EMAIL — Email создателя (строка, только при создании)
-
-    Номера entity_id/field_* генерируются внутри конкретной инсталляции CRM и
-    отличаются между инстансами — не хардкодятся, читаются из crm_settings
-    (src/crm/crm_config.py), настраиваются через CRM_TASK_* переменные окружения.
+    """CRUD-операции с сущностью «Задачи». Номера entity_id/field_* читаются из crm_settings (CRM_TASK_*),
+    потому что различаются между инсталляциями CRM.
     """
 
-    ENTITY_ID   = crm_settings.TASK_ENTITY_ID           # ID сущности «Задачи» в CRM Руководитель
-    FIELD_TITLE = crm_settings.TASK_FIELD_TITLE         # ID поля «Название»
-    FIELD_DESCR = crm_settings.TASK_FIELD_DESCRIPTION   # ID поля «Описание»
-    FIELD_DONE  = crm_settings.TASK_FIELD_COMPLETED     # ID поля «Статус» (чекбокс: "true" / "false")
-    FIELD_SPEC    = crm_settings.TASK_FIELD_SPECIFICATION  # ID поля «Техническое задание» (одиночный файл)
-    FIELD_OTHER   = crm_settings.TASK_FIELD_OTHER_FILES    # ID поля «Иные документы» (множественные файлы)
-    FIELD_PROJECT = crm_settings.TASK_FIELD_PROJECT        # ID поля «Проект» (выпадающий список, ссылка на глобальный справочник CRM)
-    FIELD_CREATOR_EMAIL = crm_settings.TASK_FIELD_CREATOR_EMAIL  # ID поля «Email создателя»
+    ENTITY_ID   = crm_settings.TASK_ENTITY_ID
+    FIELD_TITLE = crm_settings.TASK_FIELD_TITLE
+    FIELD_DESCR = crm_settings.TASK_FIELD_DESCRIPTION
+    FIELD_DONE  = crm_settings.TASK_FIELD_COMPLETED
+    FIELD_SPEC    = crm_settings.TASK_FIELD_SPECIFICATION
+    FIELD_OTHER   = crm_settings.TASK_FIELD_OTHER_FILES
+    FIELD_PROJECT = crm_settings.TASK_FIELD_PROJECT
+    FIELD_CREATOR_EMAIL = crm_settings.TASK_FIELD_CREATOR_EMAIL
+    FIELD_LOCAL_ID      = crm_settings.TASK_FIELD_LOCAL_ID
 
     async def create_task(
         self,
+        local_id: int,
         title: str,
         description: str,
         completed: bool = False,
-        project: Optional[str] = None,  # CRM-ID опции списка "Проект"; None — поле не выбрано
-        creator_email: Optional[str] = None,  # email пользователя, создавшего задачу; None — не передавать
+        project: Optional[str] = None,
+        creator_email: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Создаёт задачу в CRM; возвращает {'id': int|None, 'response': dict}."""
         record = {
             f"field_{self.FIELD_TITLE}": title,
             f"field_{self.FIELD_DESCR}": description,
             f"field_{self.FIELD_DONE}":  self._bool_to_crm(completed),
+            f"field_{self.FIELD_LOCAL_ID}": str(local_id),
         }
         if project is not None:
             record[f"field_{self.FIELD_PROJECT}"] = project
@@ -56,10 +50,7 @@ class TaskManager(CRMClient):
         task_id = None
         if result.get("status") == "success":
             data = result.get("data")
-            # Формат поля "data" в ответе на insert нестабилен между версиями CRM:
-            # - большинство версий возвращают словарь: {"id": "42"}
-            # - отдельные версии возвращают список:   [{"id": "42"}]
-            # Оба варианта обрабатываются явно, чтобы не зависеть от конкретной версии.
+            # Поле "data" в ответе на insert бывает словарём {"id": "42"} или списком [{"id": "42"}].
             if isinstance(data, dict):
                 task_id = data.get("id")
             elif isinstance(data, list) and data:
@@ -69,32 +60,20 @@ class TaskManager(CRMClient):
 
         return {"id": task_id, "response": result}
 
-    async def find_task(self, title: str, description: str) -> Optional[Dict[str, Any]]:
-        """Ищет задачу по совпадению title И description — используется ТОЛЬКО
-        для идемпотентности retry события 'create' в durable outbox
-        (src/tasks/crm_outbox_tasks.py::_do_create): если процесс упал между
-        успешной вставкой в CRM и записью crm_task_id в локальную БД, повторная
-        попытка сначала ищет уже созданную запись, а не вставляет дубликат.
+    async def find_task(self, local_id: int) -> Optional[Dict[str, Any]]:
+        """Ищет задачу по точному Local ID (`field_{FIELD_LOCAL_ID}` хранит Task.id).
 
-        Эвристика, не гарантия: у сущности «Задачи» в CRM «Руководитель»
-        (entity_id=29) нет поля-владельца — совпадение title+description между
-        разными пользователями (shared board допускает разные owner_id с
-        похожими названиями) сузит, но не исключит коллизию полностью.
-        Принятый риск, не техническое упущение — более надёжное решение
-        (служебное поле «Local ID» в самой CRM) не реализовано из-за
-        отсутствия административного доступа к demo-CRM для его создания.
+        Нужен для идемпотентного retry 'create' (_do_create_task): после сбоя между вставкой в CRM и записью
+        crm_task_id повтор находит созданную запись, а не вставляет дубликат. Local ID — точный ключ, поэтому
+        поиск не может вернуть запись другой локальной задачи.
 
-        :return: Словарь первой найденной записи или None.
+        :return: словарь найденной записи или None.
         """
-        select_fields = ",".join(str(f) for f in (self.FIELD_TITLE, self.FIELD_DESCR))
         result = await self._call(
             action="select",
             entity_id=self.ENTITY_ID,
-            select_fields=select_fields,
-            filters={
-                str(self.FIELD_TITLE): {"value": title, "condition": "include"},
-                str(self.FIELD_DESCR): {"value": description, "condition": "include"},
-            },
+            select_fields=str(self.FIELD_LOCAL_ID),
+            filters={str(self.FIELD_LOCAL_ID): {"value": str(local_id), "condition": "include"}},
         )
         data = result.get("data", [])
         if not data:
@@ -114,11 +93,8 @@ class TaskManager(CRMClient):
     ) -> Dict[str, Any]:
         """Обновляет задачу по CRM-ID; передаёт только заполненные поля.
 
-        clear_specification=True: field_320 = [] (CRM удаляет вложение ТЗ).
-        other_file_abs_paths=[]: field_321 = [] (CRM очищает поле иных документов).
-        other_file_abs_paths=[p1,p2]: field_321 = [file1, file2] (полная замена содержимого поля).
-        project="" (пустая строка): field_327 = "" (CRM очищает поле "Проект");
-        project=None: поле не трогать.
+        clear_specification=True — очищает поле ТЗ. other_file_abs_paths: None — не трогать, [] — очистить,
+        [p1, p2] — заменить содержимое. project: "" — очистить поле «Проект», None — не трогать.
         """
         data: Dict[str, Any] = {}
         if title is not None:
@@ -131,18 +107,13 @@ class TaskManager(CRMClient):
             data[f"field_{self.FIELD_PROJECT}"] = project
 
         if clear_specification:
-            # [] — CRM-формат для очистки файлового поля: запись обновляется без вложений.
             data[f"field_{self.FIELD_SPEC}"] = []
         elif specification_abs_path is not None:
-            # Одиночный файл ТЗ: CRM принимает список из одного элемента.
+            # ТЗ — одиночный файл, CRM принимает список из одного элемента.
             data[f"field_{self.FIELD_SPEC}"] = [await self._file_to_crm(specification_abs_path)]
 
         if other_file_abs_paths is not None:
-            # None → поле не трогать; [] → очистить; [p1,…] → заменить всё содержимое.
-            # asyncio.gather запускает все _file_to_crm(...) не дожидаясь друг друга;
-            # каждый вызов сам выносит read_bytes() в отдельный поток через asyncio.to_thread
-            # (см. client.py) — поэтому сами чтения с диска идут одновременно в пуле потоков,
-            # а не по очереди. gather() уже возвращает list — оборачивать в list() не нужно.
+            # None — не трогать; [] — очистить; [p1, …] — заменить. gather читает файлы параллельно.
             data[f"field_{self.FIELD_OTHER}"] = await asyncio.gather(
                 *[self._file_to_crm(p) for p in other_file_abs_paths]
             )
@@ -155,11 +126,23 @@ class TaskManager(CRMClient):
             action="update",
             entity_id=self.ENTITY_ID,
             data=data,
-            update_by_field={"id": task_id},  # критерий обновления — CRM-ID задачи
-            # expect_id: если задачу удалили в CRM напрямую (не через это приложение),
-            # CRM отвечает "success" с пустым data.id вместо ошибки — expect_id превращает
-            # это в Exception, чтобы вызывающий код (services/tasks.py::update_task) выставил
-            # crm_synced=False, а не ошибочный True.
+            update_by_field={"id": task_id},
+            # expect_id: ответ «success» с пустым data.id (запись удалена в CRM) становится исключением.
+            expect_id=True,
+        )
+
+    async def backfill_local_id(self, task_id: int, local_id: int) -> Dict[str, Any]:
+        """Дописывает field_{FIELD_LOCAL_ID} в существующую CRM-запись (для scripts/backfill_crm_local_id.py).
+
+        Нужен для записей, созданных до появления Local ID: без него find_task не находит их при retry
+        'create'. Повторная запись того же значения безопасна.
+        """
+        logger.info("CRM: backfill local_id=%s on task crm_id=%s", local_id, task_id)
+        return await self._call(
+            action="update",
+            entity_id=self.ENTITY_ID,
+            data={f"field_{self.FIELD_LOCAL_ID}": str(local_id)},
+            update_by_field={"id": task_id},
             expect_id=True,
         )
 
@@ -170,5 +153,5 @@ class TaskManager(CRMClient):
             action="delete",
             entity_id=self.ENTITY_ID,
             delete_by_field={"id": task_id},
-            expect_id=True,  # см. update_task выше — та же проверка для уже отсутствующей в CRM записи
+            expect_id=True,
         )

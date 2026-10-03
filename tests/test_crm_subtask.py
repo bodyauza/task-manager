@@ -1,10 +1,4 @@
-"""
-Юнит-тесты для SubtaskManager из src/crm/subtask_service.py.
-
-Все HTTP-вызовы перехватываются через unittest.mock: реальных запросов нет.
-Тесты работают с SubtaskManager напрямую, минуя приложение — каждый тест
-сам настраивает свой mock для полного контроля сценария.
-"""
+"""Юнит-тесты SubtaskManager (src/crm/subtask_service.py); HTTP-вызовы перехватываются через unittest.mock."""
 import json
 
 import httpx
@@ -13,16 +7,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.crm.subtask_service import SubtaskManager
 
-# Ключи полей CRM выводятся из констант SubtaskManager, а не хардкодятся строками:
-# сторонние разработчики меняют FIELD_TITLE/FIELD_DESCR/FIELD_DONE/ENTITY_ID
-# в subtask_service.py под свой demo-инстанс CRM, и эти тесты продолжают
-# проходить без правок.
-_FIELD_TITLE = f"field_{SubtaskManager.FIELD_TITLE}"
-_FIELD_DESCR = f"field_{SubtaskManager.FIELD_DESCR}"
-_FIELD_DONE  = f"field_{SubtaskManager.FIELD_DONE}"
+# Ключи полей CRM берутся из констант SubtaskManager, а не хардкодятся.
+_FIELD_TITLE    = f"field_{SubtaskManager.FIELD_TITLE}"
+_FIELD_DESCR    = f"field_{SubtaskManager.FIELD_DESCR}"
+_FIELD_DONE     = f"field_{SubtaskManager.FIELD_DONE}"
+_FIELD_LOCAL_ID = f"field_{SubtaskManager.FIELD_LOCAL_ID}"
 
-
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _resp(data, status_code: int = 200) -> MagicMock:
     mock = MagicMock()
@@ -57,15 +47,13 @@ def _patch_httpx(return_value=None, side_effect=None):
     return patcher, mock_http
 
 
-# ── SubtaskManager.create_subtask ────────────────────────────────────────────
-
 @pytest.mark.asyncio
 async def test_create_subtask_success_dict_data():
     """create_subtask извлекает CRM-ID из ответа формата data: {id: ...}."""
     patcher, mock_http = _patch_httpx(_resp({"id": "55"}))
     try:
         result = await SubtaskManager().create_subtask(
-            parent_item_id=99, title="Write test", description="desc"
+            parent_item_id=99, local_id=5, title="Write test", description="desc"
         )
         assert result["id"] == 55
         payload = mock_http.post.call_args.kwargs["json"]
@@ -75,6 +63,7 @@ async def test_create_subtask_success_dict_data():
         assert payload["items"][0][_FIELD_DESCR] == "desc"
         assert payload["items"][0][_FIELD_DONE] == "false"   # completed=False по умолчанию
         assert payload["items"][0]["parent_item_id"] == 99
+        assert payload["items"][0][_FIELD_LOCAL_ID] == "5"
     finally:
         patcher.stop()
 
@@ -85,7 +74,7 @@ async def test_create_subtask_success_list_data():
     patcher, _ = _patch_httpx(_resp([{"id": "77"}]))
     try:
         result = await SubtaskManager().create_subtask(
-            parent_item_id=10, title="Sub", description=""
+            parent_item_id=10, local_id=5, title="Sub", description=""
         )
         assert result["id"] == 77
     finally:
@@ -98,7 +87,7 @@ async def test_create_subtask_completed_true():
     patcher, mock_http = _patch_httpx(_resp({"id": "1"}))
     try:
         await SubtaskManager().create_subtask(
-            parent_item_id=10, title="Done", description="", completed=True
+            parent_item_id=10, local_id=5, title="Done", description="", completed=True
         )
         payload = mock_http.post.call_args.kwargs["json"]
         assert payload["items"][0][_FIELD_DONE] == "true"
@@ -112,7 +101,7 @@ async def test_create_subtask_connection_error():
     try:
         with pytest.raises(Exception, match="Connection error"):
             await SubtaskManager().create_subtask(
-                parent_item_id=1, title="X", description=""
+                parent_item_id=1, local_id=1, title="X", description=""
             )
     finally:
         patcher.stop()
@@ -124,7 +113,7 @@ async def test_create_subtask_timeout():
     try:
         with pytest.raises(Exception, match="timed out"):
             await SubtaskManager().create_subtask(
-                parent_item_id=1, title="X", description=""
+                parent_item_id=1, local_id=1, title="X", description=""
             )
     finally:
         patcher.stop()
@@ -136,7 +125,7 @@ async def test_create_subtask_crm_api_error():
     try:
         with pytest.raises(Exception, match="CRM API error"):
             await SubtaskManager().create_subtask(
-                parent_item_id=1, title="X", description=""
+                parent_item_id=1, local_id=1, title="X", description=""
             )
     finally:
         patcher.stop()
@@ -149,7 +138,7 @@ async def test_create_subtask_with_creator_email():
     patcher, mock_http = _patch_httpx(_resp({"id": "1"}))
     try:
         await SubtaskManager().create_subtask(
-            parent_item_id=1, title="X", description="", creator_email="user@example.com"
+            parent_item_id=1, local_id=1, title="X", description="", creator_email="user@example.com"
         )
         payload = mock_http.post.call_args.kwargs["json"]
         assert payload["items"][0][_FIELD_CREATOR_EMAIL] == "user@example.com"
@@ -163,7 +152,7 @@ async def test_create_subtask_without_creator_email_omits_field():
     _FIELD_CREATOR_EMAIL = f"field_{SubtaskManager.FIELD_CREATOR_EMAIL}"
     patcher, mock_http = _patch_httpx(_resp({"id": "1"}))
     try:
-        await SubtaskManager().create_subtask(parent_item_id=1, title="X", description="")
+        await SubtaskManager().create_subtask(parent_item_id=1, local_id=1, title="X", description="")
         payload = mock_http.post.call_args.kwargs["json"]
         assert _FIELD_CREATOR_EMAIL not in payload["items"][0]
     finally:
@@ -181,13 +170,35 @@ async def test_create_subtask_invalid_json():
     try:
         with pytest.raises(Exception, match="invalid JSON"):
             await SubtaskManager().create_subtask(
-                parent_item_id=1, title="X", description=""
+                parent_item_id=1, local_id=1, title="X", description=""
             )
     finally:
         patcher.stop()
 
 
-# ── SubtaskManager.update_subtask ────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_find_subtask_searches_by_local_id():
+    """find_subtask ищет по точному Local ID (`field_{FIELD_LOCAL_ID}`), а не по title/description/parent_item_id."""
+    patcher, mock_http = _patch_httpx(_resp([{"id": "901"}]))
+    try:
+        result = await SubtaskManager().find_subtask(5)
+        assert result == {"id": "901"}
+        payload = mock_http.post.call_args.kwargs["json"]
+        assert payload["action"] == "select"
+        assert payload["select_fields"] == str(SubtaskManager.FIELD_LOCAL_ID)
+        assert payload["filters"] == {str(SubtaskManager.FIELD_LOCAL_ID): {"value": "5", "condition": "include"}}
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_find_subtask_returns_none_when_not_found():
+    patcher, _ = _patch_httpx(_resp([]))
+    try:
+        assert await SubtaskManager().find_subtask(999) is None
+    finally:
+        patcher.stop()
+
 
 @pytest.mark.asyncio
 async def test_update_subtask_success():
@@ -211,10 +222,7 @@ async def test_update_subtask_success():
 
 @pytest.mark.asyncio
 async def test_update_subtask_empty_id_raises():
-    """Регрессия: если подзадачу удалили в CRM напрямую, CRM отвечает
-    "success" с пустым data.id — expect_id должен превратить это в Exception, чтобы
-    _do_update_subtask (src/tasks/crm_outbox_tasks.py) не принял это за успех и
-    оставил строку crm_outbox на повторную попытку, а не пометил её 'done'."""
+    """Если подзадачу удалили в CRM напрямую, ответ «success» с пустым data.id должен стать Exception (expect_id), чтобы строка outbox осталась на повтор."""
     patcher, _ = _patch_httpx(_resp({"id": ""}))
     try:
         with pytest.raises(Exception, match="no valid id"):
@@ -254,8 +262,6 @@ async def test_update_subtask_crm_api_error():
     finally:
         patcher.stop()
 
-
-# ── SubtaskManager.delete_subtask ────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_delete_subtask_success():
@@ -304,7 +310,31 @@ async def test_delete_subtask_crm_api_error():
         patcher.stop()
 
 
-# ── SubtaskManager._bool_to_crm ─────────────────────────────────────────────
+# См. test_crm.py::test_backfill_local_id_success — то же для подзадач.
+
+@pytest.mark.asyncio
+async def test_backfill_local_id_success():
+    patcher, mock_http = _patch_httpx(_resp({"id": "55"}))
+    try:
+        result = await SubtaskManager().backfill_local_id(subtask_id=55, local_id=7)
+        assert result["status"] == "success"
+        payload = mock_http.post.call_args.kwargs["json"]
+        assert payload["action"] == "update"
+        assert payload["data"][_FIELD_LOCAL_ID] == "7"
+        assert payload["update_by_field"] == {"id": 55}
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_backfill_local_id_empty_id_raises():
+    patcher, _ = _patch_httpx(_resp({"id": ""}))
+    try:
+        with pytest.raises(Exception, match="no valid id"):
+            await SubtaskManager().backfill_local_id(subtask_id=55, local_id=7)
+    finally:
+        patcher.stop()
+
 
 def test_bool_to_crm_true():
     assert SubtaskManager._bool_to_crm(True) == "true"

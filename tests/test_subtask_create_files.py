@@ -1,9 +1,4 @@
-"""Тесты атомарного создания подзадачи с файлами одним HTTP-запросом (POST /create-subtask/).
-
-Зеркалирует tests/test_task_create_files.py — см. его docstring за описанием покрытия
-и за тем, почему CRM-синхронизация проверяется через содержимое outbox-строк, а не
-через факт прямого CRM-вызова (тот теперь целиком в Celery-воркере).
-"""
+"""Тесты атомарного создания подзадачи с файлами (POST /create-subtask/); зеркало test_task_create_files.py."""
 
 import json
 
@@ -62,8 +57,6 @@ def _multipart(
     return data, (files or None)
 
 
-# ── Атомарное создание с файлами ──────────────────────────────────────────────
-
 @pytest.mark.asyncio
 async def test_create_subtask_with_spec_and_other_files_success(client, mock_smtp, mock_magic, upload_root):
     await _auth(client, mock_smtp)
@@ -111,10 +104,10 @@ async def test_create_subtask_disk_save_failure_partial(
 
     real_save_file = attachments_module.save_file
 
-    def _flaky_save_file(dest_dir, filename, content):
+    def _flaky_save_file(dest_dir, filename, content, upload_root):
         if filename.endswith("_bad.pdf"):
             raise OSError("simulated disk failure")
-        return real_save_file(dest_dir, filename, content)
+        return real_save_file(dest_dir, filename, content, upload_root)
 
     monkeypatch.setattr(attachments_module, "save_file", _flaky_save_file)
 
@@ -131,7 +124,35 @@ async def test_create_subtask_disk_save_failure_partial(
     assert "bad.pdf" in body["file_upload_errors"]
 
 
-# ── Паритет валидации ─────────────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_create_subtask_commit_failure_deletes_orphaned_files(
+    client, mock_smtp, mock_magic, upload_root, monkeypatch,
+):
+    """Симметрично test_create_task_commit_failure_deletes_orphaned_files для create_subtask."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    await _auth(client, mock_smtp)
+    task = await _create_task(client)
+
+    original_commit = AsyncSession.commit
+    calls = {"n": 0}
+
+    async def _commit_raises_once(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated commit failure")
+        return await original_commit(self, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "commit", _commit_raises_once)
+
+    data, files = _multipart(task["id"], spec=(_pdf(), "tz.pdf"), other=[(_pdf(), "a.pdf")])
+    # См. комментарий про pytest.raises в
+    # test_create_task_commit_failure_deletes_orphaned_files (test_task_create_files.py).
+    with pytest.raises(RuntimeError, match="simulated commit failure"):
+        await client.post("/create-subtask/", data=data, files=files)
+
+    assert [p for p in upload_root.rglob("*") if p.is_file()] == []
+
 
 @pytest.mark.asyncio
 async def test_create_subtask_multipart_empty_title(client, mock_smtp, upload_root):
@@ -154,8 +175,6 @@ async def test_create_subtask_multipart_duplicate_title(client, mock_smtp, uploa
     assert r2.status_code == 409
 
 
-# ── CRM-синхронизация ─────────────────────────────────────────────────────────
-
 @pytest.mark.asyncio
 async def test_create_subtask_with_files_enqueues_create_and_sync_files_rows(
     client, mock_smtp, mock_magic, upload_root,
@@ -173,8 +192,9 @@ async def test_create_subtask_with_files_enqueues_create_and_sync_files_rows(
     create_row, sync_row = rows
     assert sync_row.depends_on_event_id == create_row.id
     assert sync_row.payload["crm_subtask_id"] is None
-    assert sync_row.payload["specification_path"] is not None
-    assert len(sync_row.payload["other_file_paths"]) == 1
+    # payload несёт флаги затронутых слотов, а не пути — обработчик читает их из БД.
+    assert sync_row.payload["sync_specification"] is True
+    assert sync_row.payload["sync_other_files"] is True
 
 
 @pytest.mark.asyncio

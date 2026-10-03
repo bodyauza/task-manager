@@ -1,35 +1,16 @@
 """UserAdmin — создание, просмотр и точечная правка пользователей (`person`).
 
-Не замена продуктового src/routers/users.py (защита от самоудаления, валидация
-role_ids, каскады) и не замена самостоятельной регистрации
-(auth/registration_endpoints.py) — инструмент администратора.
+**Создание** идёт через UserManager.create() (insert_model): хеш пароля, роль `user` по умолчанию, username из email.
+Выбранные в форме роли заменяют роль по умолчанию; пользователь сразу is_verified=True.
 
-**Создание** идёт не прямой записью в БД, а через UserManager.create()
-(insert_model ниже): тот же путь, что у регистрации, — хеш пароля, роль
-`user` по умолчанию, username = часть email до '@'. Минимальные проверки
-(email/пароль) — те же функции, что у API (auth/user_schemas.py). Роли из
-формы, если выбраны, ЗАМЕНЯЮТ роль по умолчанию. Созданный администратором
-пользователь сразу is_verified=True (как после подтверждения email кодом
-при самостоятельной регистрации).
+**Пароль** — виртуальное поле (в модели колонки нет): при создании обязателен, при правке пустое значение не меняет хеш.
+В sqladmin 0.20.1 нет form_extra_fields, поэтому поле добавляется в scaffold_form и должно быть в form_create_rules
+и form_edit_rules.
 
-**Пароль** — виртуальное поле «Пароль» (у модели такой колонки нет, хранится
-только hashed_password, который в форму не попадает): при создании обязателен,
-при правке пустое значение не меняет хеш, непустое — задаёт новый пароль
-(сброс забытого пароля — в проекте нет иного способа). В sqladmin 0.20.1
-нет form_extra_fields, поэтому поле добавляется в scaffold_form. Поле
-обязано быть и в form_create_rules, и в form_edit_rules: sqladmin удаляет с
-формы всё, чего нет в правилах.
+**Не редактируется:** email, firstname/lastname/patronymic после создания, hashed_password/is_superuser/registered_at,
+коллекция tasks. can_delete = False: каскад снёс бы задачи в обход outbox и очистки файлов — только DELETE /users/{id}.
 
-**Не редактируется** через форму: email (логин), firstname/lastname/patronymic
-после создания, hashed_password/is_superuser/registered_at, коллекция tasks
-(delete-orphan: снятие галочки физически удалило бы задачу с подзадачами в
-обход outbox/файлов; владельца меняют со стороны TaskAdmin.owner).
-can_delete = False: удаление каскадно сносит задачи пользователя в обход
-outbox/очистки файлов — только через DELETE /users/{id} (routers/users.py).
-
-**Ограничение:** смена пароля не отзывает уже выданные access/refresh-токены
-(в JWT нет метки версии пароля) — при компрометации дополнительно снимите
-is_active.
+**Ограничение:** смена пароля не отзывает выданные токены — при компрометации дополнительно снимите is_active.
 """
 
 import asyncio
@@ -57,21 +38,18 @@ from src.database import async_session_maker
 
 logger = logging.getLogger(__name__)
 
-# Те же границы, что у UserCreate.password (auth/user_schemas.py): 5..72 символа.
+# Те же границы, что у UserCreate.password: 5..72 символа.
 _PASSWORD_MAX_LEN = 72
 _PASSWORD_TOO_LONG = f"Пароль не должен быть длиннее {_PASSWORD_MAX_LEN} символов."
 
-# Тот же PasswordHelper, которым пользуется сам UserManager (BaseUserManager.
-# __init__ создаёт свой экземпляр — класс-атрибут UserManager.password_helper
-# им перекрывается), — хеш при правке пароля идентичен хешу при регистрации.
+# Тот же PasswordHelper, что у UserManager (из экземпляра менеджера) — хеши при правке и регистрации идентичны.
 _password_helper = UserManager(None).password_helper
 
 
 def _validate_password(password: str) -> None:
-    """Те же правила, что у регистрации (UserCreate.password). Исключение —
-    ValueError с чистым текстом: sqladmin выводит str(e) на форме и логирует
-    исключение, поэтому в сообщение НЕ попадает сам пароль (в отличие от текста
-    pydantic.ValidationError, который включает input_value)."""
+    """Те же правила, что у регистрации. ValueError с чистым текстом: sqladmin выводит str(e) на форму, а текст
+    pydantic.ValidationError включил бы сам пароль.
+    """
     if len(password) > _PASSWORD_MAX_LEN:
         raise ValueError(_PASSWORD_TOO_LONG)
     if not is_valid_password_format(password):
@@ -79,7 +57,7 @@ def _validate_password(password: str) -> None:
 
 
 def _roles_formatter(model, _attr) -> str:
-    """User.roles — m2m-список: имена ролей через запятую, "—" для пустого."""
+    """User.roles — m2m: имена ролей через запятую, "—" для пустого."""
     return ", ".join(role.name for role in model.roles) or "—"
 
 
@@ -96,7 +74,6 @@ class UserAdmin(ModelView, model=User):
         User.roles, User.is_active, User.is_verified, User.registered_at,
     ]
     column_searchable_list = [User.email, User.username, User.firstname, User.lastname]
-    # User.roles не в сортировке — m2m-список, не скалярная колонка.
     column_sortable_list = [User.id, User.email, User.registered_at]
     column_labels = {
         User.email: "Email", User.firstname: "Имя", User.lastname: "Фамилия",
@@ -107,15 +84,11 @@ class UserAdmin(ModelView, model=User):
     column_formatters = {User.roles: _roles_formatter}
     column_formatters_detail = column_formatters
 
-    # hashed_password — не показывается нигде: сырая правка обходит
-    # password_helper, а просмотр хеша бессмыслен и небезопасен.
-    # tasks — см. докстринг модуля.
+    # hashed_password не показываем: сырая правка обходит password_helper, а хеш небезопасно просматривать.
     column_details_exclude_list = [User.hashed_password, User.tasks]
 
-    # form_columns — allow-list ВСЕХ полей модели, которые вообще могут быть на
-    # какой-либо из форм (объединение); что именно показать на создании/правке —
-    # form_create_rules/form_edit_rules. "password" — виртуальное поле, его нет
-    # в модели, поэтому оно только в правилах (добавляется в scaffold_form).
+    # form_columns — allow-list всех полей любой из форм; что показать на создании/правке, решают form_create_rules/form_edit_rules.
+    # "password" — виртуальное поле, только в правилах.
     form_columns = [
         User.email, User.firstname, User.lastname, User.patronymic,
         User.roles, User.is_active,
@@ -128,10 +101,8 @@ class UserAdmin(ModelView, model=User):
 
     async def scaffold_form(self, rules=None) -> Type[Form]:
         form_class = await super().scaffold_form(rules)
-        # Подпись и подсказка одинаковы для создания и правки; обязательность
-        # проверяется в insert_model/on_model_change (там же полная проверка
-        # формата) — на уровне wtforms поле необязательное, иначе при правке
-        # пустое значение («не менять пароль») не прошло бы валидацию.
+        # Подпись одинакова для создания и правки; обязательность проверяется в insert_model/on_model_change, на уровне wtforms
+        # поле необязательное — иначе пустое значение при правке не прошло бы валидацию.
         form_class.password = PasswordField(
             "Пароль",
             description=(
@@ -142,8 +113,7 @@ class UserAdmin(ModelView, model=User):
         return form_class
 
     async def insert_model(self, request: Request, data: dict) -> User:
-        """Создание через UserManager.create(), а не прямой записью в БД — см.
-        докстринг модуля."""
+        """Создание через UserManager.create(), а не прямой записью в БД."""
         email = (data.get("email") or "").strip()
         password = data.get("password") or ""
         firstname = (data.get("firstname") or "").strip()
@@ -172,9 +142,7 @@ class UserAdmin(ModelView, model=User):
                 raise ValueError("Пользователь с таким email уже существует.") from None
 
             if role_ids:
-                # Выбранные роли ЗАМЕНЯЮТ роль по умолчанию, назначенную create().
-                # Перечитываем с selectinload: bulk-replace незагруженной
-                # async-relationship падает MissingGreenlet.
+                # Выбранные роли заменяют роль по умолчанию; перечитываем с selectinload, иначе MissingGreenlet.
                 user = (await session.execute(
                     select(User).options(selectinload(User.roles)).where(User.id == user.id)
                 )).scalar_one()
@@ -185,14 +153,11 @@ class UserAdmin(ModelView, model=User):
             return user
 
     async def on_model_change(self, data: dict, model: User, is_created: bool, request: Request) -> None:
-        """Правка (создание идёт через insert_model и сюда не попадает).
+        """Правка (создание сюда не попадает).
 
-        password — виртуальное поле: sqladmin в _set_attributes_async ищет для
-        каждого ключа data колонку модели и при пустом значении обращается к
-        column.nullable у None (AttributeError), поэтому ключ ВСЕГДА
-        вырезается. Непустой пароль хешируется тем же PasswordHelper, что и при
-        регистрации, — в потоке: синхронный CPU-bound вызов иначе заблокировал
-        бы event loop."""
+        password — виртуальное поле: sqladmin при пустом значении обращается к column.nullable у None, поэтому ключ всегда вырезается.
+        Непустой пароль хешируется тем же PasswordHelper в потоке.
+        """
         password = data.pop("password", None) or ""
         if not password:
             return

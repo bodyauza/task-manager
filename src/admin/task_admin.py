@@ -1,20 +1,10 @@
-"""TaskAdmin/SubtaskAdmin — просмотр и точечная правка «безопасных» полей.
+"""TaskAdmin/SubtaskAdmin — просмотр и правка «безопасных» полей.
 
-Не замена продуктовых роутов (services/tasks.py, services/subtasks.py — outbox,
-WebSocket-события, файлы, CRM): запись через форму sqladmin идёт мимо них.
-Поэтому:
-
-- НЕ редактируются и исключены из формы: crm_task_id/crm_subtask_id/crm_shard/
-  sync_status (источник истины — CRM/outbox), specification_path/other_file_paths
-  (запись файла — только через services/attachments.py: MIME-проверка, rel-путь;
-  здесь показываются кликабельными ссылками на /uploads/...), коллекции
-  subtasks (delete-orphan: снятие галочки физически удалило бы подзадачу).
-- can_delete = False: удаление в обход services/*::delete_* оставило бы
-  задачу-сироту в CRM и файлы на диске.
-- Редактируются title/description/completed и связи: owner (ajax по email),
-  project_ref/task (ajax) — «гибкая правка сырых полей включая владельца».
-  Изменение этих полей в CRM и по WebSocket не уйдёт — это осознанная цена
-  админской правки; продуктовый флоу остаётся путём для синхронной правки.
+Запись через форму sqladmin идёт мимо outbox, WebSocket, файлов и CRM, поэтому:
+- не редактируются crm_*_id, crm_shard, sync_status, specification_path/other_file_paths (показываются ссылками)
+  и коллекции subtasks (delete-orphan);
+- can_delete = False: удаление в обход services оставило бы сироту в CRM и файлы на диске;
+- редактируются title/description/completed и связи owner, project_ref, task. Эти правки в CRM и по WebSocket не уйдут.
 """
 
 from sqladmin import ModelView

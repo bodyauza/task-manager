@@ -1,11 +1,6 @@
-"""Юнит-тесты src.realtime.chat_history: append_event/get_history_page на
-Redis List.
+"""Юнит-тесты chat_history: append_event/get_history_page на Redis List.
 
-FakeRedis — самодельная замена redis.asyncio.Redis поверх обычного Python
-list/int (по аналогии с FakeWebSocket/FakeBroadcaster в tests/test_realtime.py),
-а не сторонний мок-пакет (fakeredis) и не настоящий Redis: нужны только пять
-команд (INCR/GET/RPUSH/LTRIM/LRANGE) с точной семантикой отрицательных
-индексов Redis, которую проверяют сами тесты пагинации.
+FakeRedis — самодельная замена поверх list/int: нужны только INCR/GET/RPUSH/LTRIM/LRANGE с точной семантикой отрицательных индексов.
 """
 
 import json
@@ -18,9 +13,7 @@ from src.realtime import chat_history
 
 
 def _resolve_range(n: int, start: int, stop: int):
-    """Нормализует (start, stop) как Redis LRANGE/LTRIM: отрицательные индексы
-    считаются от конца списка, диапазон включает оба конца. Возвращает (s, e)
-    или None, если диапазон пуст."""
+    """Нормализует (start, stop) как LRANGE/LTRIM: отрицательные индексы от конца, диапазон включает оба конца; None, если пуст."""
     s = start if start >= 0 else n + start
     e = stop if stop >= 0 else n + stop
     s = max(s, 0)
@@ -70,18 +63,11 @@ def fake_redis():
 
 
 async def _append_chat(sender_user_id: int, sender_email: str, text: str) -> dict:
-    """Хелпер — append_event() теперь принимает готовый payload целиком (см.
-    src/realtime/events.py::broadcast_task_event для CRUD-событий), а не
-    отдельные позиционные аргументы sender_user_id/sender_email/text; тесты
-    ниже проверяют именно логику Redis List/пагинации, не форму конкретного
-    payload, поэтому используют этот тонкий wrapper вместо повторения dict
-    в каждом вызове."""
+    """Тонкий wrapper над append_event(): тесты проверяют логику Redis List, а не форму payload."""
     return await chat_history.append_event({
         "type": "chat", "sender_user_id": sender_user_id, "sender": sender_email, "text": text,
     })
 
-
-# ── append_event ──────────────────────────────────────────────────────────
 
 async def test_append_event_assigns_increasing_ids(fake_redis):
     first = await _append_chat(1, "alice@example.com", "привет")
@@ -101,10 +87,7 @@ async def test_append_event_stores_sender_and_text(fake_redis):
 
 
 async def test_append_event_preserves_arbitrary_payload_fields(fake_redis):
-    """append_event ничего не знает о форме payload — что передали, то и
-    сохранилось (плюс id/created_at). Проверяем на форме CRUD-события задачи,
-    а не чат-сообщения — ровно то, что теперь тоже проходит через этот путь
-    (src/realtime/events.py::broadcast_task_event)."""
+    """append_event не знает формы payload: что передали, то и сохранилось (плюс id/created_at)."""
     entry = await chat_history.append_event({
         "type": "task_created", "title": "Демо-задача", "sender": "alice@example.com",
         "actor_id": 1,
@@ -126,8 +109,6 @@ async def test_append_event_trims_history_to_configured_max_len(fake_redis):
         kept_ids = [json.loads(item)["id"] for item in raw]
         assert kept_ids == [3, 4, 5]  # только 3 последних сообщения
 
-
-# ── get_history_page ─────────────────────────────────────────────────────
 
 async def test_get_history_page_without_cursor_returns_latest_page(fake_redis):
     for i in range(5):

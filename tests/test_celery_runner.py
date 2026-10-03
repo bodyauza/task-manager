@@ -1,18 +1,9 @@
-"""Запуск Celery-задач: src/celery_app.py::run_celery_task, src/database.py::run_isolated,
-регистрация задач и расписание Beat.
+"""Запуск Celery-задач: run_celery_task, run_isolated, регистрация задач и расписание Beat.
 
-Все Celery-задачи проекта — синхронные обёртки над asyncio.run() (через
-run_celery_task). Багов, найденных живым прогоном docker compose и не пойманных
-юнит-тестами, было два: (1) второй asyncio.run() в том же процессе падал на
-переиспользовании соединения/httpx-клиента от закрытого event loop; (2)
-autodiscover_tasks не регистрировал ни одной задачи. Обычные тесты этого не
-видят (один event loop на тест, задачи вызываются через _..._async напрямую), а
-NullPool в тестовом режиме скрывает проблему пула SQLAlchemy — поэтому здесь
-проверяется сам жизненный цикл: два запуска подряд, освобождение ресурсов,
-реестр задач.
-
-Тесты СИНХРОННЫЕ (def, не async def): asyncio.run() нельзя вызывать из-под уже
-работающего event loop.
+Задачи — синхронные обёртки над asyncio.run(). Живой прогон docker compose выявил два бага, которые обычные тесты не ловят:
+второй asyncio.run() в том же процессе падал на соединении/httpx-клиенте закрытого loop, а autodiscover_tasks не регистрировал задачи.
+Поэтому тесты проверяют жизненный цикл (два запуска подряд, освобождение ресурсов, реестр) и сделаны синхронными (def): asyncio.run()
+нельзя вызывать из работающего loop.
 """
 
 import asyncio
@@ -23,8 +14,6 @@ import pytest
 from src.celery_app import celery_app, run_celery_task
 from src.database import run_isolated
 
-
-# ── run_celery_task ──────────────────────────────────────────────────────────
 
 def test_run_celery_task_returns_result_of_coroutine():
     async def _work():
@@ -48,9 +37,7 @@ def test_run_celery_task_twice_uses_a_fresh_event_loop_each_time():
 
 
 def test_shared_http_client_is_closed_and_recreated_per_task():
-    """Разделяемый httpx-клиент CRM, созданный под один event loop, ломается в
-    следующем asyncio.run(): run_celery_task обязан закрывать его и обнулять
-    singleton, чтобы следующая задача лениво создала новый клиент."""
+    """Общий httpx-клиент CRM, созданный под одним loop, ломается в следующем asyncio.run(): run_celery_task закрывает его и обнуляет singleton."""
     import src.crm.client as crm_client
 
     async def _use_client():
@@ -76,13 +63,8 @@ def test_run_celery_task_closes_client_and_propagates_when_task_raises():
     aclose.assert_awaited_once()                    # ресурсы освобождены и при сбое
 
 
-# ── run_isolated ─────────────────────────────────────────────────────────────
-
 def test_run_isolated_disposes_engine_after_each_run():
-    """Пул соединений SQLAlchemy освобождается после каждого изолированного
-    запуска (иначе следующий asyncio.run() взял бы соединение от закрытого loop).
-    NullPool тестового режима скрывает проблему, поэтому проверяется сам факт
-    dispose()."""
+    """Пул SQLAlchemy освобождается после каждого изолированного запуска; NullPool тестового режима скрывает проблему, поэтому проверяем dispose()."""
     async def _work():
         return "done"
 
@@ -105,8 +87,6 @@ def test_run_isolated_disposes_engine_even_when_coroutine_raises():
 
     fake_engine.dispose.assert_awaited_once()
 
-
-# ── синхронные обёртки задач ─────────────────────────────────────────────────
 
 def test_process_outbox_row_wrapper_runs_async_body_with_row_id():
     from src.tasks.crm_outbox_tasks import process_outbox_row
@@ -138,8 +118,6 @@ def test_sync_project_table_wrapper_runs_async_body():
     body.assert_awaited_once()
 
 
-# ── реестр задач и расписание ────────────────────────────────────────────────
-
 EXPECTED_TASKS = {
     "src.tasks.crm_outbox_tasks.process_outbox_row",
     "src.tasks.crm_outbox_tasks.reconcile_pending_outbox",
@@ -162,9 +140,7 @@ def test_every_beat_schedule_entry_points_to_a_registered_task():
     assert schedule, "расписание Beat пусто"
     for name, entry in schedule.items():
         assert entry["task"] in celery_app.tasks, f"{name}: задача {entry['task']} не зарегистрирована"
-        # Числовой интервал (секунды) — просто > 0; crontab — валиден сам по себе
-        # ("> 0" для него не определено, но его же наличие в CrontabSchedule
-        # достаточно: конструктор celery.schedules.crontab уже проверяет диапазоны).
+        # Числовой интервал — просто > 0; crontab валиден сам по себе (диапазоны проверяет конструктор crontab).
         if isinstance(entry["schedule"], crontab):
             continue
         assert entry["schedule"] > 0

@@ -15,9 +15,7 @@ auth_router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
 def _apply_transport_cookies(target_response: Response, transport_response: Response) -> None:
-    # fastapi-users возвращает Response с Set-Cookie заголовками.
-    # JSONResponse/RedirectResponse не наследуют их автоматически — переносим явно.
-    # getlist() возвращает все Set-Cookie значения, если кук несколько.
+    # fastapi-users возвращает Response с Set-Cookie; JSONResponse/RedirectResponse их не наследуют — переносим явно.
     for value in transport_response.headers.getlist("set-cookie"):
         target_response.headers.append("set-cookie", value)
 
@@ -32,14 +30,8 @@ async def login(
         credentials: OAuth2PasswordRequestForm = Depends(),
         user_manager: UserManager = Depends(get_user_manager),
 ):
-    # Предварительная валидация формата email снижает нагрузку на БД при явно невалидных данных.
-    # Формат пароля здесь намеренно НЕ проверяется: /auth/login верифицирует уже существующий
-    # секрет (совпадает ли с сохранённым хешем), а не создаёт новый — валидация формы пароля
-    # уместна только там, где пароль задаётся (UserCreate, /auth/register/complete). Проверка
-    # формата на входе в систему означала бы вторую, независимую от хеша копию правил пароля:
-    # если PASSWORD_REGEX когда-нибудь изменится, пользователи с корректным, но не подходящим
-    # под новое правило паролем не смогут войти, хотя их хеш в БД никто не менял.
-    # Некорректный пароль и так корректно даст LOGIN_BAD_CREDENTIALS через authenticate() ниже.
+    # Формат email проверяем заранее, чтобы не нагружать БД. Формат пароля намеренно не проверяем: логин сверяет
+    # существующий секрет с хешем, а правила пароля при смене PASSWORD_REGEX не должны блокировать вход.
     if not is_valid_email_format(credentials.username):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -49,8 +41,7 @@ async def login(
     user = await user_manager.authenticate(credentials)
 
     if user is None or not user.is_active:
-        # Единый код ошибки для «нет пользователя» и «неверный пароль»:
-        # раздельные коды позволяют атакующему перечислять зарегистрированные email.
+        # Единый код ошибки для «нет пользователя» и «неверный пароль» — иначе можно перечислять email.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="LOGIN_BAD_CREDENTIALS",
@@ -61,9 +52,7 @@ async def login(
         content={"message": "Login successful"},
     )
 
-    # access_token  (30 мин) — краткосрочный, используется в каждом запросе.
-    # refresh_token (7 дней) — долгосрочный, хранится отдельно; подписан другим секретом,
-    # поэтому кража access_token не позволяет продлить сессию через /auth/access-token.
+    # access_token (30 мин) — на каждый запрос; refresh_token (7 дней) подписан другим секретом.
     access_cookie_response = await auth_backend.login(strategy=get_access_strategy(), user=user)
     _apply_transport_cookies(json_response, access_cookie_response)
 
@@ -84,8 +73,7 @@ async def get_access_token(
         refresh_token: Optional[str] = Cookie(default=None),
         user_manager: UserManager = Depends(get_user_manager),
 ):
-    # Вызывается клиентским JS при получении 401 на любом защищённом эндпоинте.
-    # Читает refresh_token из HttpOnly-куки (JS не имеет к ней доступа напрямую).
+    # Вызывается клиентским JS при 401; читает refresh_token из HttpOnly-куки.
     if refresh_token is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -117,23 +105,10 @@ async def get_access_token(
     description="Удаляет обе куки и отвечает `303` на `/`.",
 )
 async def do_logout():
-    # Без Depends(current_user): логаут обязан очищать куки независимо от того,
-    # валиден ли ещё access_token. access_token живёт всего 30 минут (settings.ACCESS_EXP);
-    # если бы здесь стоял Depends(current_user), просроченный access_token давал бы 401
-    # ДО тела функции — ни одна из строк ниже не выполнялась бы, ни одна кука не
-    # очищалась бы. Дальше 401 перехватывает global exception_handler в main.py
-    # (Accept: text/html у обычной формы) и превращает его в редирект на "/" —
-    # пользователь видит обычный переход на страницу входа и считает, что вышел,
-    # а его refresh_token (живёт 7 дней) остаётся в браузере полностью рабочим.
-    # Проверено эмпирически: POST с просроченным access_token давал 302 на "/" и
-    # ни одного заголовка Set-Cookie в ответе. Логаут не должен требовать валидную
-    # сессию для собственного выполнения — это его единственная задача, и она обязана
-    # быть идемпотентной: очистка уже отсутствующих кук — не ошибка, а no-op.
+    # Без Depends(current_user): логаут обязан очищать куки, даже если access_token (30 мин) уже просрочен, иначе
+    # 401 перехватил бы глобальный обработчик, а refresh_token остался бы рабочим. Операция идемпотентна.
     #
-    # Форм-based вариант выхода: браузер POST-ом отправляет форму (не fetch),
-    # поэтому ответ — 303 See Other, а не JSON 200.
-    # 303 заставляет браузер перейти на GET "/" — это исключает повторную отправку
-    # формы при нажатии «Назад» (в отличие от 302).
+    # Форм-вариант: ответ 303 See Other — браузер переходит на GET "/", повторной отправки формы при «Назад» нет.
     redirect_response = RedirectResponse(url="/", status_code=303)
 
     access_logout_response = await auth_backend.transport.get_logout_response()
@@ -151,17 +126,9 @@ async def do_logout():
     description="Удаляет обе куки, возвращает JSON `200`.",
 )
 async def logout():
-    # Без Depends(current_user) — та же причина, что и в do_logout() выше: логаут
-    # обязан очищать куки независимо от того, валиден ли ещё access_token, иначе
-    # именно в наиболее вероятном сценарии (пользователь бездействовал дольше 30 минут,
-    # затем нажал «Выйти») refresh_token остаётся в браузере рабочим при видимом
-    # «успешном» выходе. profile.js подстраховывался от этого клиентской логикой
-    # (retry после 401 через /auth/access-token) — но полагаться только на неё
-    # неверно: прямой POST /auth/logout без этой JS-обвязки (curl, другой клиент)
-    # страдал бы от той же дыры. Чинить нужно на сервере.
+    # Без Depends(current_user) — по той же причине, что в do_logout().
     #
-    # JS-вариант выхода: fetch-запрос из profile.js ждёт JSON 200,
-    # после чего JS выполняет window.location.replace('/').
+    # JS-вариант: fetch из profile.js ждёт JSON 200 и сам делает redirect.
     json_response = JSONResponse(
         status_code=status.HTTP_200_OK,
         content={"message": "Successfully logged out"},

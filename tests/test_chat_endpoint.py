@@ -1,13 +1,7 @@
-"""HTTP-тесты GET /chat/history (src/realtime/router.py) — постраничная
-подгрузка истории WS-чата.
+"""HTTP-тесты GET /chat/history (src/realtime/router.py).
 
-mock_chat_history_redis (tests/conftest.py, autouse) уже патчит
-src.realtime.chat_history._get_redis для ВСЕГО файла — здесь он запрашивается
-как параметр там, где тесту нужно настроить конкретный ответ Redis
-(lrange.return_value), не только избежать реального сетевого соединения.
-Сама арифметика пагинации (курсор before_id, LTRIM-обрезка) уже проверена
-в tests/test_chat_history.py — здесь проверяется только HTTP-контракт
-эндпоинта (аутентификация, форма ответа, валидация query-параметров).
+mock_chat_history_redis (autouse) патчит _get_redis; здесь он запрашивается параметром, когда нужно настроить ответ lrange.
+Арифметика пагинации проверена в tests/test_chat_history.py — тут только HTTP-контракт (аутентификация, форма, валидация).
 """
 
 import json
@@ -56,9 +50,7 @@ async def test_chat_history_returns_stored_messages_without_sender_user_id(
 
     assert response.status_code == 200
     data = response.json()
-    # Без строгого response_model (эндпоинт отдаёт разные наборы полей для
-    # чата и для CRUD-событий задач/подзадач, см. router.py) — created_at
-    # проходит как есть, без изменения формата.
+    # Эндпоинт без response_model (разные наборы полей для чата и событий) — created_at проходит как есть.
     assert data == [{
         "id": 1,
         "type": "chat",
@@ -73,9 +65,7 @@ async def test_chat_history_returns_stored_messages_without_sender_user_id(
 async def test_chat_history_returns_stored_task_event_entries(
     client: AsyncClient, mock_smtp: dict, mock_chat_history_redis,
 ):
-    """Персистированные CRUD-события задач/подзадач (task_created и т.п.,
-    src/realtime/events.py) отдаются через тот же эндпоинт, что и чат —
-    единая история панели WS."""
+    """Персистированные события задач/подзадач отдаются тем же эндпоинтом, что и чат."""
     await _register_login(client, mock_smtp)
     entry = {
         "id": 2,

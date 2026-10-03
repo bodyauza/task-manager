@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
@@ -38,8 +39,6 @@ async def _create_subtask(
         data={"data": json.dumps({"task_id": task_id, "title": title, "description": description})},
     )
 
-
-# ── Create ───────────────────────────────────────────────────────────────────
 
 async def test_create_subtask_success(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp)
@@ -126,9 +125,7 @@ async def test_create_subtask_no_description(client: AsyncClient, mock_smtp: dic
 
 
 async def test_create_subtask_while_parent_not_synced_depends_on_parent_create(client: AsyncClient, mock_smtp: dict):
-    # Родитель ещё не синхронизирован с CRM (crm_task_id = None: синхронизация целиком
-    # в Celery-воркере, которого в тестах нет) — создание подзадачи всё равно проходит,
-    # а её 'create' уходит в outbox с зависимостью от ещё не готового create родителя.
+    # Родитель ещё не синхронизирован (crm_task_id = None): подзадача всё равно создаётся, её 'create' зависит от create родителя.
     await _register_login(client, mock_smtp)
     task = await _create_task(client)
     r = await _create_subtask(client, task["id"])
@@ -150,8 +147,6 @@ async def test_create_subtask_while_parent_not_synced_depends_on_parent_create(c
         )).scalar_one()
     assert sub_create.depends_on_event_id == parent_create.id
 
-
-# ── Read list ─────────────────────────────────────────────────────────────────
 
 async def test_read_subtasks_empty(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp)
@@ -228,8 +223,6 @@ async def test_read_subtasks_nonexistent_task_returns_empty(client: AsyncClient,
     assert int(r.headers["X-Total-Count"]) == 0
 
 
-# ── Read single ───────────────────────────────────────────────────────────────
-
 async def test_get_subtask_success(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp)
     task = await _create_task(client)
@@ -250,8 +243,6 @@ async def test_get_subtask_unauthenticated(client: AsyncClient):
     r = await client.get("/subtasks/1")
     assert r.status_code == 401
 
-
-# ── Update ────────────────────────────────────────────────────────────────────
 
 async def test_update_subtask_success(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp)
@@ -301,6 +292,23 @@ async def test_update_subtask_duplicate_title(client: AsyncClient, mock_smtp: di
     assert r.status_code == 409
 
 
+@pytest.mark.parametrize("payload", [{"title": None}, {"description": None}, {"completed": None}])
+async def test_update_subtask_explicit_null_for_not_null_field_returns_422_not_409(
+    client: AsyncClient, mock_smtp: dict, payload: dict,
+):
+    """Явный null для NOT NULL-полей даёт 422, а не 409 (см. test_update_task_explicit_null_for_not_null_field_returns_422_not_409)."""
+    await _register_login(client, mock_smtp)
+    task = await _create_task(client)
+    await _create_subtask(client, task["id"], title="Alpha")
+    s2 = (await _create_subtask(client, task["id"], title="Beta")).json()
+
+    r = await client.patch(f"/subtasks/{s2['id']}", json=payload)
+
+    assert r.status_code == 422
+    stored = (await client.get(f"/subtasks/{s2['id']}")).json()
+    assert stored["title"] == "Beta"  # не изменилось
+
+
 async def test_update_subtask_other_user_allowed(client: AsyncClient, mock_smtp: dict):
     # shared board: проверка owner_id закомментирована → любой авторизованный пользователь
     # может изменить подзадачу чужой задачи
@@ -314,8 +322,6 @@ async def test_update_subtask_other_user_allowed(client: AsyncClient, mock_smtp:
     assert r.status_code == 200
     assert r.json()["title"] == "Updated by Bob"
 
-
-# ── Delete ────────────────────────────────────────────────────────────────────
 
 async def test_delete_subtask_success(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp)

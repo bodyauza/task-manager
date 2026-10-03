@@ -1,13 +1,7 @@
-"""Эндпоинты загрузки и удаления файлов для подзадач.
+"""Эндпоинты загрузки и удаления файлов подзадач — тонкий адаптер над src/services/attachments.py.
 
-Тонкий HTTP-адаптер над src/services/attachments.py — та же логика, что и в
-task_files.py, параметризованная SUBTASK_ATTACHMENTS.
-
-Маршруты:
-    POST   /subtasks/{subtask_id}/specification     — загрузить/заменить файл ТЗ
-    DELETE /subtasks/{subtask_id}/specification     — удалить файл ТЗ
-    POST   /subtasks/{subtask_id}/files             — добавить «Иные документы»
-    DELETE /subtasks/{subtask_id}/files/{filename}  — удалить один файл
+POST/DELETE /subtasks/{subtask_id}/specification, POST /subtasks/{subtask_id}/files,
+DELETE /subtasks/{subtask_id}/files/{filename}.
 """
 
 from fastapi import APIRouter, Depends, File, UploadFile
@@ -27,12 +21,12 @@ router = APIRouter(tags=["Subtask files"])
     "/subtasks/{subtask_id}/specification",
     status_code=200,
     summary="Загрузить или заменить ТЗ подзадачи",
-    description="`multipart/form-data`, поле `file`. Форматы: pdf, doc, docx, xls, xlsx, jpg, jpeg, png, txt; до 100 МБ.",
+    description="`multipart/form-data`, поле `file`. Форматы: pdf, jpg, jpeg, png; до 10 МБ.",
     responses=responses(401, 404, 413, 422),
 )
 async def upload_subtask_specification(
     subtask_id: int,
-    file: UploadFile = File(...),                    # multipart/form-data, поле "file"
+    file: UploadFile = File(...),
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
@@ -62,7 +56,7 @@ async def delete_subtask_specification(
 )
 async def upload_subtask_files(
     subtask_id: int,
-    files: list[UploadFile] = File(...),             # поле "files" — список файлов
+    files: list[UploadFile] = File(...),
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
@@ -77,7 +71,7 @@ async def upload_subtask_files(
 )
 async def delete_subtask_file(
     subtask_id: int,
-    filename: str,                                    # имя файла с UUID-префиксом
+    filename: str,
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):

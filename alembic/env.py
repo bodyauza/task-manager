@@ -7,8 +7,7 @@ from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import create_async_engine
 
-# Make sure the project root is on sys.path so `from src.xxx import ...` works
-# when alembic is run from the project root directory.
+# Корень проекта должен быть в sys.path, чтобы работал `from src.xxx import ...` при запуске alembic из корня.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import settings

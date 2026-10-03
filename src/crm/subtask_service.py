@@ -3,85 +3,67 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from src.crm.client import CRMClient              # базовый клиент: _call(), _http, аутентификация
+from src.crm.client import CRMClient
 from src.crm.crm_config import crm_settings
 
-logger = logging.getLogger(__name__)              # логгер этого модуля для INFO/ERROR записей
+logger = logging.getLogger(__name__)
 
 
 class SubtaskManager(CRMClient):
-    """CRUD-операции с подсущностью «Подзадачи» (entity_id из crm_settings.SUBTASK_ENTITY_ID).
-
-    parent_item_id — CRM-ID задачи из сущности «Задачи» (crm_settings.TASK_ENTITY_ID),
-    то есть crm_task_id из локальной БД.
-
-    Поля:
-        FIELD_TITLE — Название (строка)
-        FIELD_DESCR — Описание (текст)
-        FIELD_DONE  — Статус   (чекбокс: "true" / "false")
-        FIELD_CREATOR_EMAIL — Email создателя (строка, только при создании)
-
-    Номера entity_id/field_* генерируются внутри конкретной инсталляции CRM и
-    отличаются между инстансами — не хардкодятся, читаются из crm_settings
-    (src/crm/crm_config.py), настраиваются через CRM_SUBTASK_* переменные окружения.
+    """CRUD-операции с подсущностью «Подзадачи». parent_item_id — CRM-ID задачи (crm_task_id).
+    Номера entity_id/field_* читаются из crm_settings (CRM_SUBTASK_*).
     """
 
-    ENTITY_ID   = crm_settings.SUBTASK_ENTITY_ID           # ID подсущности «Подзадачи» в CRM
-    FIELD_TITLE = crm_settings.SUBTASK_FIELD_TITLE         # ID поля «Название»; в payload: f"field_{ID}"
-    FIELD_DESCR = crm_settings.SUBTASK_FIELD_DESCRIPTION   # ID поля «Описание»
-    FIELD_DONE  = crm_settings.SUBTASK_FIELD_COMPLETED     # ID поля «Статус» (чекбокс "true"/"false")
-    FIELD_SPEC  = crm_settings.SUBTASK_FIELD_SPECIFICATION  # ID поля «Техническое задание» (одиночный файл)
-    FIELD_OTHER = crm_settings.SUBTASK_FIELD_OTHER_FILES   # ID поля «Иные документы» (множественные файлы)
-    FIELD_CREATOR_EMAIL = crm_settings.SUBTASK_FIELD_CREATOR_EMAIL  # ID поля «Email создателя»
+    ENTITY_ID   = crm_settings.SUBTASK_ENTITY_ID
+    FIELD_TITLE = crm_settings.SUBTASK_FIELD_TITLE
+    FIELD_DESCR = crm_settings.SUBTASK_FIELD_DESCRIPTION
+    FIELD_DONE  = crm_settings.SUBTASK_FIELD_COMPLETED
+    FIELD_SPEC  = crm_settings.SUBTASK_FIELD_SPECIFICATION
+    FIELD_OTHER = crm_settings.SUBTASK_FIELD_OTHER_FILES
+    FIELD_CREATOR_EMAIL = crm_settings.SUBTASK_FIELD_CREATOR_EMAIL
+    FIELD_LOCAL_ID      = crm_settings.SUBTASK_FIELD_LOCAL_ID
 
     async def create_subtask(
         self,
-        parent_item_id: int,                    # crm_task_id родительской задачи из локальной БД
+        parent_item_id: int,
+        local_id: int,
         title: str,
         description: str,
         completed: bool = False,
-        creator_email: Optional[str] = None,    # email пользователя, создавшего подзадачу; None — не передавать
+        creator_email: Optional[str] = None,
     ) -> Dict[str, Any]:
         record = {
-            f"field_{self.FIELD_TITLE}": title,             # "field_322": "Название"
-            f"field_{self.FIELD_DESCR}": description,       # "field_323": "Описание"
-            f"field_{self.FIELD_DONE}":  self._bool_to_crm(completed),  # "field_324": "false"
-            "parent_item_id": parent_item_id,               # привязка к родительской задаче в CRM
+            f"field_{self.FIELD_TITLE}": title,
+            f"field_{self.FIELD_DESCR}": description,
+            f"field_{self.FIELD_DONE}":  self._bool_to_crm(completed),
+            f"field_{self.FIELD_LOCAL_ID}": str(local_id),
+            "parent_item_id": parent_item_id,
         }
         if creator_email is not None:
             record[f"field_{self.FIELD_CREATOR_EMAIL}"] = creator_email
         logger.info("CRM: insert subtask parent_item_id=%s title='%s'", parent_item_id, title)
         result = await self._call(action="insert", entity_id=self.ENTITY_ID, items=[record])
-        # _call() бросает Exception при: HTTP-ошибке, таймауте, невалидном JSON, ответе с "msg"
 
         subtask_id = None
-        if result.get("status") == "success":               # не все версии CRM возвращают "success"
+        if result.get("status") == "success":
             data = result.get("data")
-            if isinstance(data, dict):                      # большинство версий: {"id": "42"}
+            if isinstance(data, dict):
                 subtask_id = data.get("id")
-            elif isinstance(data, list) and data:           # отдельные версии: [{"id": "42"}]
+            elif isinstance(data, list) and data:
                 subtask_id = data[0].get("id")
         if subtask_id is not None:
-            subtask_id = int(subtask_id)                    # CRM возвращает id как строку
+            subtask_id = int(subtask_id)
 
         return {"id": subtask_id, "response": result}
-        # subtask_id может быть None при нестандартном успешном ответе CRM
+        # subtask_id может быть None при нестандартном успешном ответе
 
-    async def find_subtask(self, title: str, description: str) -> Optional[Dict[str, Any]]:
-        """См. TaskManager.find_task — тот же приём и та же оговорка про
-        неоднозначность совпадения title+description между разными
-        пользователями, используется той же схемой идемпотентного retry
-        'create' в src/tasks/crm_outbox_tasks.py::_do_create.
-        """
-        select_fields = ",".join(str(f) for f in (self.FIELD_TITLE, self.FIELD_DESCR))
+    async def find_subtask(self, local_id: int) -> Optional[Dict[str, Any]]:
+        """См. TaskManager.find_task: поиск по точному Local ID (Subtask.id), parent_item_id не нужен."""
         result = await self._call(
             action="select",
             entity_id=self.ENTITY_ID,
-            select_fields=select_fields,
-            filters={
-                str(self.FIELD_TITLE): {"value": title, "condition": "include"},
-                str(self.FIELD_DESCR): {"value": description, "condition": "include"},
-            },
+            select_fields=str(self.FIELD_LOCAL_ID),
+            filters={str(self.FIELD_LOCAL_ID): {"value": str(local_id), "condition": "include"}},
         )
         data = result.get("data", [])
         if not data:
@@ -98,12 +80,7 @@ class SubtaskManager(CRMClient):
         clear_specification: bool = False,
         other_file_abs_paths: Optional[list[Path]] = None,
     ) -> Dict[str, Any]:
-        """Обновляет подзадачу по CRM-ID; передаёт только заполненные поля.
-
-        clear_specification=True: field_325 = [] (CRM удаляет вложение ТЗ).
-        other_file_abs_paths=[]: field_326 = [] (CRM очищает поле иных документов).
-        other_file_abs_paths=[p1,p2]: field_326 = [file1, file2] (полная замена содержимого поля).
-        """
+        """Обновляет подзадачу по CRM-ID; передаёт только заполненные поля (семантика файлов — как в TaskManager.update_task)."""
         data: Dict[str, Any] = {}
         if title is not None:
             data[f"field_{self.FIELD_TITLE}"] = title
@@ -114,14 +91,9 @@ class SubtaskManager(CRMClient):
         if clear_specification:
             data[f"field_{self.FIELD_SPEC}"] = []
         elif specification_abs_path is not None:
-            # field_325: одиночный файл ТЗ подзадачи; CRM принимает список из одного элемента.
             data[f"field_{self.FIELD_SPEC}"] = [await self._file_to_crm(specification_abs_path)]
         if other_file_abs_paths is not None:
-            # None → поле не трогать; [] → очистить; [p1,…] → заменить всё содержимое.
-            # asyncio.gather запускает все _file_to_crm(...) не дожидаясь друг друга;
-            # каждый вызов сам выносит read_bytes() в отдельный поток через asyncio.to_thread
-            # (см. client.py) — поэтому сами чтения с диска идут одновременно в пуле потоков,
-            # а не по очереди. gather() уже возвращает list — оборачивать в list() не нужно.
+            # None — не трогать; [] — очистить; [p1, …] — заменить.
             data[f"field_{self.FIELD_OTHER}"] = await asyncio.gather(
                 *[self._file_to_crm(p) for p in other_file_abs_paths]
             )
@@ -132,12 +104,20 @@ class SubtaskManager(CRMClient):
         return await self._call(
             action="update",
             entity_id=self.ENTITY_ID,
-            data=data,                          # только переданные поля, остальные не тронуты
-            update_by_field={"id": subtask_id},  # критерий: обновить запись с этим CRM-ID
-            # expect_id: если подзадачу удалили в CRM напрямую, CRM отвечает "success"
-            # с пустым data.id вместо ошибки — expect_id превращает это в Exception, чтобы
-            # вызывающий код (services/subtasks.py::update_subtask) выставил crm_synced=False.
-            # См. task_service.py::update_task (тот же паттерн для задач).
+            data=data,
+            update_by_field={"id": subtask_id},
+            # expect_id: ответ «success» с пустым data.id (запись удалена в CRM) становится исключением.
+            expect_id=True,
+        )
+
+    async def backfill_local_id(self, subtask_id: int, local_id: int) -> Dict[str, Any]:
+        """См. TaskManager.backfill_local_id."""
+        logger.info("CRM: backfill local_id=%s on subtask crm_id=%s", local_id, subtask_id)
+        return await self._call(
+            action="update",
+            entity_id=self.ENTITY_ID,
+            data={f"field_{self.FIELD_LOCAL_ID}": str(local_id)},
+            update_by_field={"id": subtask_id},
             expect_id=True,
         )
 
@@ -146,6 +126,6 @@ class SubtaskManager(CRMClient):
         return await self._call(
             action="delete",
             entity_id=self.ENTITY_ID,
-            delete_by_field={"id": subtask_id},  # CRM удалит запись по CRM-ID подзадачи
-            expect_id=True,  # см. update_subtask выше
+            delete_by_field={"id": subtask_id},
+            expect_id=True,
         )

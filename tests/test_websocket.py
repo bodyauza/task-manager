@@ -1,18 +1,12 @@
-"""WebSocket-эндпоинт /ws/tasks/{client_id} (src/realtime/router.py::websocket_endpoint).
+"""WebSocket-эндпоинт /ws/tasks/{client_id}: проверка куки, закрытие 1008, приём сообщения и рассылка, отписка, лимиты.
 
-Раньше тестировались только части — ConnectionManager, _publish_chat_message,
-история — но не сам эндпоинт: проверка куки, закрытие 1008, приём сообщения и
-рассылка, отписка при разрыве. Здесь эндпоинт вызывается по-настоящему через
-starlette TestClient.websocket_connect (его цикл событий — в отдельном потоке;
-движок БД в тестах на NullPool, поэтому соединения не привязаны к циклу).
-
-Чтение из WebSocket в TestClient блокирующее и без таймаута: при регрессии
-тест завис бы навсегда. Поэтому сценарий выполняется в демоническом потоке с
-ограничением по времени (_run_with_timeout).
+Эндпоинт вызывается через starlette TestClient.websocket_connect (его loop — в отдельном потоке). Чтение в TestClient блокирующее
+и без таймаута, поэтому сценарий идёт в демоническом потоке с ограничением по времени (_run_with_timeout).
 """
 
 import asyncio
 import threading
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -21,6 +15,7 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from src.auth.user_models import User
+from src.config import settings
 from src.database import async_session_maker
 from src.main import app
 from src.realtime.connection_manager import connection_manager
@@ -168,3 +163,70 @@ async def test_ws_chat_message_is_persisted_in_history(client: AsyncClient, mock
 
     assert frame["text"] == "persist me"
     mock_chat_history_redis.rpush.assert_awaited()          # запись попала в Redis-список истории
+
+
+async def test_ws_oversized_message_is_rejected_and_connection_stays_alive(
+    client: AsyncClient, mock_smtp: dict, monkeypatch
+):
+    monkeypatch.setattr(settings, "WS_MAX_MESSAGE_CHARS", 20)
+    _, token = await _register_get_token(client, mock_smtp, ALICE)
+
+    def _scenario():
+        with TestClient(app).websocket_connect("/ws/tasks/1", headers=_cookie(token)) as ws:
+            ws.send_text("x" * 21)
+            rejected = ws.receive_json()
+            ws.send_text("ok")
+            accepted = ws.receive_json()
+            return rejected, accepted
+
+    rejected, accepted = await _run_with_timeout(_scenario)
+    assert rejected["type"] == "error"
+    assert accepted["type"] == "chat" and accepted["text"] == "ok"
+
+
+async def test_ws_message_rate_is_limited_per_connection(
+    client: AsyncClient, mock_smtp: dict, monkeypatch
+):
+    monkeypatch.setattr(settings, "WS_RATE_LIMIT_MESSAGES", 2)
+    monkeypatch.setattr(settings, "WS_RATE_LIMIT_WINDOW_SECONDS", 60.0)
+    _, token = await _register_get_token(client, mock_smtp, ALICE)
+
+    def _scenario():
+        with TestClient(app).websocket_connect("/ws/tasks/1", headers=_cookie(token)) as ws:
+            frames = []
+            for i in range(3):
+                ws.send_text(f"m{i}")
+                frames.append(ws.receive_json())
+            return frames
+
+    frames = await _run_with_timeout(_scenario)
+    assert [f["type"] for f in frames] == ["chat", "chat", "error"]
+
+
+async def test_ws_survives_redis_failure_on_chat_message(client: AsyncClient, mock_smtp: dict):
+    _, token = await _register_get_token(client, mock_smtp, ALICE)
+
+    def _scenario():
+        with patch(
+            "src.realtime.router.chat_history.append_event",
+            AsyncMock(side_effect=ConnectionError("redis down")),
+        ):
+            with TestClient(app).websocket_connect("/ws/tasks/1", headers=_cookie(token)) as ws:
+                ws.send_text("still alive")
+                return ws.receive_json()
+
+    frame = await _run_with_timeout(_scenario)
+    assert frame["type"] == "chat" and frame["text"] == "still alive"
+
+
+def test_message_rate_limiter_window_slides(monkeypatch):
+    from src.realtime import router as ws_router
+
+    now = [100.0]
+    monkeypatch.setattr(ws_router.time, "monotonic", lambda: now[0])
+    limiter = ws_router._MessageRateLimiter(2, 10.0)
+
+    assert limiter.allow() and limiter.allow()
+    assert limiter.allow() is False
+    now[0] += 10.0
+    assert limiter.allow() is True

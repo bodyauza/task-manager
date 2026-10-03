@@ -1,13 +1,8 @@
-"""Маршруты под /admin/* (кроме самой sqladmin-панели, src/admin/).
-
-Вынесены из pages.py в отдельный роутер: sqladmin монтируется на /admin как
-Mount(...) через setup_admin(app), а Starlette матчит маршруты в порядке
-регистрации и НЕ проваливается дальше после совпадения префикса Mount —
-пути под /admin/*, зарегистрированные после него (pages_router подключается
-последним), получили бы 404 от sqladmin. admin_router подключается в main.py
-ДО setup_admin(app), поэтому эти пути матчатся первыми.
+"""Маршруты /admin/* вне sqladmin-панели. Подключается в main.py ДО setup_admin(): Mount на /admin
+иначе перехватил бы эти пути и ответил 404.
 """
 
+import asyncio
 import os
 
 from fastapi import APIRouter, Depends, Request
@@ -39,21 +34,17 @@ _admin_only = require_role("admin")
     responses=responses(401, 403),
 )
 async def refresh_crm_options(admin: User = Depends(_admin_only)) -> dict:
-    """Ставит задачу немедленной синхронизации таблицы project с CRM в очередь
-    Celery — не выполняет её сама в веб-процессе. 202 Accepted, не 204:
-    работа принята к исполнению, но не гарантированно завершена к моменту
-    ответа — Celery-воркер выполнит её асинхронно.
+    """Ставит в очередь Celery немедленную синхронизацию таблицы project с CRM (202 Accepted — работа принята, но не завершена).
 
-    Вызывается вручную администратором сразу после правки списка «Проект» в
-    самой CRM — не дожидаясь следующего срабатывания Celery Beat
-    (CRM_PROJECT_SYNC_INTERVAL_SECONDS, по умолчанию 180с).
+    Вызывается администратором после правки списка «Проект» в CRM, не дожидаясь Beat. .delay() синхронный,
+    поэтому вынесен в asyncio.to_thread. Исключение не перехватывается: durable-строки за этим путём нет,
+    сбой должен быть виден администратору как 500.
     """
-    sync_project_table.delay()
+    await asyncio.to_thread(sync_project_table.delay)
     return {"status": "queued"}
 
 
-# ── Admin: статус CRM-синхронизации (единственное официальное место, где он
-# вообще виден — см. TaskResponse/SubtaskResponse, где этих полей больше нет) ──
+# Admin: статус CRM-синхронизации
 
 @admin_router.get(
     "/admin/crm-sync-status/tasks",
@@ -65,9 +56,7 @@ async def admin_tasks_sync_status(
     admin: User = Depends(_admin_only),
     db: AsyncSession = Depends(get_async_session),
 ) -> list[TaskSyncStatusResponse]:
-    """Все задачи ВСЕХ владельцев (без owner-фильтрации — сама admin-only
-    защита уже достаточна, см. services/admin_sync.py) с текущим
-    Task.sync_status и снимком последней попытки из crm_outbox."""
+    """Все задачи всех владельцев с Task.sync_status и снимком последней попытки из crm_outbox."""
     return await admin_sync.list_task_sync_status(db)
 
 
@@ -86,8 +75,7 @@ async def admin_subtasks_sync_status(
 
 @admin_router.get("/admin/crm-sync", response_class=HTMLResponse)
 async def admin_crm_sync_page(request: Request, admin: User = Depends(_admin_only)):
-    """HTML-страница над двумя эндпоинтами выше — данные грузит клиентский
-    JS (admin-crm-sync.js), тем же паттерном, что task-board.html/*.js."""
+    """HTML-страница над эндпоинтами выше; данные грузит admin-crm-sync.js."""
     return templates.TemplateResponse(
         request, "admin-crm-sync.html", {"current_page": "admin-crm-sync", "is_admin": True},
     )

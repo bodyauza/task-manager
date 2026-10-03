@@ -187,6 +187,8 @@ const MESSAGE_HANDLERS = {
     // переживают перезагрузку страницы.
     chat: (data) => renderLiveMessage(data),
 
+    error: (data) => addMessage('System: ' + data.detail),
+
     task_created: (data) => {
         renderLiveMessage(data);
         // При событиях от других пользователей перезагружаем текущую страницу,
@@ -447,10 +449,11 @@ function _renderCreateOtherPending() {
 // размер, до отправки на сервер): дублируется здесь, а не выносится в common.js,
 // т.к. там же не вынесено на момент этой доработки (не расширяем область правки).
 function _validateOtherFileClientSide(file) {
+    const forbidden = findForbiddenFilenameChars(file.name);
+    if (forbidden.length) return `имя содержит недопустимые символы: ${forbidden.join(' ')}`;
     const dotIndex = file.name.lastIndexOf('.');
     const ext = dotIndex >= 0 ? file.name.slice(dotIndex).toLowerCase() : '';
-    const allowed = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.jpg', '.jpeg', '.png', '.txt'];
-    if (!allowed.includes(ext)) return `расширение «${ext || '(нет)'}» не поддерживается`;
+    if (!OTHER_FILES_ALLOWED_EXT.includes(ext)) return `расширение «${ext || '(нет)'}» не поддерживается`;
     if (file.size > OTHER_FILES_MAX_SIZE) return `размер превышает лимит ${OTHER_FILES_MAX_SIZE / (1024 * 1024)} МБ`;
     return null;
 }
@@ -462,7 +465,16 @@ document.getElementById('createTaskModal').addEventListener('click', function(e)
 });
 
 document.getElementById('createSpecInput').addEventListener('change', function(e) {
-    createPendingSpecFile = e.target.files[0] || null;
+    const file = e.target.files[0] || null;
+    if (file) {
+        const forbidden = findForbiddenFilenameChars(file.name);
+        if (forbidden.length) {
+            showToast(`«${file.name}»: имя содержит недопустимые символы: ${forbidden.join(' ')}`, 'warning');
+            e.target.value = '';
+            return;
+        }
+    }
+    createPendingSpecFile = file;
     _renderCreateSpecPending();
 });
 

@@ -1,14 +1,6 @@
-"""Файлы вложений (ТЗ + «Иные документы») — общая логика для задач и подзадач.
+"""Файлы вложений (ТЗ и «Иные документы») — общая логика для задач и подзадач.
 
-routers/task_files.py и routers/subtask_files.py были почти буквальным дублем
-друг друга (OCP/DRY-нарушение из аудита): валидация, гонка на JSONB-колонке
-(FOR NO KEY UPDATE) и порядок commit/CRM-синхронизации/удаления-с-диска
-повторялись дважды с разницей только в модели (Task/Subtask) и именах
-CRM-полей. Здесь эта логика живёт один раз, параметризованная
-AttachmentConfig — конфигом различий на конкретную сущность.
-
-Комментарии про гонки и порядок операций внутри функций объясняют одну и ту
-же механику для обеих сущностей — конфигурации не заменяют их, а параметризуют.
+Различия между сущностями параметризует AttachmentConfig.
 """
 
 import asyncio
@@ -25,22 +17,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.auth.user_models import User
 from src.realtime import broadcast_task_event
 from src.task_logic.models import CrmOutbox, Subtask, Task
+from src.crm.outbox_queries import pending_create_event_id
 from src.tasks.crm_outbox_tasks import dispatch_outbox_row
 from src.tasks.sharding import ensure_task_shard
 from src.utils.file_utils import (
-    MAX_OTHER_FILES,     # лимит файлов в «Иных документах» (10 штук)
-    UPLOAD_ROOT,         # абсолютный путь к src/uploads/ (единая точка определения)
-    parse_other_paths,   # JSONB (list[str] | None) → list[str]; [] при NULL
-    read_and_validate,   # чтение + проверка размера/расширения/MIME
-    safe_filename,       # добавление UUID-префикса к имени
-    save_file,           # запись на диск, возврат rel-пути
+    MAX_OTHER_FILES,
+    UPLOAD_ROOT,
+    parse_other_paths,
+    read_and_validate,
+    safe_filename,
+    save_file,
 )
 
 logger = logging.getLogger(__name__)
 
 
 class HasAttachments(Protocol):
-    """Общая форма Task/Subtask, на которую опирается этот модуль."""
+    """Общая форма Task/Subtask для этого модуля."""
 
     id: int
     specification_path: Optional[str]
@@ -51,21 +44,18 @@ class HasAttachments(Protocol):
 class AttachmentConfig:
     """Всё, чем задачи и подзадачи различаются в файловом сценарии."""
 
-    model: type                                           # Task | Subtask
-    dir_segment: str                                       # "tasks" | "subtasks" — сегмент пути на диске
-    singular_name: str                                     # "task" | "subtask" — для логов
-    not_found_detail: str                                  # "Task not found" | "Subtask not found"
-    event_type: str                                        # "task_files_updated" | "subtask_files_updated"
-    aggregate_type: str                                    # "task" | "subtask" — CrmOutbox.aggregate_type
-    crm_id_payload_key: str                                 # "crm_task_id" | "crm_subtask_id" — ключ в payload,
-        # который читают _do_sync_files_task/_do_sync_files_subtask (crm_outbox_tasks.py)
-    get_crm_id: Callable[[Any], Optional[int]]              # entity -> crm_task_id | crm_subtask_id
+    model: type
+    dir_segment: str
+    singular_name: str
+    not_found_detail: str
+    event_type: str
+    aggregate_type: str
+    crm_id_payload_key: str  # ключ crm id в payload (читают _do_sync_files_*)
+    get_crm_id: Callable[[Any], Optional[int]]
     get_shard: Callable[[AsyncSession, Any], Awaitable[str]]
-        # entity -> шард агрегата: для Task — сама entity (ensure_task_shard), для Subtask —
-        # шард родительской задачи (у Subtask своего crm_shard нет, см. sharding.py)
+        # entity -> шард агрегата (у Subtask свой crm_shard отсутствует — берётся шард родительской задачи)
     event_extra: Callable[[AsyncSession, Any], Awaitable[dict]]
-        # -> {"title": ..., "task_id": ...} либо {"title": ..., "task_id": ..., "subtask_id": ..., "task_title": ...}
-        # вычисляется ДО commit — после expire атрибуты сущности могут стать недоступны
+        # -> payload WS-события; вычисляется до commit, пока атрибуты не expired
 
 
 async def _task_shard(db: AsyncSession, task: Task) -> str:
@@ -82,8 +72,7 @@ async def _task_event_extra(db: AsyncSession, task: Task) -> dict:
 
 
 async def _subtask_event_extra(db: AsyncSession, subtask: Subtask) -> dict:
-    # task_title нужен для payload "[Task-title]" в чате task-board.js — подзадача сама
-    # по себе неоднозначна без указания родительской задачи.
+    # task_title нужен для чата: подзадача без родительской задачи неоднозначна.
     task_title = (await db.get(Task, subtask.task_id)).title
     return {
         "title": subtask.title,
@@ -123,15 +112,10 @@ SUBTASK_ATTACHMENTS = AttachmentConfig(
 async def _enqueue_sync_files(
     db: AsyncSession, config: AttachmentConfig, entity: Any, entity_id: int, crm_id: int, **payload_fields: Any,
 ) -> CrmOutbox:
-    """Строит и добавляет в сессию outbox-строку operation='sync_files' для
-    обновления файлового поля УЖЕ существующей в CRM сущности (в отличие от
-    sync_files, вставляемой в create-флоу services/tasks.py/subtasks.py — та
-    зависит от 'create' того же агрегата через depends_on_event_id, здесь же
-    crm_id уже известен, поэтому зависимость не нужна).
+    """Добавляет в сессию outbox-строку 'sync_files' для сущности, уже существующей в CRM.
 
-    Вызывается ДО db.commit() (в той же транзакции, что и изменение
-    specification_path/other_file_paths) — вызывающий код обязан сам
-    диспатчить возвращённую строку через dispatch_outbox_row() ПОСЛЕ commit.
+    Вызывается до commit (в одной транзакции с изменением); строку после commit нужно
+    отправить через dispatch_outbox_row().
     """
     outbox_row = CrmOutbox(
         aggregate_type=config.aggregate_type,
@@ -141,29 +125,50 @@ async def _enqueue_sync_files(
         payload={config.crm_id_payload_key: crm_id, **payload_fields},
     )
     db.add(outbox_row)
-    entity.sync_status = "pending"   # вернётся в 'synced' после успешного sync_files в воркере
+    entity.sync_status = "pending"
     return outbox_row
 
 
-# ════════════════════════════════════════════════════════════
+async def _enqueue_sync_files_pending_create(
+    db: AsyncSession, config: AttachmentConfig, entity: Any, entity_id: int, **payload_fields: Any,
+) -> Optional[CrmOutbox]:
+    """Как _enqueue_sync_files, но для сущности без CRM-id (create ещё не выполнен).
+
+    Строка зависит от 'create' через depends_on_event_id и несёт crm_id=None — воркер прочитает актуальный
+    id из БД после create. Если create-события нет (штатно не бывает) — логируем и ничего не ставим,
+    чтобы не ронять запрос пользователя.
+    """
+    create_event_id = await pending_create_event_id(db, config.aggregate_type, entity_id)
+    if create_event_id is None:
+        logger.error(
+            "%s %s: не найдено событие 'create' в outbox — sync_files не поставлена",
+            config.singular_name, entity_id,
+        )
+        return None
+
+    outbox_row = CrmOutbox(
+        aggregate_type=config.aggregate_type,
+        aggregate_id=entity_id,
+        operation="sync_files",
+        shard=await config.get_shard(db, entity),
+        depends_on_event_id=create_event_id,
+        payload={config.crm_id_payload_key: None, **payload_fields},
+    )
+    db.add(outbox_row)
+    entity.sync_status = "pending"
+    return outbox_row
+
+
 # Атомарное создание сущности с файлами (POST /create-task/, /create-subtask/)
-# ════════════════════════════════════════════════════════════
 
 async def validate_files_for_create(
     specification: Optional[UploadFile],
     other_files: Optional[list[UploadFile]],
 ) -> tuple[Optional[tuple[bytes, str, str]], list[tuple[bytes, str, str]]]:
-    """Валидирует spec (если есть) и other_files (если есть) полностью в памяти.
+    """Валидирует spec и other_files в памяти — первым шагом create-флоу.
 
-    Вызывается ПЕРВЫМ шагом create-флоу, до создания CRM-записи и до INSERT в БД —
-    единственный невалидный файл должен блокировать создание сущности целиком (422),
-    ничего не должно быть тронуто. Отдельно от save_files_for_create() ниже: та
-    вызывается уже после того, как сущность гарантированно существует, и её сбои
-    best-effort, а не 422.
-
-    other_files создаётся "с нуля" (существующих файлов ещё нет), поэтому лимит
-    MAX_OTHER_FILES проверяется просто как len(other_files) — в отличие от
-    upload_other_files(), где к нему прибавляется количество уже загруженных.
+    Единственный невалидный файл блокирует создание целиком (422). other_files создаётся с нуля,
+    поэтому лимит MAX_OTHER_FILES — просто len(other_files).
     """
     other_files = other_files or []
     if len(other_files) > MAX_OTHER_FILES:
@@ -187,15 +192,9 @@ async def save_files_for_create(
     spec_validated: Optional[tuple[bytes, str, str]],
     other_validated: list[tuple[bytes, str, str]],
 ) -> tuple[Optional[str], list[str], dict[str, str]]:
-    """Best-effort сохранение уже провалидированных файлов на диск.
+    """Best-effort сохранение провалидированных файлов на диск (после flush, до commit).
 
-    Вызывается ПОСЛЕ db.flush() (когда entity_id уже известен) и ДО финального
-    db.commit() — сущность к этому моменту уже гарантированно вставлена в сессию.
-    Сбой сохранения одного файла (диск, права доступа и т.п.) не поднимается наружу
-    и не влияет на соседние файлы — попадает в возвращаемый errors по оригинальному
-    имени файла. Если один и тот же оригинальный файл упоминается дважды и оба раза
-    падает — вторая ошибка перезапишет первую в словаре (редкий косметический случай,
-    не устраняется).
+    Сбой одного файла не влияет на остальные и попадает в возвращаемый errors по оригинальному имени.
     """
     errors: dict[str, str] = {}
 
@@ -204,7 +203,7 @@ async def save_files_for_create(
         content, filename, original_name = spec_validated
         dest_dir = UPLOAD_ROOT / config.dir_segment / str(entity_id) / "specification"
         try:
-            spec_path = await asyncio.to_thread(save_file, dest_dir, filename, content)
+            spec_path = await asyncio.to_thread(save_file, dest_dir, filename, content, UPLOAD_ROOT)
         except Exception as exc:
             logger.error("Create %s %s: spec save failed: %s", config.singular_name, entity_id, exc)
             errors[original_name] = str(exc)
@@ -214,7 +213,7 @@ async def save_files_for_create(
         dest_dir = UPLOAD_ROOT / config.dir_segment / str(entity_id) / "other"
 
         async def _save_one(content: bytes, filename: str) -> str:
-            return await asyncio.to_thread(save_file, dest_dir, filename, content)
+            return await asyncio.to_thread(save_file, dest_dir, filename, content, UPLOAD_ROOT)
 
         results = await asyncio.gather(
             *[_save_one(content, filename) for content, filename, _ in other_validated],
@@ -233,9 +232,27 @@ async def save_files_for_create(
     return spec_path, other_paths, errors
 
 
-# ════════════════════════════════════════════════════════════
+async def delete_orphaned_files(
+    specification_path: Optional[str], other_file_paths: Optional[list[str]],
+) -> None:
+    """Удаляет с диска файлы, записанные в этом запросе, если flush()/commit() упал.
+
+    Файлы пишутся до commit, и при откате ссылки на них в БД не будет никогда. Исключение не поднимает
+    (не должно маскировать исходное), только логирует.
+    """
+    paths = list(other_file_paths or [])
+    if specification_path:
+        paths.append(specification_path)
+    for rel_path in paths:
+        try:
+            await asyncio.to_thread((UPLOAD_ROOT / rel_path).unlink, missing_ok=True)
+        except OSError as exc:
+            logger.error(
+                "Не удалось удалить осиротевший файл %s после сбоя commit/flush: %s", rel_path, exc,
+            )
+
+
 # Техническое задание (одиночный файл)
-# ════════════════════════════════════════════════════════════
 
 async def upload_specification(
     db: AsyncSession,
@@ -244,104 +261,112 @@ async def upload_specification(
     file: UploadFile,
     config: AttachmentConfig,
 ) -> dict:
-    """Загружает (или заменяет) файл ТЗ. При повторной загрузке старый файл удаляется с диска.
+    """Загружает или заменяет файл ТЗ; старый файл удаляется с диска после commit.
 
-    Синхронизация с CRM — через durable outbox (см. _enqueue_sync_files): веб-процесс
-    сам CRM не вызывает, ошибка/недоступность CRM не блокирует и не задерживает сохранение.
+    CRM синхронизируется через outbox. FOR NO KEY UPDATE (key_share=True) сериализует конкурентные
+    upload/delete одного слота и не конфликтует с FOR KEY SHARE при INSERT подзадачи.
     """
     entity = (
-        await db.execute(select(config.model).where(config.model.id == entity_id))
+        await db.execute(
+            select(config.model).where(config.model.id == entity_id).with_for_update(key_share=True)
+        )
     ).scalar_one_or_none()
     if entity is None:
         raise HTTPException(status_code=404, detail=config.not_found_detail)
 
-    # read_and_validate: читает байты, проверяет размер (≤100 МБ), расширение и MIME.
-    # При нарушении — поднимает HTTPException (413 или 422) до записи на диск.
+    # read_and_validate проверяет размер, расширение и MIME до записи на диск (413/422).
     content = await read_and_validate(file)
 
-    # safe_filename добавляет uuid-префикс: "tz.pdf" → "a1b2c3d4_tz.pdf"
     filename = safe_filename(file.filename)
     dest_dir = UPLOAD_ROOT / config.dir_segment / str(entity_id) / "specification"
 
-    # Старый путь захватываем до commit; удалим файл только после успешного commit.
+    # Старый путь захватываем до commit; удаляем файл только после успешного commit.
     old_path = UPLOAD_ROOT / entity.specification_path if entity.specification_path else None
 
-    # asyncio.to_thread: mkdir+write_bytes — синхронный блокирующий I/O, без выноса
-    # в поток он держит event loop занятым на время записи (для больших файлов заметно).
-    rel_path = await asyncio.to_thread(save_file, dest_dir, filename, content)
+    # Запись вынесена в поток (блокирующий I/O). OSError перехватываем: ничего ещё не закоммичено.
+    try:
+        rel_path = await asyncio.to_thread(save_file, dest_dir, filename, content, UPLOAD_ROOT)
+    except OSError as exc:
+        logger.error("%s %s: spec save failed: %s", config.singular_name, entity_id, exc)
+        raise HTTPException(status_code=500, detail="Не удалось сохранить файл на диск")
 
-    # Outbox — только если сущность зарегистрирована в CRM (иначе синхронизировать
-    # нечего: crm_task_id/crm_subtask_id ещё не известен, а create-флоу сам поставит
-    # свою sync_files-строку, см. services/tasks.py::create_task). Вставляется в ТОЙ
-    # ЖЕ транзакции, что и entity.specification_path ниже.
+    # Outbox вставляется в той же транзакции. Если CRM-id ещё нет — строка зависит от 'create'
+    # (см. _enqueue_sync_files_pending_create).
     crm_id = config.get_crm_id(entity)
-    outbox_row: Optional[CrmOutbox] = None
+    # sync_specification — флаг «слот ТЗ затронут»; путь воркер читает из БД.
     if crm_id is not None:
         outbox_row = await _enqueue_sync_files(
-            db, config, entity, entity_id, crm_id, specification_path=rel_path,
+            db, config, entity, entity_id, crm_id, sync_specification=True,
+        )
+    else:
+        outbox_row = await _enqueue_sync_files_pending_create(
+            db, config, entity, entity_id, sync_specification=True,
         )
 
-    # extra захватывается ДО commit — иначе MissingGreenlet после expire (title, task_title и т.д.).
+    # extra захватывается до commit — иначе MissingGreenlet после expire.
     extra = await config.event_extra(db, entity)
     title = extra.pop("title")
     entity.specification_path = rel_path
-    await db.commit()
+    # commit мог упасть после записи файла: откат оставит файл сиротой, удаляем его. old_path не трогаем.
+    try:
+        await db.commit()
+    except Exception:
+        await delete_orphaned_files(rel_path, None)
+        raise
 
     if outbox_row is not None:
-        dispatch_outbox_row(outbox_row)
+        await dispatch_outbox_row(outbox_row)
 
-    # Удаляем старый файл только после успешного commit: если commit упал бы раньше,
-    # старый файл остался бы на диске и путь в БД не изменился бы → нет потери данных.
-    # asyncio.to_thread: unlink — синхронный блокирующий I/O, как и save_file/mkdir выше.
+    # Старый файл удаляем только после успешного commit (unlink в потоке).
     if old_path:
         await asyncio.to_thread(old_path.unlink, missing_ok=True)
 
-    # exclude_user_id не передаётся: broadcast идёт всем, включая актора — актор должен увидеть
-    # собственное сообщение в чате (см. task-board.js). action="uploaded" различает
-    # формулировку "Добавлены файлы"/"Files added" от "Удалены файлы"/"Files removed" на фронте.
+    # exclude_user_id не передаётся: актор тоже видит событие в чате.
     await broadcast_task_event(
         config.event_type, title, sender_email=user.email, actor_id=user.id, action="uploaded", **extra,
     )
 
-    return {"specification_path": rel_path}  # URL: /uploads/{rel_path}
+    return {"specification_path": rel_path}
 
 
 async def delete_specification(
     db: AsyncSession, user: User, entity_id: int, config: AttachmentConfig,
 ) -> dict:
-    """Удаляет файл ТЗ с диска и обнуляет путь в БД."""
+    """Удаляет файл ТЗ с диска и обнуляет путь в БД (FOR NO KEY UPDATE — как в upload_specification)."""
     entity = (
-        await db.execute(select(config.model).where(config.model.id == entity_id))
+        await db.execute(
+            select(config.model).where(config.model.id == entity_id).with_for_update(key_share=True)
+        )
     ).scalar_one_or_none()
     if entity is None:
         raise HTTPException(status_code=404, detail=config.not_found_detail)
 
     if not entity.specification_path:
-        # 404: удалять нечего — файл не загружен
         raise HTTPException(status_code=404, detail="Specification file not found")
 
-    # Путь на диске захватываем до commit; удалим файл только после успешного commit —
-    # симметрично upload_specification: если commit упадёт, путь в БД не изменится,
-    # а файл на диске останется на месте (нет расхождения БД↔диск).
+    # Путь захватываем до commit; файл удаляем только после успешного commit.
     old_path = UPLOAD_ROOT / entity.specification_path
 
+    # sync_specification — флаг «слот затронут»; воркер увидит пустой путь и очистит поле в CRM.
     crm_id = config.get_crm_id(entity)
-    outbox_row: Optional[CrmOutbox] = None
     if crm_id is not None:
         outbox_row = await _enqueue_sync_files(
-            db, config, entity, entity_id, crm_id, clear_specification=True,
+            db, config, entity, entity_id, crm_id, sync_specification=True,
+        )
+    else:
+        # CRM-id ещё нет — зависимая от 'create' строка (см. _enqueue_sync_files_pending_create).
+        outbox_row = await _enqueue_sync_files_pending_create(
+            db, config, entity, entity_id, sync_specification=True,
         )
 
-    extra = await config.event_extra(db, entity)  # захватить до commit — иначе MissingGreenlet после expire
+    extra = await config.event_extra(db, entity)
     title = extra.pop("title")
     entity.specification_path = None
     await db.commit()
 
     if outbox_row is not None:
-        dispatch_outbox_row(outbox_row)
+        await dispatch_outbox_row(outbox_row)
 
-    # asyncio.to_thread: unlink — синхронный блокирующий I/O; без выноса в поток
-    # он держит event loop занятым на время удаления, как и запись файла в upload_specification.
     await asyncio.to_thread(old_path.unlink, missing_ok=True)
 
     await broadcast_task_event(
@@ -351,22 +376,14 @@ async def delete_specification(
     return {"specification_path": None}
 
 
-# ════════════════════════════════════════════════════════════
 # Иные документы (множественные файлы)
-# ════════════════════════════════════════════════════════════
 
 async def _validate_other_files(files: list[UploadFile]) -> list[tuple[bytes, str, str]]:
-    """Валидирует все файлы параллельно, ничего не сохраняя на диск.
+    """Параллельно валидирует все файлы, ничего не сохраняя.
 
-    Возвращает (content, safe_filename, original_filename) для каждого файла —
-    original_filename нужен вызывающему коду create-флоу для ключей file_upload_errors,
-    upload_other_files его игнорирует.
-
-    return_exceptions=True вместо того чтобы дать gather самому оборвать ожидание на
-    первой ошибке: поток ОС, уже занятый magic.from_buffer() для другого файла, всё
-    равно не остановить снаружи — он доработает сам по себе, просто впустую. Дожидаемся
-    всех результатов и поднимаем первую ошибку сами — так на диске не остаётся частично
-    сохранённых файлов (сохранение начинается только после этой проверки).
+    Возвращает (content, safe_filename, original_filename); original_filename нужен create-флоу для ключей
+    file_upload_errors. return_exceptions=True: дожидаемся всех результатов и поднимаем первую ошибку сами,
+    чтобы на диске не оставалось частично сохранённых файлов.
     """
     async def _validate_one(upload: UploadFile) -> tuple[bytes, str, str]:
         content = await read_and_validate(upload)
@@ -379,7 +396,7 @@ async def _validate_other_files(files: list[UploadFile]) -> list[tuple[bytes, st
     for result in validation_results:
         if isinstance(result, BaseException):
             raise result
-    return validation_results  # после цикла выше — только tuple
+    return validation_results
 
 
 async def upload_other_files(
@@ -390,23 +407,9 @@ async def upload_other_files(
     config: AttachmentConfig,
 ) -> dict:
     """Добавляет файлы в «Иные документы» (максимум MAX_OTHER_FILES суммарно)."""
-    # Race condition (lost update) на JSONB-колонке other_file_paths: без блокировки строки
-    # между SELECT и последующим UPDATE (entity.other_file_paths = updated ниже) два параллельных
-    # запроса к одной и той же сущности читают один и тот же "existing" ещё до commit друг друга —
-    # итоговый UPDATE второго запроса молча затирает результат первого:
-    #
-    #   Запрос A: existing=[], сохраняет a1b2c3d4_doc.pdf → updated=["a1b2c3d4_doc.pdf"] → commit
-    #   Запрос B: читал existing=[] ещё до commit A → сохраняет e5f6a801_doc.pdf → updated=["e5f6a801_doc.pdf"] → commit
-    #
-    # После обоих commit в БД остаётся только ["e5f6a801_doc.pdf"] — путь a1b2c3d4_doc.pdf
-    # потерян из JSONB, хотя сам файл остался лежать на диске (не отдаётся, не удаляется при чистке).
-    #
-    # Устраняется пессимистичной блокировкой строки перед чтением: with_for_update(key_share=True)
-    # рендерит FOR NO KEY UPDATE (не FOR UPDATE) — этого достаточно, чтобы сериализовать
-    # запись other_file_paths, но НЕ конфликтует с FOR KEY SHARE, которую PostgreSQL
-    # автоматически берёт на родительскую задачу при INSERT подзадачи с FK на неё —
-    # параллельное создание подзадач (create_subtask) не блокируется. Обычный FOR UPDATE
-    # здесь был бы избыточен: other_file_paths не входит ни в PK, ни в UNIQUE-ограничение.
+    # Блокировка строки (FOR NO KEY UPDATE) защищает JSONB other_file_paths от lost update: два параллельных
+    # запроса иначе читают один и тот же existing, и второй UPDATE затирает результат первого, оставляя файл
+    # на диске сиротой. key_share=True не конфликтует с FOR KEY SHARE при INSERT подзадачи.
     entity = (
         await db.execute(
             select(config.model).where(config.model.id == entity_id).with_for_update(key_share=True)
@@ -429,35 +432,53 @@ async def upload_other_files(
 
     dest_dir = UPLOAD_ROOT / config.dir_segment / str(entity_id) / "other"
 
-    # Проход 1: валидируем все файлы до записи на диск (см. _validate_other_files выше).
+    # Проход 1: валидируем все файлы до записи на диск.
     validated = await _validate_other_files(files)
 
-    # Проход 2: все файлы валидны — сохраняем на диск параллельно. В отличие от MIME-проверки
-    # выше (сериализована общим локом внутри python-magic), запись на диск такого ограничения
-    # не имеет — у каждого файла свой UUID-префикс от safe_filename(), коллизий имён нет.
-    # gather() уже возвращает list — оборачивать в list() не нужно.
-    new_paths: list[str] = await asyncio.gather(
-        *[asyncio.to_thread(save_file, dest_dir, filename, content) for content, filename, _ in validated]
+    # Проход 2: сохраняем на диск параллельно (у каждого файла свой UUID-префикс). При сбое любого файла
+    # откатываем уже сохранённые и не обновляем entity — иначе они остались бы сиротами.
+    save_results = await asyncio.gather(
+        *[asyncio.to_thread(save_file, dest_dir, filename, content, UPLOAD_ROOT) for content, filename, _ in validated],
+        return_exceptions=True,
     )
+    new_paths: list[str] = [r for r in save_results if not isinstance(r, BaseException)]
+    save_errors = [r for r in save_results if isinstance(r, BaseException)]
+    if save_errors:
+        for rel_path in new_paths:
+            await asyncio.to_thread((UPLOAD_ROOT / rel_path).unlink, missing_ok=True)
+        logger.error(
+            "%s %s: не удалось сохранить %d из %d файлов на диск: %s",
+            config.singular_name, entity_id, len(save_errors), len(validated), save_errors[0],
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось сохранить {len(save_errors)} из {len(validated)} файл(ов) на диск",
+        )
 
     updated = existing + new_paths
-    crm_id = config.get_crm_id(entity)                        # захватить до commit
-    # Outbox — CRM-поле заменяется целиком (передаём ВСЕ текущие файлы поля, не
-    # только new_paths — иначе CRM потеряет ранее загруженные файлы записи); та же
-    # транзакция, что и entity.other_file_paths ниже.
-    outbox_row: Optional[CrmOutbox] = None
+    crm_id = config.get_crm_id(entity)
+    # sync_other_files — флаг «слот затронут»; воркер отправит в CRM весь текущий список из БД.
     if crm_id is not None:
         outbox_row = await _enqueue_sync_files(
-            db, config, entity, entity_id, crm_id, other_file_paths=updated,
+            db, config, entity, entity_id, crm_id, sync_other_files=True,
         )
-    extra = await config.event_extra(db, entity)               # захватить до commit
+    else:
+        # CRM-id ещё нет — зависимая от 'create' строка (см. _enqueue_sync_files_pending_create).
+        outbox_row = await _enqueue_sync_files_pending_create(
+            db, config, entity, entity_id, sync_other_files=True,
+        )
+    extra = await config.event_extra(db, entity)
     title = extra.pop("title")
-    # JSONB: передаём list[str] напрямую; asyncpg сериализует в бинарный JSON при INSERT/UPDATE.
     entity.other_file_paths = updated
-    await db.commit()
+    # commit мог упасть после записи файлов: откат оставит new_paths сиротами, удаляем их (existing в БД не затронуты).
+    try:
+        await db.commit()
+    except Exception:
+        await delete_orphaned_files(None, new_paths)
+        raise
 
     if outbox_row is not None:
-        dispatch_outbox_row(outbox_row)
+        await dispatch_outbox_row(outbox_row)
 
     await broadcast_task_event(
         config.event_type, title, sender_email=user.email, actor_id=user.id, action="uploaded", **extra,
@@ -469,12 +490,8 @@ async def upload_other_files(
 async def delete_other_file(
     db: AsyncSession, user: User, entity_id: int, filename: str, config: AttachmentConfig,
 ) -> dict:
-    """Удаляет один файл из «Иных документов» по имени файла."""
-    # Тот же lost-update race, что и в upload_other_files — только в обратную сторону: если это
-    # удаление racing-ит с параллельной загрузкой нового файла, финальный UPDATE может отменить
-    # чужое добавление или воскресить путь, который параллельно удалили. Устраняется той же
-    # блокировкой FOR NO KEY UPDATE — разбор выбора между FOR UPDATE и FOR NO KEY UPDATE
-    # см. в upload_other_files.
+    """Удаляет один файл из «Иных документов» по имени."""
+    # Та же блокировка, что в upload_other_files: защита от lost update при параллельной загрузке/удалении.
     entity = (
         await db.execute(
             select(config.model).where(config.model.id == entity_id).with_for_update(key_share=True)
@@ -485,37 +502,35 @@ async def delete_other_file(
 
     existing = parse_other_paths(entity.other_file_paths)
 
-    # Ищем в списке путь, чьё имя файла совпадает с запрошенным.
     # Path(p).name отрезает директорию: "tasks/3/other/a1b2_doc.pdf" → "a1b2_doc.pdf".
     target = next((p for p in existing if Path(p).name == filename), None)
     if target is None:
         raise HTTPException(status_code=404, detail=f"Файл '{filename}' не найден")
 
-    # Путь на диске захватываем до commit; удалим файл только после успешного commit —
-    # та же инвариантность, что и в upload_specification/delete_specification: если
-    # commit упадёт, JSONB-запись не изменится, а файл на диске останется на месте.
+    # Путь захватываем до commit; файл удаляем только после успешного commit.
     target_path = UPLOAD_ROOT / target
 
     updated = [p for p in existing if p != target]
     crm_id = config.get_crm_id(entity)
-    # Outbox — [] в payload означает «очистить поле в CRM» (обработчик различает
-    # отсутствие ключа от [] — см. _do_sync_files_task/_do_sync_files_subtask),
-    # [p1,…] — полную замену содержимого. Та же транзакция, что и other_file_paths ниже.
-    outbox_row: Optional[CrmOutbox] = None
+    # sync_other_files — флаг «слот затронут»; воркер сам прочитает актуальный список.
     if crm_id is not None:
         outbox_row = await _enqueue_sync_files(
-            db, config, entity, entity_id, crm_id, other_file_paths=updated,
+            db, config, entity, entity_id, crm_id, sync_other_files=True,
         )
-    extra = await config.event_extra(db, entity)   # захватить до commit — иначе MissingGreenlet после expire
+    else:
+        # CRM-id ещё нет — зависимая от 'create' строка (см. _enqueue_sync_files_pending_create).
+        outbox_row = await _enqueue_sync_files_pending_create(
+            db, config, entity, entity_id, sync_other_files=True,
+        )
+    extra = await config.event_extra(db, entity)
     title = extra.pop("title")
-    # NULL вместо [] при пустом списке: соответствует начальному состоянию колонки.
+    # NULL вместо [] при пустом списке — как начальное состояние колонки.
     entity.other_file_paths = updated if updated else None
     await db.commit()
 
     if outbox_row is not None:
-        dispatch_outbox_row(outbox_row)
+        await dispatch_outbox_row(outbox_row)
 
-    # asyncio.to_thread: unlink — синхронный блокирующий I/O, тот же принцип, что и в save_file.
     await asyncio.to_thread(target_path.unlink, missing_ok=True)
 
     await broadcast_task_event(
@@ -525,21 +540,12 @@ async def delete_other_file(
     return {"other_file_paths": updated}
 
 
-# ════════════════════════════════════════════════════════════
 # Каскадное удаление файлов при удалении задачи/подзадачи
-# ════════════════════════════════════════════════════════════
 
 async def cleanup(entity_id: int, config: AttachmentConfig) -> None:
-    """Удаляет директорию uploads/{dir_segment}/{entity_id}/ со всем содержимым.
+    """Удаляет uploads/{dir_segment}/{entity_id}/ целиком (после commit).
 
-    Вызывается ПОСЛЕ db.commit(), когда сущность уже удалена из БД (и для задачи —
-    PostgreSQL CASCADE уже удалил подзадачи). shutil.rmtree: рекурсивное удаление;
-    ignore_errors=True — не падает, если директория не существует (сущность без файлов).
-
-    asyncio.to_thread: shutil.rmtree — синхронный блокирующий I/O по дереву каталогов;
-    без выноса в поток удаление задачи с большим деревом подзадач/файлов держало бы
-    event loop занятым на всё время обхода файловой системы, замораживая остальные
-    запросы приложения — тот же принцип, что и у save_file/unlink в этом модуле.
+    rmtree вынесен в поток; ignore_errors=True — каталога может не быть.
     """
     entity_dir = UPLOAD_ROOT / config.dir_segment / str(entity_id)
     await asyncio.to_thread(shutil.rmtree, entity_dir, ignore_errors=True)

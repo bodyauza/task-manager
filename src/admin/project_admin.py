@@ -1,10 +1,7 @@
-"""Read-only ModelView для таблицы project (зеркало глобального списка «Проект» CRM).
+"""Read-only ModelView для таблицы project (зеркало списка «Проект» CRM).
 
-Таблица целиком управляется Celery-задачей sync_project_table
-(src/tasks/global_lists_tasks.py, Celery Beat + POST /admin/crm-options/refresh):
-label/sort_order/is_active перезаписываются при каждой синхронизации, поэтому
-правка через форму молча откатилась бы — выглядит как баг. can_create/can_edit/
-can_delete = False убирают форму целиком, включая обработчики маршрутов.
+Таблицу перезаписывает Celery-задача sync_project_table, поэтому правка через форму молча откатилась бы;
+can_create/can_edit/can_delete = False убирают форму целиком.
 """
 
 from sqladmin import ModelView

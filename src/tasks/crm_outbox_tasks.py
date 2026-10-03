@@ -1,92 +1,35 @@
-"""Durable retry для CRM-вызовов, теряющихся при падении процесса между
-db.commit() и вызовом CRM — src/task_logic/models.py::CrmOutbox, докстринг там
-же объясняет схему целиком. Продюсеры — src/services/tasks.py,
-src/services/subtasks.py (create_*/update_*/delete_*) и
-src/services/attachments.py (upload/delete-функции) — вставляют строку в той
-же транзакции, что и основное изменение, и сразу после db.commit() вызывают
-dispatch_outbox_row(row) (см. ниже), чтобы Celery-воркер подхватил её
-практически немедленно. Сам CRM-вызов веб-процесс больше не выполняет НИКОГДА —
-только Celery-воркер, здесь же:
+"""Durable-синхронизация с CRM через outbox (схема — докстринг CrmOutbox в src/task_logic/models.py).
 
-- process_outbox_row(outbox_id) — выполняет одну конкретную операцию
-  (вызывается и через dispatch_outbox_row сразу после commit, и повторно через
-  reconcile_pending_outbox ниже).
-- reconcile_pending_outbox() — Celery Beat, раз в минуту (см. celery_app.py):
-  находит строки status='pending' старше грейс-периода (_PENDING_GRACE_SECONDS),
-  у которых уже прошла экспоненциальная пауза после прошлой неудачной попытки
-  (_retry_delay_seconds, см. ниже), и ставит process_outbox_row в очередь для каждой, в очередь её шарда
-  (row.shard — снимок Task.crm_shard на момент вставки строки, не lookup в
-  реальном времени, см. докстринг CrmOutbox). Грейс-период нужен, чтобы не
-  диспетчеризовать строку повторно, пока её ещё обрабатывает (или вот-вот
-  начнёт обрабатывать) задача, поставленная dispatch_outbox_row сразу после
-  вставки, — иначе два параллельных process_outbox_row для одной строки могли
-  бы отправить в CRM один и тот же запрос дважды.
-- reconcile_blocked_outbox() — Celery Beat, раз в 5 минут: переводит
-  status='blocked' обратно в 'pending', если событие-зависимость
-  (depends_on_event_id) с тех пор стало 'done' — следующий тик
-  reconcile_pending_outbox подхватит разблокированную строку как обычную
-  pending (её created_at уже старше грейс-периода к этому моменту).
+Продюсеры (services/tasks.py, subtasks.py, attachments.py) вставляют строку crm_outbox в одной
+транзакции с изменением и после commit вызывают dispatch_outbox_row(). Веб-процесс CRM не вызывает.
 
-Два вида зависимости depends_on_event_id: межагрегатная (create подзадачи
-зависит от create родительской задачи) и внутриагрегатная (sync_files
-зависит от create того же агрегата —
-на момент вставки sync_files, если create ещё не выполнялся синхронно,
-CRM-ID агрегата не известен, payload несёт crm_task_id=None; обработчик в
-этом случае читает уже актуальное значение из БД, а не из своего payload —
-единственное намеренное исключение из общего принципа «payload самодостаточен»,
-подробно прокомментировано в _do_sync_files_task/_do_sync_files_subtask).
+- process_outbox_row(outbox_id) — выполняет одну операцию.
+- reconcile_pending_outbox() — Beat, раз в минуту: ставит в очередь шарда pending-строки старше
+  грейс-периода, у которых прошла пауза после неудачи (_retry_delay_seconds).
+- reconcile_blocked_outbox() — Beat, раз в 5 минут: blocked → pending, когда зависимость стала done.
 
-Гонка «create в процессе — пользователь удалил агрегат» закрыта на стороне
-воркера: _do_create_* берут FOR NO KEY UPDATE на строку агрегата ПОСЛЕ
-CRM-вызова (_lock_entity); веб-сторона (services/tasks.py::delete_task,
-subtasks.py::delete_subtask) берёт FOR UPDATE на ту же строку и конфликтует с
-ним. Если к моменту записи crm_*_id строки уже нет, только что созданная
-воркером запись в CRM — сирота: _compensate_orphan удаляет её сразу, а при
-сбое CRM ставит в crm_outbox обычную строку 'delete'.
+depends_on_event_id бывает межагрегатным (create подзадачи ждёт create задачи) и внутриагрегатным
+(update/sync_files ждут create того же агрегата). В таких строках CRM-id в payload равен None,
+обработчик читает его из БД. sync_files читает пути файлов из БД «по состоянию», а не из payload.
 
-Идемпотентность retry 'create' — src/crm/task_service.py::TaskManager.find_task/
-src/crm/subtask_service.py::SubtaskManager.find_subtask (эвристика по
-title+description, не гарантия — см. их докстринги).
+Порядок событий одной сущности: _has_older_unfinished не даёт событию начать попытку, пока есть
+более старое незавершённое; sync_status пересчитывается в _refresh_sync_status.
+Гонка «create в процессе — агрегат удалён»: _do_create_* берут FOR NO KEY UPDATE после CRM-вызова
+(_lock_entity), при отсутствии агрегата _compensate_orphan удаляет созданную запись в CRM.
+Идемпотентность create — find_task/find_subtask по Local ID. Шардирование, Redlock и rate limit —
+src/tasks/sharding.py, crm_shard_lock.py, crm_rate_limit.py.
 
-Шардирование (id % N, sticky)/Redlock/token-bucket — src/tasks/sharding.py,
-src/tasks/crm_shard_lock.py, src/tasks/crm_rate_limit.py. Redlock здесь —
-дополнительная страховка, не механизм порядка: порядок обеспечивается
-топологией деплоя (один celery-worker-shard-N процесс на шард, --pool=solo,
-concurrency=1 — см. src/docker-compose.yml).
-
-Топология выше гарантирует, что два ПРОЦЕССА не читают одну очередь
-одновременно, но НЕ гарантирует порядок обработки событий ОДНОЙ сущности —
-строка с паузой перед повтором (_retry_delay_seconds) может пропустить
-вперёд себя более новое событие той же сущности, которое было поставлено в
-очередь сразу после вставки (dispatch_outbox_row) и не ждёт никакой паузы.
-_has_older_unfinished (ниже) закрывает это структурно: событие не начинает
-попытку, пока у той же сущности есть более старое ещё не завершённое
-(pending/blocked) событие. Без этой гарантии более старое событие, довыполнившись
-позже более нового, могло бы применить в CRM устаревшие данные ПОВЕРХ уже
-отправленных свежих. Task.sync_status/Subtask.sync_status в паре с этим
-ПЕРЕСЧИТЫВАЕТСЯ при каждом терминальном исходе (_refresh_sync_status), а не
-записывается условно, как раньше.
-
-Celery-задачи синхронные — src.celery_app.run_celery_task() оборачивает
-async-тело в свой asyncio.run(), освобождает пул соединений SQLAlchemy и
-закрывает общий httpx-клиент CRM сразу после (см. её докстринг — без этого
-второй и последующие вызовы в одном и том же Celery-воркере падают
-RuntimeError из-за переиспользования asyncpg-соединения/httpx-клиента от
-закрытого event loop; обнаружено живым прогоном docker compose up, не
-юнит-тестами). В тестах НЕ вызывать process_outbox_row/reconcile_*/.delay()
-напрямую как функцию из-под уже работающего event loop pytest-asyncio —
-asyncio.run() внутри уже запущенного loop бросает RuntimeError. Тесты вызывают
-_process_outbox_row_async(...)/_reconcile_*_async() напрямую (await), минуя
-синхронную Celery-обёртку, — см. tests/test_crm_outbox.py. Redis (Redlock,
-token-bucket) в тестах не поднимается — acquire_slot/shard_lock патчатся
-автоматической фикстурой в самом тестовом файле.
+Celery-задачи синхронные: src.celery_app.run_celery_task() оборачивает async-тело в asyncio.run().
+Тесты вызывают _process_outbox_row_async/_reconcile_*_async напрямую (await).
 """
 
+import asyncio
 import datetime
 import logging
 from typing import Any, Optional
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -99,38 +42,34 @@ from src.database import async_session_maker
 from src.task_logic.models import CrmOutbox, Subtask, Task
 from src.tasks.crm_rate_limit import acquire_slot
 from src.tasks.crm_shard_lock import shard_lock
-from src.utils.file_utils import UPLOAD_ROOT
+from src.utils.file_utils import UPLOAD_ROOT, parse_other_paths
 
 logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 5
 _PENDING_GRACE_SECONDS = 45
-# Пауза перед повтором неудачной строки: min(60·2^(attempts-1), 900) с
-# (60 → 120 → 240 → 480 с, потолок 15 мин). Отдельный механизм задержки
-# (countdown/ETA) не нужен: updated_at обновляется на каждом UPDATE строки
-# (onupdate=func.now()), в т.ч. при учёте очередной попытки. Реальная пауза
-# ограничена частотой тика reconcile (60 с) — минимум до минуты.
+# Пауза перед повтором: min(60·2^(attempts-1), 900) с. Реальная пауза ограничена тиком reconcile (60 с).
 _RETRY_BASE_DELAY_SECONDS = 60
 _RETRY_MAX_DELAY_SECONDS = 900
+# Строка с attempts == 0, которая не двигается (лимит CRM, более старое событие, зависимость), иначе
+# ставилась бы в очередь на каждом тике. dispatched_at хранит момент последней постановки;
+# ниже — минимальный интервал между ними.
+_STALLED_REDISPATCH_COOLDOWN_SECONDS = 300
+# Предел выборки за тик — не читать весь backlog в память.
+_RECONCILE_BATCH_LIMIT = 500
 LAST_ERROR_MAX_LEN = 1000
-_DEFAULT_SHARD = "shard_0"  # фолбэк для строки с NULL shard — не должно происходить
-                            # у корректно вставленных строк, но не должно и валить
-                            # reconcile-цикл целиком из-за одной аномальной строки
+_DEFAULT_SHARD = "shard_0"  # фолбэк для строки с NULL shard
 
 
 def _retry_delay_seconds(attempts: int) -> int:
-    """Сколько секунд строка с данным числом уже сделанных попыток должна
-    отлежаться в pending перед повторной постановкой в очередь. 0 попыток —
-    без паузы (только грейс-период created_at)."""
+    """Сколько секунд строка с данным числом попыток должна отлежаться перед повторной постановкой."""
     if attempts <= 0:
         return 0
     return min(_RETRY_BASE_DELAY_SECONDS * 2 ** (attempts - 1), _RETRY_MAX_DELAY_SECONDS)
 
 
 def _format_error(exc: BaseException) -> str:
-    """Текст для CrmOutbox.last_error: тип + сообщение, обрезано — ответ CRM
-    может содержать фрагменты данных задачи, а сообщение — быть произвольно
-    длинным."""
+    """Тип и сообщение ошибки для CrmOutbox.last_error, обрезанные по длине."""
     return f"{type(exc).__name__}: {exc}"[:LAST_ERROR_MAX_LEN]
 
 
@@ -140,18 +79,11 @@ _SYNC_STATUS_MODELS = {"task": Task, "subtask": Subtask}
 async def set_aggregate_sync_status(
     db: AsyncSession, row: CrmOutbox, status: str, *, only_from: Optional[tuple[str, ...]] = None,
 ) -> None:
-    """Task.sync_status / Subtask.sync_status агрегата этой outbox-строки
-    ('unsynced' | 'pending' | 'synced' | 'failed'). Агрегата уже может не
-    быть (удалён) — тогда ничего не делает. only_from — менять только если
-    текущее значение среди перечисленных.
+    """Задаёт Task/Subtask.sync_status агрегата; ничего не делает, если агрегата нет.
 
-    Единственный оставшийся вызывающий — admin-действие «Повторить»
-    (src/admin/outbox_admin.py): сбрасывает 'failed' обратно в 'pending' перед
-    повторной постановкой строки в очередь. Терминальные исходы (успех или
-    провал попытки) сам воркер больше не «записывает» этой функцией — см.
-    _refresh_sync_status ниже, которая ПЕРЕСЧИТЫВАЕТ статус из текущего
-    состояния событий сущности, а не устанавливает заданное значение
-    условно."""
+    only_from — менять, только если текущее значение среди перечисленных. Используется админ-действием
+    «Повторить»; воркер статус пересчитывает через _refresh_sync_status.
+    """
     model = _SYNC_STATUS_MODELS.get(row.aggregate_type)
     if model is None:
         return
@@ -164,17 +96,7 @@ async def set_aggregate_sync_status(
 
 
 async def _other_unfinished_events_exist(db: AsyncSession, row: CrmOutbox) -> bool:
-    """True, если у той же сущности (aggregate_type, aggregate_id) есть ДРУГАЯ
-    строка crm_outbox (id != row.id) со статусом 'pending' или 'blocked'.
-
-    Защита от преждевременного 'synced': два параллельных события одной
-    сущности (например, update #10 и update #11, оба pending) — если #10
-    завершится первым, set_aggregate_sync_status(..., only_from=("failed",
-    "pending")) сам по себе безусловно поставил бы 'synced', хотя #11 ещё не
-    выполнено. Эта проверка вызывается ПЕРЕД таким вызовом и не даёт пометить
-    сущность синхронизированной, пока остаются незавершённые события. 'done'
-    здесь не считается 'unfinished' — своё же событие row тоже не в счёт
-    (исключено через id != row.id)."""
+    """True, если у сущности есть другая строка (id != row.id) в статусе pending/blocked."""
     other = (
         await db.execute(
             select(CrmOutbox.id)
@@ -191,28 +113,11 @@ async def _other_unfinished_events_exist(db: AsyncSession, row: CrmOutbox) -> bo
 
 
 async def _has_older_unfinished(db: AsyncSession, row: CrmOutbox) -> bool:
-    """Есть ли у ТОЙ ЖЕ сущности (aggregate_type, aggregate_id) более старое
-    (id < row.id) событие, ещё не завершённое ('pending' или 'blocked').
+    """Есть ли у той же сущности более старое (id < row.id) незавершённое событие (pending/blocked).
 
-    Структурный запрет на обгон, а не проверка постфактум перед записью
-    статуса (как было раньше — см. историю в докстринге has_newer_done_sibling
-    ниже): событие просто не начинает попытку, пока порядок не восстановлен,
-    вместо того чтобы выполниться и разбираться с последствиями потом.
-    Топология деплоя (--pool=solo, concurrency=1 — src/docker-compose.yml) не
-    даёт двум ПРОЦЕССАМ читать одну очередь одновременно, но не гарантирует,
-    что ОДИН и тот же воркер обработает события строго по id: у строки с
-    паузой перед повтором (_retry_delay_seconds) есть окно, в которое более
-    новое событие той же сущности — поставленное в очередь сразу после
-    вставки, без всякой паузы — успевает пройти вперёд и завершиться раньше.
-
-    Без этой проверки устаревшее событие, довыполнившись позже, могло бы
-    применить в CRM старые данные ПОВЕРХ уже отправленных свежих — не только
-    испортить sync_status (это лечили два прежних патча — has_newer_done_
-    sibling в ветке провала и доведение sync_status до 'synced' на последней
-    попытке, — см. git-историю этого файла), но и реально перезаписать
-    актуальные данные в самой CRM. Эта проверка устраняет причину (сам обгон),
-    а не только её проявление в статусе — поэтому оба прежних патча стали не
-    нужны и удалены (см. _refresh_sync_status ниже)."""
+    Событие не начинает попытку, пока порядок не восстановлен: строка с паузой перед повтором иначе
+    пропустила бы вперёд более новое событие, и устаревшие данные перезаписали бы свежие в CRM.
+    """
     older = (
         await db.execute(
             select(CrmOutbox.id)
@@ -229,37 +134,12 @@ async def _has_older_unfinished(db: AsyncSession, row: CrmOutbox) -> bool:
 
 
 async def _refresh_sync_status(db: AsyncSession, row: CrmOutbox, *, failed: bool) -> None:
-    """Task.sync_status/Subtask.sync_status — не запись заданного значения, а
-    ПЕРЕСЧЁТ из текущего состояния событий сущности при каждом терминальном
-    исходе (row.status стал 'done' или 'failed'). Единая точка для ЛЮБОЙ
-    операции — create/update/delete/sync_files — а не только update/sync_files,
-    как было раньше: create ставил sync_status сам, внутри _do_create_task/
-    _do_create_subtask, теперь не ставит — эта функция делает то же самое за
-    него, тем же способом, что и для остальных операций.
+    """Пересчитывает sync_status агрегата при терминальном исходе строки (done/failed).
 
-    failed=True: статус безусловно 'failed'. Благодаря _has_older_unfinished
-    (см. её докстринг) в момент, когда СТАРШЕЕ событие сущности проваливается
-    окончательно, ни одно МЛАДШЕЕ событие той же сущности ещё не могло
-    выполниться — оно физически не начало бы попытку, пока это событие не
-    стало терминальным. Портить нечем — 'failed' здесь всегда честная картина
-    происходящего прямо сейчас, а не потенциальное затирание более свежего
-    'synced'.
-
-    failed=False: пересчитывается из _other_unfinished_events_exist — остались
-    ли у сущности другие незавершённые (pending/blocked) события. Если да —
-    'pending' (работа продолжается), если нет — 'synced'. Этим же путём статус
-    самостоятельно восстанавливается после более раннего 'failed' другого
-    события: как только ПОСЛЕДНИЙ незавершённый сосед (в т.ч. ранее
-    провалившийся) разрешается успехом, пересчёт видит «незавершённых больше
-    нет» и ставит 'synced' — без отдельного шага «довести до synced», который
-    раньше требовался специально для этого случая.
-
-    Агрегата уже может не быть — после 'delete' (обычный случай: сущность
-    удаляется на веб-стороне СИНХРОННО, до того как воркер вообще увидит
-    outbox-строку 'delete') или если её удалили конкурентно, пока воркер
-    обрабатывал более старое событие. db.get вернёт None — функция просто
-    ничего не делает, отдельная проверка row.operation != "delete" (как было
-    раньше) для этого не нужна."""
+    failed=True — 'failed'. Благодаря _has_older_unfinished более новое событие ещё не выполнялось,
+    поэтому затирать нечего. failed=False — 'pending', если остались незавершённые события, иначе 'synced'.
+    Агрегата может не быть (удалён) — тогда функция ничего не делает.
+    """
     model = _SYNC_STATUS_MODELS.get(row.aggregate_type)
     if model is None:
         return
@@ -273,24 +153,11 @@ async def _refresh_sync_status(db: AsyncSession, row: CrmOutbox, *, failed: bool
 
 
 async def has_newer_done_sibling(db: AsyncSession, row: CrmOutbox) -> bool:
-    """True, если у той же сущности (aggregate_type, aggregate_id) есть ДРУГАЯ
-    строка с БОЛЬШИМ id и статусом 'done' — то есть более позднее событие уже
-    успешно синхронизировалось с CRM.
+    """True, если у сущности есть строка с большим id в статусе 'done'.
 
-    Используется в admin-действии «Повторить» (src/admin/outbox_admin.py) —
-    не переставлять в очередь failed-строку, которую перекрыло более новое
-    успешное событие (иначе повтор применил бы устаревшие данные поверх уже
-    отправленных в CRM свежих). Актуально именно для РУЧНОГО повтора: к
-    моменту, когда администратор решает вернуть в очередь уже терминальную
-    ('failed') строку, _has_older_unfinished её больше не защищает — тот
-    запрет действует только пока строка сама ещё не завершилась, а тут она
-    уже давно завершилась (неудачей) и с тех пор порядок никем не
-    контролируется.
-
-    До этой правки та же функция использовалась ЕЩЁ и в самом воркере — как
-    заплатка поверх отсутствовавшего структурного запрета на обгон (см.
-    докстринг _has_older_unfinished и _refresh_sync_status). Теперь обгон
-    невозможен в принципе, поэтому там эта проверка была удалена."""
+    Нужна админ-действию «Повторить»: не повторять failed-строку, которую перекрыло более новое успешное
+    событие, иначе устаревшие данные перезапишут свежие.
+    """
     newer = (
         await db.execute(
             select(CrmOutbox.id)
@@ -307,11 +174,11 @@ async def has_newer_done_sibling(db: AsyncSession, row: CrmOutbox) -> bool:
 
 
 async def _lock_entity(db: AsyncSession, model, entity_id: int):
-    """SELECT ... FOR NO KEY UPDATE строки агрегата (Task/Subtask); None, если
-    её уже нет (удалена конкурентно). Веб-сторона удаления берёт FOR UPDATE на
-    ту же строку — они конфликтуют, поэтому запись crm_*_id и удаление
-    сериализуются. populate_existing: объект мог быть загружен в сессию ДО
-    CRM-вызова — без него вернулось бы устаревшее состояние из identity map."""
+    """SELECT ... FOR NO KEY UPDATE строки агрегата; None, если её уже нет.
+
+    Удаление на веб-стороне берёт FOR UPDATE на ту же строку, поэтому запись crm_*_id и удаление
+    сериализуются. populate_existing — чтобы не получить устаревший объект из identity map.
+    """
     return (
         await db.execute(
             select(model)
@@ -323,11 +190,9 @@ async def _lock_entity(db: AsyncSession, model, entity_id: int):
 
 
 async def _compensate_orphan(db: AsyncSession, row: CrmOutbox, aggregate_type: str, crm_id: int) -> None:
-    """Агрегат удалён локально, пока воркер создавал его в CRM: запись только
-    что создана нами и никем не учтена (web-стороне её crm_id на момент
-    удаления был неизвестен, delete-событие не ставилось) — удаляем сразу. При
-    сбое CRM ставим обычную строку 'delete' в crm_outbox (коммитится вместе с
-    исходной строкой), дальше её ведёт штатный retry/reconcile."""
+    """Агрегат удалён, пока воркер создавал его в CRM: созданная запись никем не учтена — удаляем сразу.
+    При сбое CRM ставим обычную строку 'delete' (коммитится вместе с исходной).
+    """
     try:
         if aggregate_type == "task":
             await TaskManager().delete_task(crm_id)
@@ -354,32 +219,19 @@ async def _compensate_orphan(db: AsyncSession, row: CrmOutbox, aggregate_type: s
         )
 
 
-def dispatch_outbox_row(row: CrmOutbox) -> None:
-    """Ставит только что вставленную (и закоммиченную) outbox-строку в очередь
-    её шарда сразу же — вызывается продюсерами (services/tasks.py,
-    services/subtasks.py, services/attachments.py) сразу после db.commit(),
-    ЗАМЕНЯЯ прежнюю синхронную best-effort попытку вызвать CRM прямо внутри
-    HTTP-запроса. CRM-вызов теперь выполняется исключительно в Celery-воркере
-    (process_outbox_row), а не в веб-процессе — это и убирает CRM-латентность
-    из ответа пользователю, и не требует отдельной синхронной попытки: в
-    типовом случае воркер простаивает и подхватывает задачу практически
-    мгновенно.
+async def dispatch_outbox_row(row: CrmOutbox) -> None:
+    """Ставит закоммиченную outbox-строку в очередь её шарда.
 
-    Не более чем оптимизация задержки — не механизм надёжности: если сам
-    apply_async не успеет выполниться (падение процесса между commit и этим
-    вызовом) или Celery/Redis временно недоступны, строка остаётся 'pending' и
-    её всё равно найдёт и повторно поставит в очередь reconcile_pending_outbox
-    (Celery Beat) на следующем тике — см. докстринг модуля.
-
-    Именно поэтому исключение из apply_async (например, брокер Redis временно
-    недоступен) здесь ПЕРЕХВАТЫВАЕТСЯ, а не улетает наверх: строка к этому
-    моменту уже закоммичена в PostgreSQL — реальная потеря данных невозможна,
-    а необработанное исключение здесь превратило бы уже состоявшееся успешное
-    изменение (задача/подзадача создана и сохранена) в ложный HTTP 500 для
-    пользователя, будто ничего не сохранилось.
+    Это оптимизация задержки, а не механизм надёжности: при сбое строку подхватит
+    reconcile_pending_outbox. Исключение apply_async перехватывается — строка уже в БД, а 500 ввёл бы
+    пользователя в заблуждение. apply_async синхронный и блокирующий, поэтому вызывается через
+    asyncio.to_thread, чтобы недоступный Redis не замораживал event loop.
     """
     try:
-        process_outbox_row.apply_async(args=[row.id], queue=f"crm_sync.{row.shard or _DEFAULT_SHARD}")
+        await asyncio.to_thread(
+            process_outbox_row.apply_async,
+            args=[row.id], queue=f"crm_sync.{row.shard or _DEFAULT_SHARD}",
+        )
     except Exception as exc:
         logger.warning(
             "crm_outbox id=%s: немедленный диспатч не удался (%s) — строка остаётся "
@@ -387,25 +239,19 @@ def dispatch_outbox_row(row: CrmOutbox) -> None:
         )
 
 
-# ── Обработчики: Task ────────────────────────────────────────────────────────────
-
 async def _do_create_task(db: AsyncSession, row: CrmOutbox) -> None:
-    """Идемпотентный retry: сначала ищем уже созданную запись (find_task,
-    эвристика title+description — см. её докстринг), чтобы повторная попытка
-    после сбоя между "CRM создала запись" и "мы записали crm_task_id" не
-    создала дубликат. Task.crm_task_id обновляется здесь же — в отличие от
-    update/delete/sync_files, 'create' не может унаследовать crm_task_id из
-    своего payload (его ещё не существовало на момент вставки). sync_status
-    здесь не трогается — см. _refresh_sync_status.
+    """Идемпотентный create: сначала ищем запись по Local ID (find_task), чтобы повтор после сбоя между
+    созданием в CRM и записью crm_task_id не создал дубликат. sync_status не трогаем.
     """
     payload = row.payload
     mgr = TaskManager()
-    found = await mgr.find_task(payload["title"], payload["description"])
+    found = await mgr.find_task(row.aggregate_id)
     created_here = found is None
     if found is not None:
         crm_id = found.get("id")
     else:
         result = await mgr.create_task(
+            local_id=row.aggregate_id,
             title=payload["title"], description=payload["description"],
             completed=payload.get("completed", False), project=payload.get("project"),
             creator_email=payload.get("creator_email"),
@@ -413,65 +259,77 @@ async def _do_create_task(db: AsyncSession, row: CrmOutbox) -> None:
         crm_id = result.get("id")
     crm_id = int(crm_id) if crm_id is not None else None
 
-    # Блокировка ПОСЛЕ CRM-вызова (см. докстринг модуля): либо мы успеваем
-    # записать crm_task_id, и конкурентный delete_task дождётся commit'а и
-    # увидит его, либо удаление опередило нас — тогда запись в CRM сирота.
+    # Блокировка после CRM-вызова: либо мы успеваем записать crm_task_id и delete_task увидит его,
+    # либо удаление опередило нас и запись в CRM — сирота.
     task = await _lock_entity(db, Task, row.aggregate_id)
     if task is None:
         if crm_id is not None and created_here:
             await _compensate_orphan(db, row, "task", crm_id)
         elif crm_id is not None:
-            # Запись найдена эвристикой find_task (title+description), а не
-            # создана нами в этой попытке — может принадлежать другой задаче;
-            # удалять её вслепую нельзя.
+            # Запись найдена по Local ID, а не создана этой попыткой — вслепую не удаляем.
             logger.warning(
                 "crm_outbox id=%s: task id=%s удалён локально, найденная в CRM запись crm_id=%s НЕ удалена "
                 "(создана не этой попыткой) — проверить вручную", row.id, row.aggregate_id, crm_id,
             )
         return
-    task.crm_task_id = crm_id
-    # sync_status здесь больше не ставится — _refresh_sync_status в конце
-    # _process_outbox_row_async делает это единообразно для всех операций.
     if crm_id is None:
         raise Exception("CRM create_task retry: no valid id in response")
+    # Проверка владельца до присваивания (не полагаемся на IntegrityError, чтобы не оставить транзакцию
+    # aborted). Структурно конфликт невозможен — защита от ошибок конфигурации CRM.
+    conflicting_owner = (
+        await db.execute(
+            select(Task.id).where(Task.crm_task_id == crm_id, Task.id != row.aggregate_id)
+        )
+    ).scalar_one_or_none()
+    if conflicting_owner is not None:
+        raise Exception(
+            f"find_task: crm_id={crm_id} уже принадлежит task id={conflicting_owner} — "
+            f"усыновление отклонено, проверить вручную"
+        )
+    task.crm_task_id = crm_id
 
 
 async def _do_sync_files_task(db: AsyncSession, row: CrmOutbox) -> None:
+    """«По состоянию»: payload несёт только флаги слотов (sync_specification/sync_other_files), пути файлов
+    читаются из Task в момент обработки — файл мог быть заменён, пока строка стояла в очереди.
+    Если задачи уже нет — выходим без обращения к CRM.
+    """
+    task = await db.get(Task, row.aggregate_id)
+    if task is None:
+        return
+
     payload = row.payload
     crm_task_id = payload.get("crm_task_id")
     if crm_task_id is None:
-        # 'create' на момент вставки этой строки ещё не выполнялся синхронно
-        # (весь create теперь тоже идёт через outbox) — depends_on_event_id
-        # гарантирует, что к этому моменту создание уже done, поэтому читаем
-        # актуальный crm_task_id из уже обновлённой записи Task, а не из
-        # своего (заведомо пустого на момент вставки) payload.
-        task = await db.get(Task, row.aggregate_id)
-        crm_task_id = task.crm_task_id if task is not None else None
+        # Для зависимой строки create уже done — берём актуальный crm_task_id из Task.
+        crm_task_id = task.crm_task_id
         if crm_task_id is None:
             raise Exception("sync_files retry: task still has no crm_task_id")
 
-    spec_path = payload.get("specification_path")
-    # "other_file_paths" отсутствует в payload → None (не трогать это поле в CRM);
-    # ключ есть, но [] → явная очистка; ключ есть и непустой список → полная замена.
-    # Раньше `payload.get(...) or []` схлопывало отсутствие ключа и [] в одно и то
-    # же значение — годилось только для create-флоу (там нечего было чистить), но
-    # ломало бы attachments.py::delete_other_file (там [] означает «удалить все
-    # файлы», а не «не трогать»).
-    other_paths = payload.get("other_file_paths")
+    sync_spec = payload.get("sync_specification", False)
     await TaskManager().update_task(
         task_id=crm_task_id,
-        specification_abs_path=(UPLOAD_ROOT / spec_path) if spec_path else None,
-        clear_specification=payload.get("clear_specification", False),
+        specification_abs_path=(UPLOAD_ROOT / task.specification_path) if (sync_spec and task.specification_path) else None,
+        clear_specification=bool(sync_spec and not task.specification_path),
         other_file_abs_paths=(
-            [UPLOAD_ROOT / p for p in other_paths] if other_paths is not None else None
+            [UPLOAD_ROOT / p for p in parse_other_paths(task.other_file_paths)]
+            if payload.get("sync_other_files", False) else None
         ),
     )
 
 
 async def _do_update_task(db: AsyncSession, row: CrmOutbox) -> None:
     payload = row.payload
+    crm_task_id = payload.get("crm_task_id")
+    if crm_task_id is None:
+        task = await db.get(Task, row.aggregate_id)
+        if task is None:
+            return
+        crm_task_id = task.crm_task_id
+        if crm_task_id is None:
+            raise Exception("update retry: task still has no crm_task_id")
     await TaskManager().update_task(
-        task_id=payload["crm_task_id"],
+        task_id=crm_task_id,
         title=payload.get("title"),
         description=payload.get("description"),
         completed=payload.get("completed"),
@@ -480,16 +338,7 @@ async def _do_update_task(db: AsyncSession, row: CrmOutbox) -> None:
 
 
 async def _do_delete_task(db: AsyncSession, row: CrmOutbox) -> None:
-    """Известное ограничение — исправлено: CRMRecordNotFoundError (запись уже
-    отсутствует в CRM, см. client.py) перехватывается ОТДЕЛЬНО для каждого
-    удаляемого id — «уже удалено» здесь означает, что цель достигнута, а не
-    сбой. Раньше (голый Exception без различения причины) повтор удаления
-    после частичного успеха (часть подзадач удалена, остальные — нет) мог
-    списывать уже достигнутую цель в очередную неудачную попытку и без конца
-    наращивать attempts, даже когда реального сбоя больше нет — см. историю
-    этого файла до фикса. Настоящие сбои (сеть, таймаут, невалидный ответ)
-    остаются реальным сбоем — CRMRecordNotFoundError их не перехватывает.
-    """
+    """Идемпотентное удаление: CRMRecordNotFoundError по отдельному id означает «уже удалено», а не сбой."""
     payload = row.payload
     crm_task_id = payload.get("crm_task_id")
     crm_subtask_ids = payload.get("crm_subtask_ids") or []
@@ -505,25 +354,15 @@ async def _do_delete_task(db: AsyncSession, row: CrmOutbox) -> None:
             logger.info("crm_outbox id=%s: task crm_id=%s уже отсутствует в CRM — цель достигнута", row.id, crm_task_id)
 
 
-# ── Обработчики: Subtask ─────────────────────────────────────────────────────────
-
 async def _do_create_subtask(db: AsyncSession, row: CrmOutbox) -> None:
-    """Симметрично _do_create_task. Родитель Task должен быть уже
-    синхронизирован (depends_on_event_id на create-событие Task гарантирует
-    это при межагрегатной зависимости — см. докстринг модуля) — читаем
-    parent_item_id из АКТУАЛЬНОЙ записи Task, не из payload (тот же принцип,
-    что и в _do_sync_files_task).
+    """Симметрично _do_create_task. Родитель уже синхронизирован (зависимость на его create);
+    parent_item_id читаем из актуальной записи Task, а не из payload.
     """
     payload = row.payload
     subtask = await db.get(Subtask, row.aggregate_id)
     if subtask is None:
-        # Подзадача уже удалена локально (delete_subtask/каскад delete_task
-        # опередил этот retry) — известное ограничение, симметричное
-        # _do_delete_task: без служебного поля в CRM нет надёжного способа
-        # найти и подчистить возможную сироту, оставленную не успевшим
-        # завершиться create. Не бросаем — дальше в очереди для этого
-        # aggregate_id может стоять свой 'delete', который сам не найдёт что
-        # удалять и корректно завершится через CRMRecordNotFoundError выше.
+        # Подзадача удалена локально раньше retry — найти возможную сироту в CRM нечем. Не бросаем:
+        # своя строка 'delete' корректно завершится через CRMRecordNotFoundError.
         logger.warning(
             "crm_outbox id=%s: subtask id=%s больше не существует локально — create retry пропущен",
             row.id, row.aggregate_id,
@@ -534,20 +373,19 @@ async def _do_create_subtask(db: AsyncSession, row: CrmOutbox) -> None:
         raise Exception("create_subtask retry: parent task not yet synced with CRM")
 
     mgr = SubtaskManager()
-    found = await mgr.find_subtask(payload["title"], payload["description"])
+    found = await mgr.find_subtask(row.aggregate_id)
     created_here = found is None
     if found is not None:
         crm_id = found.get("id")
     else:
         result = await mgr.create_subtask(
-            parent_item_id=task.crm_task_id, title=payload["title"],
+            parent_item_id=task.crm_task_id, local_id=row.aggregate_id, title=payload["title"],
             description=payload["description"], completed=payload.get("completed", False),
             creator_email=payload.get("creator_email"),
         )
         crm_id = result.get("id")
     crm_id = int(crm_id) if crm_id is not None else None
 
-    # См. _do_create_task: блокировка строки ПОСЛЕ CRM-вызова, компенсация сироты.
     subtask = await _lock_entity(db, Subtask, row.aggregate_id)
     if subtask is None:
         if crm_id is not None and created_here:
@@ -558,39 +396,59 @@ async def _do_create_subtask(db: AsyncSession, row: CrmOutbox) -> None:
                 "(создана не этой попыткой) — проверить вручную", row.id, row.aggregate_id, crm_id,
             )
         return
-    subtask.crm_subtask_id = crm_id
-    # sync_status здесь больше не ставится — см. _do_create_task выше.
     if crm_id is None:
         raise Exception("CRM create_subtask retry: no valid id in response")
+    # Проверка владельца до присваивания — см. _do_create_task.
+    conflicting_owner = (
+        await db.execute(
+            select(Subtask.id).where(Subtask.crm_subtask_id == crm_id, Subtask.id != row.aggregate_id)
+        )
+    ).scalar_one_or_none()
+    if conflicting_owner is not None:
+        raise Exception(
+            f"find_subtask: crm_id={crm_id} уже принадлежит subtask id={conflicting_owner} — "
+            f"усыновление отклонено, проверить вручную"
+        )
+    subtask.crm_subtask_id = crm_id
 
 
 async def _do_sync_files_subtask(db: AsyncSession, row: CrmOutbox) -> None:
+    """Симметрично _do_sync_files_task."""
+    subtask = await db.get(Subtask, row.aggregate_id)
+    if subtask is None:
+        return
+
     payload = row.payload
     crm_subtask_id = payload.get("crm_subtask_id")
     if crm_subtask_id is None:
-        subtask = await db.get(Subtask, row.aggregate_id)
-        crm_subtask_id = subtask.crm_subtask_id if subtask is not None else None
+        crm_subtask_id = subtask.crm_subtask_id
         if crm_subtask_id is None:
             raise Exception("sync_files retry: subtask still has no crm_subtask_id")
 
-    spec_path = payload.get("specification_path")
-    # См. пояснение в _do_sync_files_task выше: отсутствие ключа → None (не
-    # трогать), [] → явная очистка, непустой список → полная замена.
-    other_paths = payload.get("other_file_paths")
+    sync_spec = payload.get("sync_specification", False)
     await SubtaskManager().update_subtask(
         subtask_id=crm_subtask_id,
-        specification_abs_path=(UPLOAD_ROOT / spec_path) if spec_path else None,
-        clear_specification=payload.get("clear_specification", False),
+        specification_abs_path=(UPLOAD_ROOT / subtask.specification_path) if (sync_spec and subtask.specification_path) else None,
+        clear_specification=bool(sync_spec and not subtask.specification_path),
         other_file_abs_paths=(
-            [UPLOAD_ROOT / p for p in other_paths] if other_paths is not None else None
+            [UPLOAD_ROOT / p for p in parse_other_paths(subtask.other_file_paths)]
+            if payload.get("sync_other_files", False) else None
         ),
     )
 
 
 async def _do_update_subtask(db: AsyncSession, row: CrmOutbox) -> None:
     payload = row.payload
+    crm_subtask_id = payload.get("crm_subtask_id")
+    if crm_subtask_id is None:
+        subtask = await db.get(Subtask, row.aggregate_id)
+        if subtask is None:
+            return
+        crm_subtask_id = subtask.crm_subtask_id
+        if crm_subtask_id is None:
+            raise Exception("update retry: subtask still has no crm_subtask_id")
     await SubtaskManager().update_subtask(
-        subtask_id=payload["crm_subtask_id"],
+        subtask_id=crm_subtask_id,
         title=payload.get("title"),
         description=payload.get("description"),
         completed=payload.get("completed"),
@@ -598,9 +456,7 @@ async def _do_update_subtask(db: AsyncSession, row: CrmOutbox) -> None:
 
 
 async def _do_delete_subtask(db: AsyncSession, row: CrmOutbox) -> None:
-    """Удаление ОДНОЙ подзадачи напрямую (DELETE /subtasks/{id}) — отдельно от
-    _do_delete_task, которая обрабатывает каскадное удаление всех подзадач
-    ВМЕСТЕ с родительской задачей. Та же идемпотентность, что и там."""
+    """Удаление одной подзадачи (DELETE /subtasks/{id}); та же идемпотентность, что в _do_delete_task."""
     crm_subtask_id = row.payload.get("crm_subtask_id")
     if crm_subtask_id is None:
         return
@@ -638,15 +494,11 @@ async def _process_outbox_row_async(outbox_id: int) -> None:
             await db.execute(select(CrmOutbox).where(CrmOutbox.id == outbox_id))
         ).scalar_one_or_none()
         if row is None or row.status == "done":
-            # Уже обработана синхронной попыткой из исходного запроса раньше,
-            # чем эта задача успела выполниться — не повторная отправка в CRM.
+            # Уже обработана синхронной попыткой.
             return
 
         if await _has_older_unfinished(db, row):
-            # Структурный запрет на обгон — см. докстринг _has_older_unfinished.
-            # Попытка не тратится, статус не трогается: следующий тик
-            # reconcile_pending_outbox найдёт строку снова, когда более старое
-            # событие этой же сущности к тому моменту уже станет терминальным.
+            # Есть более старое незавершённое событие сущности: попытка не тратится, строку найдёт следующий тик.
             logger.info(
                 "crm_outbox id=%s: у сущности есть более старое незавершённое событие — ждём",
                 outbox_id,
@@ -663,8 +515,7 @@ async def _process_outbox_row_async(outbox_id: int) -> None:
                         "crm_outbox id=%s: событие-зависимость id=%s провалилось — переведена в blocked",
                         outbox_id, row.depends_on_event_id,
                     )
-                # pending/processing/blocked зависимость — эта строка остаётся
-                # как есть, следующий тик reconcile найдёт её снова.
+                # Зависимость ещё не done — строку найдёт следующий тик reconcile.
                 return
 
         handlers = _HANDLERS_BY_AGGREGATE.get(row.aggregate_type)
@@ -676,9 +527,7 @@ async def _process_outbox_row_async(outbox_id: int) -> None:
             return
 
         if not await acquire_slot():
-            # Лимит запросов к CRM исчерпан на эту секунду — не тратим попытку
-            # (attempts не растёт); строка остаётся pending, её переставит в
-            # очередь ближайший тик reconcile_pending_outbox.
+            # Лимит запросов к CRM исчерпан — попытка не тратится, строку переставит следующий тик.
             logger.info("crm_outbox id=%s: отложена — лимит запросов к CRM исчерпан", outbox_id)
             return
 
@@ -707,16 +556,31 @@ async def _process_outbox_row_async(outbox_id: int) -> None:
                 )
 
         if row.status in ("done", "failed"):
-            # Единая точка пересчёта sync_status для ЛЮБОЙ операции — см.
-            # докстринг _refresh_sync_status. Раньше здесь стояли два патча
-            # (has_newer_done_sibling в ветке провала + доведение до 'synced'
-            # на последней попытке) — оба больше не нужны: _has_older_unfinished
-            # выше делает обгон структурно невозможным, поэтому пересчёт по
-            # факту не может затереть более свежий 'synced' устаревшим
-            # 'failed', а более раннее 'failed' само рассосётся, как только
-            # разрешится последнее незавершённое событие сущности.
+            # Единая точка пересчёта sync_status для любой операции.
             await _refresh_sync_status(db, row, failed=(row.status == "failed"))
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError as exc:
+            # Частичный уникальный индекс по crm_*_id может сработать здесь: проверка владельца выше не
+            # транзакционная, и конкурентный commit другого шарда мог занять тот же id. Это неретраебельный сбой:
+            # повтор упадёт так же, поэтому помечаем строку failed. Остальные сбои commit (сеть, пул, таймаут)
+            # преходящи — для них строка остаётся pending.
+            #
+            # db.refresh(row): после rollback() объект expired, а синхронное чтение атрибута в async-сессии
+            # бросило бы MissingGreenlet.
+            await db.rollback()
+            await db.refresh(row)
+            row.attempts += 1
+            row.status = "failed"
+            row.last_error = _format_error(exc)
+            logger.error(
+                "crm_outbox id=%s (%s/%s): commit упал с IntegrityError — вероятно, "
+                "конкурентная гонка на уникальном индексе crm_task_id/crm_subtask_id "
+                "помечена failed вместо тихого бесконечного retry: %s",
+                outbox_id, row.aggregate_type, row.operation, exc,
+            )
+            await _refresh_sync_status(db, row, failed=True)
+            await db.commit()
 
 
 @celery_app.task(name="src.tasks.crm_outbox_tasks.process_outbox_row")
@@ -725,34 +589,48 @@ def process_outbox_row(outbox_id: int) -> None:
 
 
 async def _reconcile_pending_outbox_async(dispatch=None) -> list[int]:
-    """dispatch — функция постановки одной строки в очередь повторно, вызывается
-    как dispatch(outbox_id) (без аргумента шарда — тесты подставляют свою
-    однопараметрическую функцию, например list.append, чтобы проверить сам
-    ВЫБОР строк без реального похода в Celery/CRM). Настоящий путь (dispatch
-    не передан) сам решает очередь по row.shard, читая его вместе с id одним
-    запросом — apply_async(..., queue=...) — а не через dispatch."""
+    """dispatch(outbox_id) ставит строку в очередь повторно; тесты подставляют свою функцию (например,
+    list.append), чтобы проверить выбор строк без Celery. Без dispatch очередь выбирается по row.shard.
+    """
     now = datetime.datetime.now(datetime.timezone.utc)
     threshold = now - datetime.timedelta(seconds=_PENDING_GRACE_SECONDS)
     async with async_session_maker() as db:
         candidates = (
             await db.execute(
-                select(CrmOutbox.id, CrmOutbox.shard, CrmOutbox.attempts, CrmOutbox.updated_at)
+                select(
+                    CrmOutbox.id, CrmOutbox.shard, CrmOutbox.attempts,
+                    CrmOutbox.updated_at, CrmOutbox.dispatched_at,
+                )
                 .where(CrmOutbox.status == "pending", CrmOutbox.created_at < threshold)
                 .order_by(CrmOutbox.created_at)
+                .limit(_RECONCILE_BATCH_LIMIT)
             )
         ).all()
 
-    # Экспоненциальная пауза после неудачной попытки: строка с attempts > 0
-    # берётся, только когда с её последнего UPDATE прошло не меньше
-    # _retry_delay_seconds(attempts). Строки без попыток (attempts == 0, в т.ч.
-    # отложенные rate-limit'ом) — только грейс-период.
-    rows = [
-        (outbox_id, shard) for outbox_id, shard, attempts, updated_at in candidates
-        if attempts <= 0
-        or (now - updated_at).total_seconds() >= _retry_delay_seconds(attempts)
-    ]
+        # attempts > 0: берём, когда с последнего UPDATE прошло _retry_delay_seconds(attempts).
+        # attempts == 0: ограничено _STALLED_REDISPATCH_COOLDOWN_SECONDS с момента dispatched_at.
+        rows = [
+            (outbox_id, shard) for outbox_id, shard, attempts, updated_at, dispatched_at in candidates
+            if (
+                attempts > 0
+                and (now - updated_at).total_seconds() >= _retry_delay_seconds(attempts)
+            )
+            or (
+                attempts <= 0
+                and (
+                    dispatched_at is None
+                    or (now - dispatched_at).total_seconds() >= _STALLED_REDISPATCH_COOLDOWN_SECONDS
+                )
+            )
+        ]
 
-    ids = [r[0] for r in rows]
+        ids = [r[0] for r in rows]
+        if ids:
+            await db.execute(
+                update(CrmOutbox).where(CrmOutbox.id.in_(ids)).values(dispatched_at=now)
+            )
+            await db.commit()
+
     for outbox_id, shard in rows:
         if dispatch is not None:
             dispatch(outbox_id)
@@ -769,10 +647,9 @@ def reconcile_pending_outbox() -> None:
 
 
 async def _reconcile_blocked_outbox_async() -> list[int]:
-    """Переводит 'blocked' обратно в 'pending', если событие-зависимость с тех
-    пор стало 'done'. Не диспетчеризует напрямую — разблокированная строка
-    попадёт в обычную выборку reconcile_pending_outbox на следующем тике
-    (created_at у неё уже гарантированно старше грейс-периода)."""
+    """Переводит 'blocked' в 'pending', если зависимость стала 'done'; в очередь строку поставит
+    следующий тик reconcile_pending_outbox.
+    """
     unblocked: list[int] = []
     async with async_session_maker() as db:
         blocked_rows = (
@@ -797,36 +674,16 @@ def reconcile_blocked_outbox() -> None:
     run_celery_task(_reconcile_blocked_outbox_async())
 
 
-_CLEANUP_BATCH = 1000  # строк за одну транзакцию — не держит долгую блокировку
-                       # таблицы, пока веб-процесс параллельно вставляет новые строки
+_CLEANUP_BATCH = 1000  # строк за транзакцию — без долгой блокировки таблицы
 
 
 async def _cleanup_done_outbox_async(retention_days: Optional[int] = None) -> int:
-    """Удаляет старые 'done'-строки crm_outbox — иначе таблица растёт
-    бесконечно: каждое изменение задачи/подзадачи добавляет строку, а
-    'done'-строки сами по себе никогда не удаляются. failed/blocked/pending
-    не трогаются НИКОГДА — это активные записи или требующие внимания.
+    """Удаляет старые 'done'-строки crm_outbox; failed/blocked/pending не трогает.
 
-    retention_days=None читает актуальное crm_settings.OUTBOX_RETENTION_DAYS —
-    не кэшируется в module-level константу, тот же приём, что и
-    src/tasks/sharding.py::shard_names(count) — тесты передают своё значение
-    без monkeypatch/reload.
-
-    Исключение по зависимости: depends_on_event_id — self-FK
-    (fk_crm_outbox_depends_on_event_id, alembic 0017, ON DELETE не указан →
-    Postgres RESTRICT). Строка, на которую ещё ссылается depends_on_event_id
-    какой-то другой (ещё не удалённой) строки, из выборки исключается явно —
-    без этого DELETE упал бы с IntegrityError на уровне БД (сама по себе
-    защита FK не даёт испортить целостность, но заранее исключать такие строки
-    дешевле, чем ловить ошибку транзакции). Цепочка «create → update»
-    съедается с конца: пока потомок (например, update, ссылающийся на своё же
-    create) не удалён, родитель остаётся занят чужой ссылкой и не попадёт в
-    выборку; на следующем прогоне, когда потомка уже нет, родитель удалится
-    тоже.
-
-    Батчами по _CLEANUP_BATCH, каждая пачка — отдельная транзакция (свой
-    async with async_session_maker()); последняя пачка меньше _CLEANUP_BATCH —
-    сигнал остановиться. Возвращает суммарное число удалённых строк.
+    retention_days=None читает актуальный crm_settings.OUTBOX_RETENTION_DAYS. Строки, на которые ещё
+    ссылается depends_on_event_id (self-FK, RESTRICT), пропускаются: цепочка create → update удаляется
+    с конца за несколько прогонов. Работает батчами по _CLEANUP_BATCH, каждая в своей транзакции;
+    возвращает число удалённых строк.
     """
     days = retention_days if retention_days is not None else crm_settings.OUTBOX_RETENTION_DAYS
     threshold = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)

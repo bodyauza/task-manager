@@ -10,52 +10,16 @@ from src.crm.crm_config import crm_settings
 
 logger = logging.getLogger(__name__)
 
-# Разделяемый клиент на уровне МОДУЛЯ, а не класса — Module-level Singleton:
-# Python кеширует модуль в sys.modules и выполняет его тело один раз при первом
-# импорте, поэтому переменная модуля неявно разделяется между всеми, кто его
-# импортирует, — без classmethod'ов и без hasattr-проверок. Новый TCP-пул и
-# TLS-хендшейк при каждом запросе (как в async with AsyncClient()) обходятся
-# в ~10–20 мс накладных расходов; один AsyncClient переиспользует HTTP/1.1
-# keep-alive соединения между вызовами.
-#
-# Раньше это был Classic Singleton на уровне класса (cls._http = ... внутри
-# classmethod на CRMClient — тот же принцип, что и типовой __new__ + hasattr/
-# is None). Такой синглтон надёжен, только если первым инстанцируется сам
-# базовый класс: тогда атрибут пишется в его __dict__, и подклассы находят его
-# обычным lookup по MRO. Но CRMClient никогда не инстанцируется напрямую —
-# используются только TaskManager и SubtaskManager.
-# Присваивание через cls внутри classmethod пишет атрибут
-# в __dict__ ТОГО класса, что передан как cls, а не мутирует атрибут родителя —
-# значит первый же вызов _get_client() у каждого из подклассов заводил
-# свой собственный httpx.AsyncClient, а CRMClient._http так и оставался None,
-# потому что ни один подкласс не писал в него напрямую. Итог —
-# независимые TCP-пулы вместо одного разделяемого (проверено эмпирически:
-# TaskManager()._get_client() is not SubtaskManager()._get_client() → True).
-#
-# Module-level singleton этой проблемы не имеет: здесь нет иерархии классов,
-# которая могла бы затенить переменную, — она одна на модуль независимо от
-# того, через какой класс к ней обращаются.
+# Один httpx.AsyncClient на модуль (а не на класс): иначе каждый подкласс CRMClient заводил бы свой TCP-пул.
 _shared_http_client: httpx.AsyncClient | None = None
 
 
 def _get_shared_http_client() -> httpx.AsyncClient:
     global _shared_http_client
     if _shared_http_client is None:
-        # timeout=30.0 (единый float) не подходит: httpx разворачивает его в
-        # ЧЕТЫРЕ независимых бюджета — connect/write/read/pool (см.
-        # src/tasks/crm_shard_lock.py, где эта механика разобрана подробно).
-        # Файловые операции (_file_to_crm ниже) передают файл до MAX_FILE_SIZE=
-        # 100 МБ (src/utils/file_utils.py) закодированным в base64 (~+33% объёма,
-        # до ~133 МБ) одним JSON-телом — на медленном канале или при долгой
-        # обработке большого поля на стороне CRM 30 секунд на фазу write или read
-        # легко не хватает: воспроизведено на реальном файле 93.6 МБ — httpx падал
-        # с TimeoutException, в crm_outbox.last_error оседало "CRM request timed
-        # out", sync_status оставался pending до исчерпания 5 попыток. connect/pool
-        # оставлены на 30 — там таймаут не наблюдался (быстрый TCP/TLS-хендшейк;
-        # воркер обрабатывает CRM-вызовы строго последовательно, --pool=solo,
-        # конкуренции за пул соединений внутри процесса нет). Смена этого значения
-        # требует пересчитать src/tasks/crm_shard_lock.py::_LOCK_TIMEOUT_SECONDS —
-        # оба числа рассчитаны от одного и того же худшего сценария.
+        # Единый timeout=30 httpx разворачивает в четыре бюджета (connect/write/read/pool). Файловые операции
+        # шлют до ~133 МБ base64 одним телом, поэтому write/read увеличены; connect/pool остаются 30 с.
+        # При смене значений пересчитать src/tasks/crm_shard_lock.py::_LOCK_TIMEOUT_SECONDS.
         _shared_http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=30.0, write=120.0, read=120.0, pool=30.0)
         )
@@ -63,10 +27,7 @@ def _get_shared_http_client() -> httpx.AsyncClient:
 
 
 async def aclose_http_client() -> None:
-    """Закрывает разделяемый CRM-клиент. Вызывается из lifespan() в main.py при shutdown.
-
-    Без этого TCP-соединения из пула AsyncClient остаются открытыми до завершения процесса.
-    """
+    """Закрывает разделяемый CRM-клиент (из lifespan при shutdown)."""
     global _shared_http_client
     if _shared_http_client is not None:
         await _shared_http_client.aclose()
@@ -74,216 +35,42 @@ async def aclose_http_client() -> None:
 
 
 class CRMRecordNotFoundError(Exception):
-    """update/delete с expect_id=True над записью, которой в CRM уже нет
-    (удалена вручную через веб-интерфейс CRM, либо предыдущая попытка retry
-    этой же outbox-строки уже успешно её удалила) — CRM отвечает "success" с
-    пустым data.id, а не явной ошибкой (см. проверку expect_id в _call() ниже).
-
-    Отдельный класс (не голый Exception, как раньше) специально для того,
-    чтобы src/tasks/crm_outbox_tasks.py::_do_delete мог отличить «запись уже
-    отсутствует — цель достигнута, это не сбой» от реальных сбоев (сеть,
-    таймаут, невалидный ответ) и не заставлял retry «проваливаться» вечно
-    на уже достигнутой цели — см. докстринг _do_delete.
+    """update/delete с expect_id=True над записью, которой в CRM уже нет: CRM отвечает «success» с пустым
+    data.id. Отдельный класс позволяет _do_delete отличить «уже удалено» от реального сбоя.
     """
 
 
 class CRMClient:
     """Асинхронный HTTP-клиент для REST API CRM «Руководитель».
 
-    Браузер ──── HTTP запрос ────► FastAPI (сервер)
-                                     │
-                           нужно вызвать CRM API
-                                     │
-                                     ▼
-                               httpx (клиент) ──── HTTP запрос ────► CRM
-                               httpx (клиент) ◄─── HTTP ответ  ────  CRM
-                                     │
-                           вернуть результат
-                                     │
-    FastAPI ──── HTTP ответ ────► Браузер
+    Все запросы — POST на /api/rest.php с JSON-телом (для demo-инстанса к URL добавляется ?demo_id=<N>).
+    Каждое тело содержит key, username, password и action (insert | select | update | delete),
+    entity_id — ID сущности (1 — пользователи, 29 — задачи).
 
-    Формат запросов к API
-    ---------------------
-    Все запросы — HTTP POST на endpoint /api/rest.php.
-    Content-Type: application/json (тело — JSON-объект).
-    При работе с demo-инстансом к URL добавляется параметр ?demo_id=<N>.
+    - insert: items — список словарей полей; ответ {"status": "success", "data": {"id": "42"}}, id строкой.
+      Чекбокс-поля — строки "true"/"false".
+    - select: select_fields — ID полей через запятую; filters — {"<field_id>": {"value": ..., "condition": "include"}}
+      (include — точное совпадение).
+    - update: data — только изменяемые поля; update_by_field — {"id": <CRM-ID>}.
+    - delete: delete_by_field — {"id": <CRM-ID>}.
 
-    Аутентификация
-    --------------
-    Каждый запрос содержит три обязательных поля аутентификации в теле:
-
-        {
-            "key":      "<API-ключ из Settings → API>",
-            "username": "<логин пользователя с ролью API>",
-            "password": "<пароль этого пользователя>"
-        }
-
-    Поле action
-    -----------
-    Определяет тип операции (аналог SQL DML):
-
-        "action": "insert"   — создание записи
-        "action": "select"   — выборка записей
-        "action": "update"   — обновление записей
-        "action": "delete"   — удаление записей
-
-    Поле entity_id
-    --------------
-    Идентификатор сущности (таблицы) в CRM:
-
-        entity_id: 1   → сущность «Пользователи»
-        entity_id: 29  → сущность «Задачи»
-
-    action = "insert"
-    -----------------
-    Параметр "items" — массив (list) словарей. Каждый словарь — одна
-    создаваемая запись. Все поля сущности передаются внутри элемента массива.
-
-    Ключи — str:  "field_317", "field_318", "group_id", "email" ...
-    Значения — Any: "false" (str), 6 (int), "Иван" (str) ...
-    {"field_317": "Название", "field_319": "false", "group_id": 6}
-
-    Для сущности entity_id=29 (Задачи) поля именуются как "field_<ID>",
-    где ID — числовой идентификатор поля в CRM:
-
-        {
-            "key": "...", "username": "...", "password": "...",
-            "action": "insert",
-            "entity_id": 29,
-            "items": [
-                {
-                    "field_317": "Название задачи",
-                    "field_318": "Описание задачи",
-                    "field_319": "false"
-                }
-            ]
-        }
-
-    Поле field_319 (статус) — чекбокс; значения строковые: "true" / "false".
-    items может содержать несколько словарей (batch-создание), но в данном
-    приложении всегда передаётся ровно один элемент.
-
-    Для сущности entity_id=1 (Пользователи) поля используют встроенные
-    имена (не field_<N>), плюс дополнительные параметры уведомления:
-
-        {
-            "key": "...", "username": "...", "password": "...",
-            "action": "insert",
-            "entity_id": 1,
-            "items": [
-                {
-                    "group_id":  6,
-                    "firstname": "Иван",
-                    "lastname":  "Иванов",
-                    "username":  "ivan.ivanov",
-                    "email":     "ivan@example.com",
-                    "password":  ""
-                }
-            ],
-            "notify":    true,
-            "login_url": "https://crm.example.com/index.php?module=users/login"
-        }
-
-    notify=true → CRM отправляет пользователю email со ссылкой из login_url.
-
-    Ответ на insert:
-        {"status": "success", "data": {"id": "42"}}
-    id возвращается строкой; преобразование в int выполняется на стороне
-    приложения. Поле status нестабильно между версиями CRM — см. ниже.
-
-    action = "select"
-    -----------------
-    Параметр "select_fields" — строка из идентификаторов полей через запятую.
-    Параметр "filters" — словарь, где ключ = ID поля, значение = условие.
-    Условие "include" означает точное совпадение (не LIKE).
-
-        {
-            "key": "...", "username": "...", "password": "...",
-            "action": "select",
-            "entity_id": 1,
-            "select_fields": "9,7,8,12,6",
-            "filters": {
-                "9": {
-                    "value":     "ivan@example.com",
-                    "condition": "include"
-                }
-            }
-        }
-
-    Поле 9 — email пользователя в сущности «Пользователи».
-    Ответ: {"status": "success", "data": [{...}, {...}]}
-
-    action = "update"
-    -----------------
-    Параметр "data" — словарь обновляемых полей (только изменяемые поля).
-    Параметр "update_by_field" — словарь критерия поиска обновляемой записи.
-
-        {
-            "key": "...", "username": "...", "password": "...",
-            "action": "update",
-            "entity_id": 29,
-            "data": {
-                "field_317": "Новое название задачи",
-                "field_319": "true"
-            },
-            "update_by_field": {"id": 42}
-        }
-
-    update_by_field.id — это CRM-ID записи (crm_task_id в локальной БД).
-    Поля, отсутствующие в "data", не изменяются.
-
-    action = "delete"
-    -----------------
-    Параметр "delete_by_field" — словарь критерия поиска удаляемой записи.
-
-        {
-            "key": "...", "username": "...", "password": "...",
-            "action": "delete",
-            "entity_id": 29,
-            "delete_by_field": {"id": 42}
-        }
-
-    Формат ответа
-    -------------
-    CRM «Руководитель» не придерживается единого формата ответа:
-    разные версии и разные операции возвращают разные признаки успеха.
-
-    Известные варианты успешного ответа:
-        {"success": true, ...}
-        {"status": "ok", ...}
-        {"status": "success", "data": {...}}
-        {"result": [...], "data": {...}}   ← нет ключей "error" / "error_message"
-
-    Признаки ошибки:
-        {"msg": "Error description"}
-        {"error_message": "..."}
-        любой ответ с ключом "error"
-
-    _call() проверяет все перечисленные варианты и поднимает Exception,
-    если ни один признак успеха не найден.
+    Формат ответа между версиями CRM нестабилен. Успех: {"success": true}, {"status": "ok"},
+    {"status": "success", "data": ...} или ответ без ключей error/error_message. Ошибка: ключ "msg",
+    "error_message" или "error". _call() проверяет все варианты и поднимает Exception, если признак
+    успеха не найден.
     """
 
     @staticmethod
     def _bool_to_crm(value: bool) -> str:
-        """Преобразует bool в строковый формат поля-чекбокса CRM («true»/«false»)."""
+        """Преобразует bool в строку поля-чекбокса CRM («true»/«false»)."""
         return "true" if value else "false"
 
     @staticmethod
     async def _file_to_crm(abs_path: Path) -> dict:
-        """Читает файл с диска и возвращает CRM-совместимый словарь.
+        """Читает файл и возвращает {'name': ..., 'content': '<base64>'}.
 
-        CRM ожидает файлы в виде {'name': 'filename.pdf', 'content': '<base64>'}.
-
-        asyncio.to_thread: read_bytes() — синхронный блокирующий I/O; файлы здесь
-        могут достигать MAX_FILE_SIZE (100 МБ, см. src/utils/file_utils.py), и без
-        выноса в поток чтение (плюс base64-кодирование результата) держало бы event
-        loop занятым на заметное время, замораживая все остальные запросы —
-        тот же принцип, что и у save_file/unlink/rmtree в src/services/attachments.py.
-        Метод асинхронный (а не обёрнут снаружи), чтобы для списка файлов
-        (other_file_abs_paths в task_service.py/subtask_service.py) вызовы можно
-        было передать в asyncio.gather не дожидаясь друг друга — тогда каждый
-        вызов почти сразу доходит до своего to_thread и реальное чтение с диска
-        идёт одновременно на нескольких потоках пула, а не по одному файлу за раз.
+        Чтение вынесено в asyncio.to_thread, чтобы блокирующий I/O (до 10 МБ) не держал event loop;
+        метод асинхронный, чтобы список файлов читался параллельно через asyncio.gather.
         """
         content = await asyncio.to_thread(abs_path.read_bytes)
         return {
@@ -309,35 +96,23 @@ class CRMClient:
         expect_id: bool = False,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Выполняет HTTP POST к REST API CRM и возвращает распакованный JSON.
+        """Выполняет POST к REST API CRM и возвращает распакованный JSON.
 
         :param action:     'insert' | 'select' | 'update' | 'delete'
-        :param entity_id:  ID сущности (1=Пользователи, 29=Задачи)
-        :param items:      Массив записей для action='insert' (список словарей)
-        :param notify:     True → CRM отправляет email-уведомление новому пользователю
-        :param login_url:  URL входа в CRM, вставляемый в тело письма-уведомления
-        :param expect_id:  True → дополнительно проверить, что "data" содержит непустой "id"
-                           (см. пояснение у проверки ниже). Используется для 'update'/'delete'
-                           над уже существующей CRM-записью — не для 'insert' (см. task_service.py/
-                           subtask_service.py, где expect_id=True стоит только на update_task/
-                           delete_task/update_subtask/delete_subtask).
-        :param kwargs:     Дополнительные поля payload:
-                           - filters          (dict)  — для action='select'
-                           - select_fields    (str)   — для action='select', через запятую
-                           - data             (dict)  — для action='update'
-                           - update_by_field  (dict)  — для action='update', критерий поиска
-                           - delete_by_field  (dict)  — для action='delete', критерий поиска
-        :raises Exception: При HTTP-ошибке, таймауте, невалидном JSON, ответе CRM с ошибкой
-                           или (при expect_id=True) отсутствии непустого id в успешном ответе
+        :param entity_id:  ID сущности CRM
+        :param items:      записи для action='insert'
+        :param notify:     True — CRM отправляет email-уведомление новому пользователю
+        :param login_url:  URL входа для письма-уведомления
+        :param expect_id:  True — проверить, что в "data" есть непустой "id" (для update/delete над
+                           существующей записью, не для insert)
+        :param kwargs:     filters/select_fields (select), data/update_by_field (update), delete_by_field (delete)
+        :raises Exception: HTTP-ошибка, таймаут, невалидный JSON, ошибка в ответе CRM или пустой id при expect_id
         """
-        # demo_id — GET-параметр, идентифицирующий конкретный demo-инстанс CRM.
         full_url = self.base_url
         if self.demo_id:
             sep = "&" if "?" in full_url else "?"
             full_url += f"{sep}demo_id={self.demo_id}"
 
-        # Базовый payload присутствует в каждом запросе к API:
-        # key + username + password — аутентификация; action — тип операции.
         payload: Dict[str, Any] = {
             "key":      self.api_key,
             "username": self.username,
@@ -350,22 +125,14 @@ class CRMClient:
             payload["notify"] = True
         if login_url:
             payload["login_url"] = login_url
-        # items — массив словарей для action='insert'.
-        # Каждый элемент — одна создаваемая запись с полями сущности.
         if items is not None:
             payload["items"] = items
-        # kwargs передают поля, специфичные для конкретной операции:
-        # filters/select_fields (select), data/update_by_field (update),
-        # delete_by_field (delete). None-значения исключаются из payload.
+        # None-значения kwargs в payload не попадают.
         for key, value in kwargs.items():
             if value is not None:
                 payload[key] = value
 
-        # Не логируем api_key и password во избежание утечки секретов
-        # DEBUG, а не INFO: для файловых операций (specification_abs_path,
-        # other_file_abs_paths) в data попадает base64-контент самого файла —
-        # при MAX_FILE_SIZE=100 МБ это до ~133 МБ на одну строку лога.
-        # Короткие сводки в task_service.py/subtask_service.py остаются на INFO.
+        # api_key и password не логируем. DEBUG, а не INFO: в data файловых операций лежит base64 (до ~133 МБ).
         safe_payload = {k: v for k, v in payload.items() if k not in ("key", "password")}
         logger.debug("CRM → %s | %s", full_url, safe_payload)
 
@@ -386,8 +153,7 @@ class CRMClient:
         except Exception:
             raise Exception(f"CRM returned invalid JSON: {response.text[:200]}")
 
-        # Формат признака успеха не стандартизирован между версиями CRM и типами операций.
-        # Проверяем все известные варианты — подробнее в docstring класса CRMClient.
+        # Формат признака успеха не стандартизирован между версиями CRM — проверяем все известные варианты.
         is_success = (
             result.get("success") is True
             or result.get("status") in ("ok", "success")
@@ -403,17 +169,8 @@ class CRMClient:
             )
             raise Exception(f"CRM API error: {error_msg}")
 
-        # expect_id=True: CRM «Руководитель» на update/delete записи, которой на её
-        # стороне уже нет (например, удалена вручную через веб-интерфейс CRM после
-        # того, как задача/подзадача была создана из этого приложения), отвечает
-        # {"status": "success", "data": {"id": ""}} — is_success выше не ловит это:
-        # ключ "status" == "success" есть, ключей "error"/"error_message" нет. Без
-        # этой проверки такой ответ считался бы успешной синхронизацией
-        # (crm_synced=True в TaskResponse/SubtaskResponse), хотя CRM на самом деле
-        # не нашла и не изменила запись — проверено эмпирически на demo-инстансе
-        # CRM. Проверяется только когда вызывающий код явно
-        # об этом просит (update/delete над существующей записью) — на insert
-        # "data.id" пустым не бывает, поэтому там expect_id не используется.
+        # expect_id: на update/delete несуществующей записи CRM отвечает {"status": "success", "data": {"id": ""}},
+        # и без этой проверки такой ответ считался бы успехом. На insert id пустым не бывает.
         if expect_id:
             data = result.get("data")
             if not isinstance(data, dict) or not data.get("id"):

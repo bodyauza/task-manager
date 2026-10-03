@@ -6,35 +6,27 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = os.path.dirname(__file__)
 
-# Файл, соответствующий текущему API_MODE — единственный источник значений для
-# ключей, которые ОДНОВРЕМЕННО объявлены в нескольких .env-файлах (DB_NAME,
-# SMTP_HOST, ACCESS_SECRET и т.п.). Грузится ПЕРВЫМ и с override=False:
-# значения, уже стоящие в os.environ (shell, docker-compose, CI — например,
-# DB_HOST=db, который docker-compose подставляет для контейнера db), всё
-# равно сохраняют приоритет над любым .env-файлом.
-#
-# Раньше все три файла грузились в фиксированном порядке .dev.env → .tests.env →
-# .env независимо от API_MODE: тот файл, что успевал загрузиться первым,
-# «застолбливал» совпадающие ключи в os.environ, а override=False не давал
-# остальным файлам их переопределить — из-за этого API_MODE=test в обход
-# pytest (который подстраховывался в conftest.py) резолвил DB_NAME=task_manager
-# (из .dev.env), а не task_manager_test (из .tests.env).
+# Файл текущего API_MODE — единственный источник для ключей, объявленных сразу в нескольких .env-файлах. Грузится первым
+# с override=False: значения из os.environ (shell, docker-compose, CI) сохраняют приоритет.
 _ENV_FILE_BY_MODE = {
     "test": ".tests.env", "testing": ".tests.env",
     "dev": ".dev.env", "development": ".dev.env",
     "prod": ".env", "production": ".env",
 }
-_mode_env_file = _ENV_FILE_BY_MODE.get(os.getenv("API_MODE"))
-if _mode_env_file is not None:
-    load_dotenv(os.path.join(BASE_DIR, _mode_env_file), override=False)
+_explicit_mode = os.getenv("API_MODE")  # снимок ДО load_dotenv — то, что передал shell/systemd/docker-compose
 
-# Остальные файлы — как и раньше, но теперь только источник значений для ключей,
-# которых нет в уже загруженном файле режима: например CRM_* (crm/crm_config.py
-# читает их через os.getenv() напрямую, минуя pydantic-settings) объявлены
-# только в .dev.env и ни в одном режиме не «конкурируют» за них с другим файлом.
-load_dotenv(os.path.join(BASE_DIR, ".dev.env"),   override=False)
-load_dotenv(os.path.join(BASE_DIR, ".tests.env"), override=False)
-load_dotenv(os.path.join(BASE_DIR, ".env"),        override=False)
+# Явный API_MODE=prod: .dev.env/.tests.env не грузятся вовсе, единственный источник — .env, чтобы dev-файл не «застолбил» общий ключ.
+if _explicit_mode in ("prod", "production"):
+    load_dotenv(os.path.join(BASE_DIR, ".env"), override=False)
+else:
+    # API_MODE явно dev/test или не задан: файл режима первым, затем безусловно все три файла. Это self-bootstrap локального запуска:
+    # .dev.env сам объявляет API_MODE=dev. Ветку не менять — на ней держится локальный запуск.
+    _mode_env_file = _ENV_FILE_BY_MODE.get(_explicit_mode)
+    if _mode_env_file is not None:
+        load_dotenv(os.path.join(BASE_DIR, _mode_env_file), override=False)
+    load_dotenv(os.path.join(BASE_DIR, ".dev.env"),   override=False)
+    load_dotenv(os.path.join(BASE_DIR, ".tests.env"), override=False)
+    load_dotenv(os.path.join(BASE_DIR, ".env"),        override=False)
 
 
 class Settings(BaseSettings):
@@ -45,8 +37,7 @@ class Settings(BaseSettings):
     algorithm: str
     access_exp: int
 
-    # Refresh-токен подписывается отдельным секретом.
-    # Компрометация access_secret не позволяет подделать refresh-токен.
+    # Refresh-токен подписывается отдельным секретом: компрометация access_secret не позволяет его подделать.
     refresh_secret: str
     refresh_exp: int
 
@@ -58,69 +49,45 @@ class Settings(BaseSettings):
     DB_DRIVER_SYNC: str
     DB_DRIVER_ASYNC: str
 
-    # Дефолты = встроенные дефолты SQLAlchemy QueuePool (5 + 10 = максимум 15 соединений
-    # на процесс) — раньше эти значения были неявными (SQLAlchemy подставляла их сама,
-    # если pool_size/max_overflow не переданы в create_async_engine). Здесь они не меняют
-    # текущее поведение, а делают его видимым и настраиваемым per-deployment: правильное
-    # значение зависит от max_connections на стороне PostgreSQL и от числа воркеров uvicorn
-    # (UVICORN_WORKERS в src/Dockerfile) — каждый воркер держит свой собственный пул, поэтому
-    # (DB_POOL_SIZE + DB_MAX_OVERFLOW) × число_воркеров не должно приближаться к
-    # max_connections БД. Наугад увеличивать нельзя: каждое соединение пула — это реальный
-    # процесс postgres на стороне БД.
+    # Дефолты равны встроенным значениям QueuePool (5 + 10 соединений на процесс). Нужное значение зависит от max_connections PostgreSQL:
+    # (DB_POOL_SIZE + DB_MAX_OVERFLOW) × число воркеров uvicorn не должно к нему приближаться.
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 10
 
-    # Нет значения по умолчанию: дефолт вида "smtp.yandex.ru" молча привязал бы проект
-    # к конкретному почтовому провайдеру — при разворачивании на другом инстансе без
-    # явного SMTP_HOST письма подтверждения email тихо шли бы через чужой SMTP-сервер
-    # (или падали бы с ошибкой аутентификации, которую трудно связать с причиной).
-    # Та же логика, что и у REG_TOKEN_SECRET выше — конфигурация внешнего сервиса не
-    # должна иметь скрытого дефолта. SMTP_PORT=465 оставлен с дефолтом: это стандартный
-    # порт SMTPS (implicit TLS), не привязанный к конкретному провайдеру.
+    # Без дефолта: тихий дефолт привязал бы проект к конкретному SMTP-провайдеру. SMTP_PORT=465 (implicit TLS) оставлен с дефолтом.
     SMTP_HOST: str
     SMTP_PORT: int = 465
     SMTP_USER: str = ""
     SMTP_PASSWORD: str = ""
 
-    # Отдельный секрет для reg_token — компрометация access_secret не позволяет
-    # подделать токен незавершённой регистрации.
-    # Нет значения по умолчанию: приложение не запустится без явно заданной переменной
-    # окружения REG_TOKEN_SECRET — случайный дефолт типа "change-me" был бы тихой уязвимостью.
+    # Отдельный секрет reg_token; без дефолта — приложение не запустится без REG_TOKEN_SECRET.
     REG_TOKEN_SECRET: str
-    REG_TOKEN_EXP: int = 1200  # 20 минут
+    REG_TOKEN_EXP: int = 1200
 
-    # Раньше был захардкожен как список Python-литералов прямо в классе, без связи с
-    # переменными окружения — ProductionSettings его не переопределял, и смена origin'ов
-    # для прода требовала правки этого файла, а не .env (см. историческую пометку об
-    # этом в main.py у CORSMiddleware). CORS_ORIGINS_CSV — строка через запятую, а не
-    # list[str]: pydantic-settings по умолчанию ожидает JSON-массив для env-значения
-    # list[...], что неудобно писать в .env-файле; CSV проще. Дефолт ниже — только
-    # localhost/127.0.0.1 для dev/test; для прода ОБЯЗАТЕЛЬНО переопределить через .env
-    # реальным доменом приложения — иначе браузер будет блокировать запросы с фронтенда,
-    # т.к. его Origin не попадёт в список.
+    # Секрет подписи сессионной куки sqladmin, независимый от access_secret; без дефолта.
+    ADMIN_SESSION_SECRET: str
+
+    # CORS_ORIGINS_CSV — строка через запятую (список в .env неудобен). Дефолт — только localhost; в production переопределить реальным доменом.
     CORS_ORIGINS_CSV: str = (
         "http://localhost,http://localhost:8080,http://127.0.0.1:8000,"
         "http://localhost:3000,http://127.0.0.1:3000"
     )
 
-    # Брокер Celery (src/celery_app.py) — общий Redis-инстанс для фоновой синхронизации
-    # CRM-справочников (src/tasks/global_lists_tasks.py) и durable-retry очереди
-    # CRM-синхронизации задач (src/tasks/crm_outbox_tasks.py). Дефолт — для запуска без
-    # Docker (Redis на localhost); docker-compose.yml переопределяет на redis://redis:6379/0.
+    # Брокер Celery и Pub/Sub: общий Redis. Дефолт — для запуска без Docker; docker-compose переопределяет на redis://redis:6379/0.
     REDIS_URL: str = "redis://localhost:6379/0"
 
-    # Часовой пояс ТОЛЬКО для отображения дат в sqladmin (src/admin/formatters.py).
-    # Хранение в БД (TIMESTAMPTZ, UTC) и datetime.now(timezone.utc) в коде не меняются.
+    # Часовой пояс только для отображения дат в sqladmin; в БД остаётся UTC.
     ADMIN_TIMEZONE: str = "Europe/Moscow"
 
-    # Сколько последних сообщений WS-чата держать в Redis List "chat:history"
-    # (src/realtime/chat_history.py) — список ограничен, не бесконечный архив.
-    # Дефолт 500 — ориентировочный, переопределяется через .env без изменения кода.
+    # Сколько последних записей держать в Redis List "chat:history".
     CHAT_HISTORY_MAX_LEN: int = 500
 
-    # Документация API (/docs, /redoc, /openapi.json). None — включена везде, кроме
-    # production (там схема API и Swagger UI не нужны посторонним); True/False — явное
-    # переопределение через .env (например, DOCS_ENABLED=true на закрытом стенде).
+    # Лимиты входящих сообщений WS-чата (на одно соединение).
+    WS_MAX_MESSAGE_CHARS: int = 1000
+    WS_RATE_LIMIT_MESSAGES: int = 10
+    WS_RATE_LIMIT_WINDOW_SECONDS: float = 10.0
+
+    # Документация API (/docs, /redoc, /openapi.json): None — везде, кроме production; True/False — явное переопределение через .env.
     DOCS_ENABLED: bool | None = None
 
     @property
@@ -156,8 +123,7 @@ class TestingSettings(Settings):
 
 @lru_cache
 def get_settings():
-    # lru_cache: pydantic-settings читает и парсит .env-файл при каждом вызове Settings().
-    # Кэш сводит это к одному разбору на жизненный цикл процесса.
+    # lru_cache: Settings() иначе перечитывает .env при каждом вызове.
     mode = os.getenv("API_MODE")
     if mode in ("test", "testing"):
         return TestingSettings()

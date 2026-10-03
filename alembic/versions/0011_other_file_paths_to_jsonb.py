@@ -4,16 +4,7 @@ Revision ID: 0011
 Revises: 0010
 Create Date: 2026-07-11
 
-Уточняет тип, оставленный как временный компромисс в 0010: колонка хранила
-JSON-массив путей в виде обычной текстовой строки — приложению приходилось
-самому вызывать json.loads()/json.dumps() при каждом чтении/записи, а
-PostgreSQL не мог ни проиндексировать содержимое, ни провалидировать, что
-там вообще лежит валидный JSON. JSONB — нативный бинарный JSON-тип
-PostgreSQL: asyncpg десериализует его в Python list автоматически (ORM-код
-получает готовый list[str], а не строку для ручного парсинга), содержимое
-можно индексировать (GIN) и проверять операторами JSONB (@>, ?, и т.д.),
-хотя в этом проекте такие операторы/индексы пока не используются — колонка
-всегда читается целиком по PK родителя.
+Текстовая колонка требовала ручного json.loads()/dumps() и не проверяла валидность JSON. JSONB asyncpg десериализует в list автоматически.
 """
 from typing import Sequence, Union
 
@@ -28,11 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # Конвертируем колонку Text → JSONB с приведением данных через USING.
-    # USING text::jsonb: PostgreSQL парсит существующие JSON-строки в бинарный JSONB на месте.
-    # Если колонка пуста (NULL) — остаётся NULL без изменений.
-    # JSONB: бинарное представление JSON в PostgreSQL; поддерживает индексы GIN,
-    # автоматически десериализуется asyncpg → Python list/dict без json.loads.
+    # Text → JSONB через USING text::jsonb; NULL остаётся NULL.
     op.alter_column(
         "task",
         "other_file_paths",
@@ -50,7 +37,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Обратное приведение JSONB → Text: PostgreSQL сериализует JSONB в строку.
+    # Обратное приведение JSONB → Text.
     op.alter_column(
         "task",
         "other_file_paths",

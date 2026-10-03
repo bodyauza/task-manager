@@ -1,10 +1,7 @@
-"""Тесты src.tasks.global_lists_tasks: синхронизация локальной таблицы project
-со списком «Проект» CRM (upsert по crm_id, деактивация пропавших опций).
+"""Тесты global_lists_tasks: синхронизация таблицы project со списком «Проект» CRM (upsert по crm_id, деактивация пропавших опций).
 
-Вызывает _upsert_project_rows/_sync_project_table_async напрямую (await), а не
-через sync_project_table.delay() — Celery-обёртка синхронна и вызывает
-asyncio.run(...) внутри, что упало бы RuntimeError изнутри уже работающего
-event loop pytest-asyncio (см. предупреждение в src/celery_app.py).
+_upsert_project_rows/_sync_project_table_async вызываются напрямую (await): Celery-обёртка делает asyncio.run() и упала бы
+внутри работающего event loop.
 """
 
 from unittest.mock import AsyncMock, patch

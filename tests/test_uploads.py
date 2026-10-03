@@ -1,9 +1,4 @@
-"""GET /uploads/{file_path} (src/routers/uploads.py::serve_upload) — аутентифицированная
-раздача загруженных файлов и защита от path-traversal.
-
-Раньше этот эндпоинт тестами не покрывался вовсе: ни проверка аутентификации, ни
-защита от выхода за пределы UPLOAD_ROOT (resolve() + relative_to()).
-"""
+"""GET /uploads/{file_path}: аутентифицированная раздача файлов и защита от path-traversal (resolve() + relative_to() относительно UPLOAD_ROOT)."""
 
 from unittest.mock import patch
 from urllib.parse import quote
@@ -71,9 +66,7 @@ async def test_serve_upload_blocks_path_traversal(client: AsyncClient, mock_smtp
 async def test_serve_upload_plain_dotdot_never_leaks_outside_file(
     client: AsyncClient, mock_smtp: dict, uploads_dir, path: str,
 ):
-    """Незакодированный «..» httpx может схлопнуть ещё на клиенте — тогда запрос
-    станет обычным несуществующим файлом (404), иначе его отклонит роутер (400).
-    В любом случае содержимое файла вне UPLOAD_ROOT не отдаётся."""
+    """Незакодированный «..» httpx может схлопнуть на клиенте (тогда обычный 404), иначе его отклонит роутер (400); файл вне UPLOAD_ROOT не отдаётся."""
     await register_and_login(client, mock_smtp, EMAIL)
     r = await client.get(f"/uploads/{path}")
     assert r.status_code in (400, 404)

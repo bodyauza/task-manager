@@ -1,10 +1,4 @@
-"""Схемы admin-only ответа о статусе CRM-синхронизации задач/подзадач.
-
-Намеренно отдельный файл, не task_schemas.py/subtask_schemas.py: эти поля
-не должны быть видны обычному клиенту (см. TaskResponse/SubtaskResponse —
-там их больше нет) — только администратору через
-src/routers/pages.py::admin_tasks_sync_status/admin_subtasks_sync_status.
-"""
+"""Схемы admin-only ответа о статусе CRM-синхронизации; отдельный файл, чтобы поля не попали в публичные TaskResponse/SubtaskResponse."""
 
 import datetime
 from typing import Optional
@@ -20,11 +14,9 @@ class TaskSyncStatusResponse(BaseModel):
     owner_id: int
     owner_email: str
     crm_task_id: Optional[int] = None
-    # 'unsynced' | 'pending' | 'synced' | 'failed' — Task.sync_status,
-    # обновляется Celery-обработчиком (src/tasks/crm_outbox_tasks.py).
+    # Task.sync_status: 'unsynced' | 'pending' | 'synced' | 'failed'.
     sync_status: str
-    # Снимок ПОСЛЕДНЕЙ строки crm_outbox для этого агрегата (по updated_at) —
-    # None во всех четырёх полях ниже, если синхронизация ни разу не запускалась.
+    # Снимок последней строки crm_outbox агрегата (по updated_at); None, если синхронизация не запускалась.
     last_operation: Optional[str] = None
     last_outbox_status: Optional[str] = None
     last_attempts: Optional[int] = None

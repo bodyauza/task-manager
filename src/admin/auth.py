@@ -1,28 +1,29 @@
-"""Аутентификация для sqladmin-панели (/admin) — доступ только роли admin.
+"""Аутентификация sqladmin-панели (/admin): доступ только роли admin.
 
-Не переиспользует access_token-куку основного приложения
-(src/auth/auth_config.py): sqladmin ведёт собственную HttpOnly-сессию через
-starlette SessionMiddleware (подключается автоматически AuthenticationBackend.
-__init__), подписанную тем же settings.access_secret, но независимую от JWT-кук
-/auth/login. Кука подписанная и без серверного состояния, поэтому работает при
-UVICORN_WORKERS > 1. Истечение access_token не обрывает сессию администратора
-в /admin, и наоборот — sqladmin не трогает куки, которые читает common.js.
+sqladmin ведёт собственную HttpOnly-сессию (SessionMiddleware, секрет ADMIN_SESSION_SECRET), независимую
+от JWT-кук /auth/login. Кука подписана и не хранит состояние на сервере, поэтому работает при UVICORN_WORKERS > 1.
 """
 
 from fastapi_users_db_sqlalchemy import SQLAlchemyUserDatabase
 from sqladmin.authentication import AuthenticationBackend
+from starlette.middleware import Middleware
+from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import Request
 
 from src.auth.manager import UserManager
 from src.auth.user_models import User
+from src.config import settings
 from src.database import async_session_maker
 from src.services.access import is_admin
 
+# AuthenticationBackend.__init__ из sqladmin подключает SessionMiddleware без https_only и same_site, срок жизни — 14 дней.
+# SameSite=lax здесь реальный CSRF-вектор: @action («Повторить») регистрируются как GET, и кука уходит
+# при переходе по ссылке с чужого сайта.
+ADMIN_SESSION_MAX_AGE_SECONDS = 4 * 60 * 60
+
 
 class _LoginCredentials:
-    """Минимальная замена OAuth2PasswordRequestForm: UserManager.authenticate()
-    обращается только к .username/.password — sqladmin присылает обычную
-    HTML-форму (username, password)."""
+    """Минимальная замена OAuth2PasswordRequestForm: UserManager.authenticate() читает только .username/.password."""
 
     def __init__(self, username: str, password: str) -> None:
         self.username = username
@@ -30,6 +31,18 @@ class _LoginCredentials:
 
 
 class AdminAuth(AuthenticationBackend):
+    def __init__(self, secret_key: str) -> None:
+        # super().__init__() не вызываем: он строит SessionMiddleware без https_only/max_age/same_site.
+        self.middlewares = [
+            Middleware(
+                SessionMiddleware,
+                secret_key=secret_key,
+                https_only=settings.is_production,
+                max_age=ADMIN_SESSION_MAX_AGE_SECONDS,
+                same_site="strict",
+            ),
+        ]
+
     async def login(self, request: Request) -> bool:
         form = await request.form()
         email = (form.get("username") or "").strip()

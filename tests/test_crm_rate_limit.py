@@ -1,11 +1,6 @@
-"""Тесты src.tasks.crm_rate_limit — token-bucket ограничитель запросов к CRM.
+"""Тесты ограничителя запросов к CRM (src/tasks/crm_rate_limit.py).
 
-Реального Redis нет (тот же принцип, что и для CRM/Celery — мокается прямая
-зависимость, не внешний сервис): redis.asyncio.Redis патчится фейковым
-клиентом, который ведёт себя как реальный INCR/EXPIRE NX, чтобы проверить
-именно то, что вызвало живой баг при docker compose up — ключ без TTL
-("EXPIRE NX" должен САМОВОССТАНАВЛИВАТЬ TTL, даже когда count > 1), а не
-только happy path.
+redis.asyncio.Redis патчится фейком с поведением INCR/EXPIRE NX: проверяем самовосстановление TTL (ключ без TTL), а не только happy path.
 """
 
 from unittest.mock import AsyncMock, patch
@@ -16,10 +11,7 @@ from src.tasks.crm_rate_limit import acquire_slot
 
 
 class FakeRedis:
-    """Минимальная имитация redis.asyncio.Redis: INCR + EXPIRE(nx=True) с
-    тем же поведением, что и у реального Redis — EXPIRE с nx=True не
-    перезаписывает уже существующий TTL, но устанавливает его, если TTL нет.
-    """
+    """Минимальная имитация Redis: INCR + EXPIRE(nx=True); nx не перезаписывает существующий TTL, но выставляет отсутствующий."""
 
     def __init__(self, initial_count: int = 0, has_ttl: bool = False):
         self.count = initial_count
@@ -68,16 +60,9 @@ async def test_acquire_slot_sets_ttl_with_nx_on_first_call(fake_redis):
 
 
 async def test_acquire_slot_self_heals_missing_ttl_on_later_call():
-    """Регрессионный тест на живой баг (docker compose up): если предыдущий
-    вызов успел INCR, но упал до EXPIRE (сеть, падение процесса, класс ошибок
-    "Event loop is closed" при переиспользовании соединения между
-    asyncio.run() — см. докстринг acquire_slot), ключ остаётся без TTL и
-    БЕЗ nx=True на EXPIRE навсегда заблокировал бы все последующие вызовы
-    (TTL ключа был обнаружен равным -1 после серии таких сбоев). Эта функция
-    должна пытаться выставить TTL на КАЖДОМ вызове (не только когда count==1),
-    и nx=True гарантирует самовосстановление, ничего не ломая для уже
-    здорового ключа (см. test_acquire_slot_denies_when_over_limit выше —
-    там EXPIRE тоже вызывается, но no-op благодаря nx)."""
+    """Регрессия живого бага: если вызов успел INCR, но упал до EXPIRE, ключ остаётся без TTL и без nx=True навсегда блокировал бы CRM-вызовы.
+    EXPIRE пробуется на каждом вызове, а nx=True не ломает уже здоровый ключ.
+    """
     fake = FakeRedis(initial_count=3, has_ttl=False)  # count>1, но TTL почему-то отсутствует
     with patch("src.tasks.crm_rate_limit.redis.from_url", return_value=fake):
         result = await acquire_slot()

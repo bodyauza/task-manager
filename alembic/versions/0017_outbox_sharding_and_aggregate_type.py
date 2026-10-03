@@ -4,26 +4,14 @@ Revision ID: 0017
 Revises: 0016
 Create Date: 2026-09-10
 
-Схема для полной реализации шардирования outbox-очереди (id % N,
-depends_on_event_id, идемпотентность, Redlock, token-bucket — код в
-src/tasks/sharding.py, src/tasks/crm_shard_lock.py, src/tasks/crm_rate_limit.py,
-src/tasks/crm_outbox_tasks.py) — распространяя durable outbox (0016) на
-`Subtask` и на операцию `create` (не только `update`/`delete`/`sync_files`).
+Схема для шардирования outbox-очереди (id % N): распространяет outbox (0016) на Subtask и операцию create.
 
-1. `crm_outbox.task_id` → `crm_outbox.aggregate_id` + новая `aggregate_type`
-   ('task' | 'subtask', server_default='task' — все существующие строки на
-   момент этой миграции относятся к Task, бэкофилл значения не требуется)
-   и `shard` (снимок Task.crm_shard на момент вставки строки — не lookup в
-   реальном времени, см. докстринг CrmOutbox в src/task_logic/models.py).
-2. `crm_outbox.depends_on_event_id` — self-FK, для обоих видов зависимости
-   из плана (межагрегатная Subtask→Task, внутриагрегатная sync_files→create).
-3. `crm_outbox.idempotency_key` — server_default gen_random_uuid() (встроена
-   в PostgreSQL с версии 13, без расширений) — бэкофилл существующих строк
-   автоматический, на уровне ALTER TABLE ADD COLUMN.
-4. `task.crm_shard` (nullable — ленивое присвоение при первом событии после
-   этой миграции, без отдельного backfill) и `task.sync_status`/
-   `subtask.sync_status` (server_default='unsynced' — бэкофилл не требуется,
-   заменяют вычисление crm_synced на лету из crm_task_id/crm_subtask_id).
+1. crm_outbox.task_id → aggregate_id + aggregate_type ('task' | 'subtask', server_default='task': старые строки относятся к Task)
+   + shard (снимок Task.crm_shard на момент вставки).
+2. crm_outbox.depends_on_event_id — self-FK для межагрегатной и внутриагрегатной зависимостей.
+3. crm_outbox.idempotency_key — server_default gen_random_uuid() (встроен с PostgreSQL 13).
+4. task.crm_shard (nullable, присваивается лениво), task.sync_status/subtask.sync_status (server_default='unsynced')
+   вместо вычисления crm_synced на лету.
 """
 from typing import Sequence, Union
 

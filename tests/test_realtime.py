@@ -1,19 +1,14 @@
-"""Юнит-тесты src.realtime: ConnectionManager (транспорт) и broadcast_task_event
-(форма доменных событий).
+"""Юнит-тесты src.realtime: ConnectionManager (транспорт) и broadcast_task_event (форма доменных событий).
 
-До выноса в отдельный модуль эта логика жила внутри routers/tasks.py вперемешку
-с CRUD-обработчиками и не имела отдельных тестов вовсе. Теперь ConnectionManager
-и broadcast_task_event — независимые единицы, которые тестируются без поднятия
-приложения, БД или реального WS-соединения: ConnectionManager — через фейковый
-объект вместо starlette.WebSocket, а broadcast_task_event — через фейковую
-реализацию протокола Broadcaster (см. DIP в src/realtime/events.py).
+Тестируются без приложения, БД и реального WS: ConnectionManager — через фейковый сокет, broadcast_task_event — через
+фейковую реализацию протокола Broadcaster.
 """
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.realtime.events import broadcast_task_event
-from src.realtime.connection_manager import ConnectionManager
+from src.realtime.connection_manager import ConnectionManager, connection_manager
 
 
 class FakeWebSocket:
@@ -30,9 +25,7 @@ class FakeWebSocket:
 
 
 class FakeBroadcaster:
-    """Реализация протокола Broadcaster для проверки broadcast_task_event
-    без обращения к ConnectionManager — демонстрирует, что events.py
-    зависит от абстракции, а не от конкретного класса (DIP)."""
+    """Реализация протокола Broadcaster для проверки broadcast_task_event без ConnectionManager."""
 
     def __init__(self):
         self.calls: list[tuple[dict, int | None]] = []
@@ -40,8 +33,6 @@ class FakeBroadcaster:
     async def broadcast(self, payload: dict, exclude_user_id: int | None = None) -> None:
         self.calls.append((payload, exclude_user_id))
 
-
-# ── ConnectionManager: регистрация ──────────────────────────────────────────
 
 async def test_register_stores_connection():
     manager = ConnectionManager()
@@ -86,8 +77,6 @@ def test_get_email_returns_none_for_unknown_user():
     assert manager.get_email(999) is None
 
 
-# ── ConnectionManager: снятие с регистрации ─────────────────────────────────
-
 async def test_unregister_removes_matching_websocket():
     manager = ConnectionManager()
     ws = FakeWebSocket()
@@ -114,9 +103,7 @@ async def test_unregister_removes_only_specified_connection():
 
 
 async def test_unregister_unknown_websocket_is_noop():
-    """discard() не бросает исключение для сокета, которого уже нет в наборе —
-    безопасно при повторном/запоздалом вызове (например, после того как
-    broadcast уже удалил то же мёртвое соединение)."""
+    """discard() не бросает исключение для отсутствующего сокета — безопасно при повторном вызове."""
     manager = ConnectionManager()
     ws_registered, ws_unknown = FakeWebSocket(), FakeWebSocket()
     manager.register(1, ws_registered, "alice@example.com")
@@ -125,8 +112,6 @@ async def test_unregister_unknown_websocket_is_noop():
 
     assert manager.get(1) == {ws_registered}
 
-
-# ── ConnectionManager: рассылка ──────────────────────────────────────────────
 
 async def test_broadcast_sends_to_all_connected_users():
     manager = ConnectionManager()
@@ -209,13 +194,9 @@ async def test_broadcast_removes_only_dead_tab_keeps_other_tab_alive():
     assert json.loads(alive_tab.sent[0]) == {"type": "ping"}
 
 
-# ── ConnectionManager: Redis Pub/Sub (рассылка между uvicorn-воркерами) ──────
+# ConnectionManager: Redis Pub/Sub (рассылка между воркерами).
 #
-# mock_realtime_redis (tests/conftest.py, autouse) уже патчит
-# src.realtime.connection_manager._get_redis для ВСЕГО файла — здесь он
-# запрашивается как параметр фикстуры только там, где тесту нужна ссылка на
-# сам фейковый клиент (проверить publish), а не только избежать реального
-# сетевого соединения.
+# mock_realtime_redis (autouse) патчит _get_redis; как параметр он запрашивается, когда нужна ссылка на фейковый клиент (publish).
 
 async def test_broadcast_publishes_to_redis_with_origin_and_payload(mock_realtime_redis):
     manager = ConnectionManager()
@@ -233,9 +214,7 @@ async def test_broadcast_publishes_to_redis_with_origin_and_payload(mock_realtim
 
 
 async def test_broadcast_survives_redis_publish_failure():
-    """Локальная доставка уже произошла к моменту публикации — сбой Redis
-    (сеть недоступна, контейнер не поднят и т.п.) не должен ронять broadcast()
-    для процесса-инициатора."""
+    """Локальная доставка уже произошла: сбой Redis не должен ронять broadcast() у инициатора."""
     manager = ConnectionManager()
     ws = FakeWebSocket()
     manager.register(1, ws, "alice@example.com")
@@ -264,9 +243,7 @@ async def test_pubsub_message_from_other_origin_delivers_locally():
 
 
 async def test_pubsub_message_from_own_origin_is_ignored():
-    """Redis рассылает публикацию всем подписчикам, включая публикующего —
-    без этой проверки процесс доставил бы своё же событие дважды (сразу в
-    broadcast() и повторно здесь)."""
+    """Redis рассылает публикацию и публикующему: без проверки origin событие доставилось бы дважды."""
     manager = ConnectionManager()
     ws = FakeWebSocket()
     manager.register(1, ws, "alice@example.com")
@@ -308,12 +285,9 @@ async def test_pubsub_message_respects_exclude_user_id():
     assert json.loads(ws2.sent[0]) == {"type": "ping"}
 
 
-# ── broadcast_task_event: форма payload и DIP-подмена broadcaster ──────────
+# broadcast_task_event: форма payload и подмена broadcaster.
 #
-# task_created/task_updated/task_deleted — персистируемые типы (src/realtime/
-# events.py::_PERSISTED_EVENT_TYPES) — payload дополняется id/created_at из
-# chat_history.append_event (mock_chat_history_redis, tests/conftest.py,
-# autouse, даёт рабочий incr-счётчик) ещё до того, как дойдёт до broadcaster.
+# Персистируемые типы дополняются id/created_at из chat_history.append_event (mock_chat_history_redis) до broadcaster.
 
 async def test_broadcast_task_event_builds_expected_payload():
     fake = FakeBroadcaster()
@@ -367,8 +341,6 @@ async def test_broadcast_task_event_uses_connection_manager_by_default():
     assert "id" in sent and "created_at" in sent
 
 
-# ── broadcast_task_event: персистентность CRUD-событий, не файловых ────────
-
 async def test_broadcast_task_event_persists_all_crud_and_file_types(mock_chat_history_redis):
     fake = FakeBroadcaster()
     crud_types = (
@@ -395,13 +367,10 @@ async def test_broadcast_task_event_does_not_persist_unknown_event(mock_chat_his
         assert "id" not in payload  # не персистировано — id/created_at не добавляются
 
 
-# ── _publish_chat_message: персист в chat_history + broadcast ──────────────
+# _publish_chat_message: персист в chat_history и broadcast.
 #
-# chat_history.append_event мокается напрямую (не Redis-уровень) — сама
-# логика Redis List/пагинации тестируется отдельно, в tests/test_chat_history.py.
-# Здесь проверяется только оркестрация router.py::_publish_chat_message:
-# персист вызывается с правильным payload, а payload broadcast() дополняется
-# id/created_at из результата append_event.
+# append_event мокается напрямую (логика Redis List — в test_chat_history.py); проверяем оркестрацию: payload persist
+# и дополнение broadcast-payload id/created_at.
 
 async def test_publish_chat_message_persists_then_broadcasts_with_id_and_created_at():
     from src.realtime.router import _publish_chat_message
@@ -437,9 +406,7 @@ async def test_publish_chat_message_persists_then_broadcasts_with_id_and_created
 
 
 async def test_publish_chat_message_skips_persistence_when_sender_not_registered():
-    """sender_email is None (пользователь не зарегистрирован в ConnectionManager,
-    например соединение уже закрылось) — персистентность не вызывается вовсе,
-    как и раньше broadcast() не вызывался."""
+    """sender_email is None (соединение уже закрылось): персистентность не вызывается, как и broadcast()."""
     from src.realtime.router import _publish_chat_message
 
     with patch("src.realtime.router.chat_history.append_event", AsyncMock()) as mock_append:
@@ -447,8 +414,6 @@ async def test_publish_chat_message_skips_persistence_when_sender_not_registered
 
     mock_append.assert_not_called()
 
-
-# ── is_own: сообщение чата рассылается всем, признак «своё» — на получателя ──
 
 async def test_deliver_local_sets_is_own_per_recipient_and_strips_sender_user_id():
     manager = ConnectionManager()
@@ -479,9 +444,7 @@ async def test_deliver_local_without_sender_user_id_sends_payload_unchanged():
 
 
 async def test_pubsub_message_from_other_worker_tailors_is_own_for_local_sockets():
-    """Сообщение чата, опубликованное другим uvicorn-воркером (с sender_user_id
-    в payload), этот воркер доставляет своим сокетам с is_own на получателя и без
-    sender_user_id."""
+    """Сообщение чата от другого воркера доставляется своим сокетам с is_own на получателя и без sender_user_id."""
     manager = ConnectionManager()
     author_ws, other_ws = FakeWebSocket(), FakeWebSocket()
     manager.register(1, author_ws, "alice@example.com")   # вторая вкладка автора — на ЭТОМ воркере
@@ -514,3 +477,44 @@ async def test_broadcast_publishes_sender_user_id_through_redis_for_other_worker
     published = json.loads(mock_realtime_redis.publish.call_args.args[1])
     assert published["payload"]["sender_user_id"] == 1
     assert "sender_user_id" not in ws.sent[0]
+
+
+async def test_broadcast_task_event_survives_append_event_failure():
+    fake = FakeBroadcaster()
+    with patch(
+        "src.realtime.events.chat_history.append_event",
+        AsyncMock(side_effect=ConnectionError("redis down")),
+    ):
+        await broadcast_task_event("task_created", "T", broadcaster=fake, sender_email="a@b.c")
+
+    assert len(fake.calls) == 1                       # живая рассылка всё равно состоялась
+    assert "id" not in fake.calls[0][0]               # событие не персистировано
+
+
+async def test_broadcast_task_event_survives_broadcast_failure(mock_chat_history_redis):
+    broken = MagicMock()
+    broken.broadcast = AsyncMock(side_effect=ConnectionError("redis down"))
+
+    await broadcast_task_event("task_created", "T", broadcaster=broken, sender_email="a@b.c")
+
+    broken.broadcast.assert_awaited_once()
+
+
+async def test_publish_chat_message_survives_redis_failures():
+    from src.realtime.router import _publish_chat_message
+
+    ws = FakeWebSocket()
+    connection_manager.register(1, ws, "alice@example.com")
+    try:
+        with patch(
+            "src.realtime.router.chat_history.append_event",
+            AsyncMock(side_effect=ConnectionError("redis down")),
+        ), patch.object(
+            connection_manager, "broadcast", AsyncMock(side_effect=ConnectionError("redis down"))
+        ) as mock_broadcast:
+            await _publish_chat_message(1, "hello")
+    finally:
+        connection_manager.unregister(1, ws)
+
+    mock_broadcast.assert_awaited_once()
+    assert "id" not in mock_broadcast.await_args.args[0]

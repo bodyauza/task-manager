@@ -1,6 +1,7 @@
 import asyncio
 import json
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
@@ -28,8 +29,6 @@ async def _create(client: AsyncClient, title: str = "My Task", description: str 
     )
 
 
-# ── Create ───────────────────────────────────────────────────────────────────
-
 async def test_create_task_success(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp)
     r = await _create(client)
@@ -37,9 +36,7 @@ async def test_create_task_success(client: AsyncClient, mock_smtp: dict):
     data = r.json()
     assert data["title"] == "My Task"
     assert data["completed"] is False
-    # crm_task_id/crm_synced НЕ являются полями ответа (см. TaskResponse);
-    # sync_status — единственная отдаваемая деталь синхронизации (бейдж на task-board):
-    # сразу после создания outbox-строка уже поставлена → 'pending'.
+    # crm_task_id/crm_synced не входят в ответ; sync_status — единственная отдаваемая деталь: сразу после создания 'pending'.
     assert "crm_task_id" not in data
     assert "crm_synced" not in data
     assert data["sync_status"] == "pending"
@@ -62,8 +59,6 @@ async def test_create_task_empty_title(client: AsyncClient, mock_smtp: dict):
     r = await client.post("/create-task/", data={"data": json.dumps({"title": "", "description": "d"})})
     assert r.status_code == 422
 
-
-# ── Read / pagination ────────────────────────────────────────────────────────
 
 async def test_get_tasks_empty(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp)
@@ -97,9 +92,7 @@ async def test_get_tasks_second_page(client: AsyncClient, mock_smtp: dict):
 
 
 async def test_get_tasks_pages_are_ordered_by_id_and_disjoint(client: AsyncClient, mock_smtp: dict):
-    """Страницы не пересекаются и идут по возрастанию id, даже если строку
-    перед этим обновили (UPDATE в PostgreSQL физически перемещает версию строки,
-    и без ORDER BY страницы «плывут»: запись повторяется или пропадает)."""
+    """Страницы не пересекаются и идут по возрастанию id, даже если строку обновили (без ORDER BY страницы «плывут»)."""
     await _register_login(client, mock_smtp)
     ids = [(await _create(client, title=f"Task {i}")).json()["id"] for i in range(7)]
     assert (await client.patch(f"/tasks/{ids[0]}", json={"completed": True})).status_code == 200
@@ -122,8 +115,6 @@ async def test_get_tasks_invalid_skip(client: AsyncClient, mock_smtp: dict):
     r = await client.get("/tasks/?skip=-1")
     assert r.status_code == 422
 
-
-# ── Search ───────────────────────────────────────────────────────────────────
 
 async def test_search_tasks_found(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp)
@@ -158,8 +149,6 @@ async def test_search_tasks_unauthenticated(client: AsyncClient):
     r = await client.get("/tasks/search?title=anything")
     assert r.status_code == 401
 
-
-# ── Update ───────────────────────────────────────────────────────────────────
 
 async def test_update_task_success(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp)
@@ -199,12 +188,38 @@ async def test_update_task_not_found(client: AsyncClient, mock_smtp: dict):
     assert r.status_code == 404
 
 
+@pytest.mark.parametrize("payload", [{"title": None}, {"description": None}, {"completed": None}])
+async def test_update_task_explicit_null_for_not_null_field_returns_422_not_409(
+    client: AsyncClient, mock_smtp: dict, payload: dict,
+):
+    """Явный `null` для title/description/completed (NOT NULL) даёт 422 на уровне схемы, а не 409 из IntegrityError.
+    Название совпадает с существующей задачей специально — чтобы доказать, что срабатывает валидация null, а не проверка дубля.
+    """
+    await _register_login(client, mock_smtp)
+    await _create(client, title="PoC task")
+    other = (await _create(client, title="Other task")).json()
+
+    r = await client.patch(f"/tasks/{other['id']}", json=payload)
+
+    assert r.status_code == 422
+    stored = (await client.get(f"/tasks/{other['id']}")).json()
+    assert stored["title"] == "Other task"  # не изменилось
+
+
+async def test_update_task_missing_key_still_leaves_field_unchanged(client: AsyncClient, mock_smtp: dict):
+    """Отсутствие ключа (в отличие от явного null выше) — штатный частичный
+    update, exclude_unset=True — не должно задеваться новой валидацией."""
+    await _register_login(client, mock_smtp)
+    created = (await _create(client, title="Keep Title")).json()
+    r = await client.patch(f"/tasks/{created['id']}", json={"completed": True})
+    assert r.status_code == 200
+    assert r.json()["title"] == "Keep Title"
+
+
 async def test_update_task_unauthenticated(client: AsyncClient):
     r = await client.patch("/tasks/1", json={"title": "X"})
     assert r.status_code == 401
 
-
-# ── Delete ───────────────────────────────────────────────────────────────────
 
 async def test_delete_task_success(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp)
@@ -227,8 +242,6 @@ async def test_delete_task_unauthenticated(client: AsyncClient):
     r = await client.delete("/delete-task/1")
     assert r.status_code == 401
 
-
-# ── Collaborative access ─────────────────────────────────────────────────────
 
 async def test_other_user_can_update_task(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp, EMAIL1)
@@ -260,16 +273,9 @@ async def test_all_users_see_all_tasks(client: AsyncClient, mock_smtp: dict):
     assert "Visible To All" in [t["title"] for t in r.json()]
 
 
-# ── Concurrency / locking ────────────────────────────────────────────────────
-
 async def test_concurrent_delete_and_create_subtask_no_crash(client: AsyncClient, mock_smtp: dict):
-    """Регрессионный тест на FOR UPDATE в delete_task + обработку FK-violation
-    в create_subtask (см. subtasks.py::create_subtask): по-настоящему
-    параллельные delete_task и create_subtask для одной и той же задачи не
-    должны приводить ни к 500 (необработанная ошибка), ни к подзадаче-сироте,
-    ни к вводящему в заблуждение "already exists" при фактически удалённой
-    задаче — только к 201 (подзадача успела создаться до удаления) либо к
-    осмысленной 404/409.
+    """FOR UPDATE в delete_task и FK-violation в create_subtask: параллельные delete_task и create_subtask для одной задачи не дают ни 500,
+    ни подзадачи-сироты, ни ложного «already exists» — только 201 либо осмысленный 404/409.
     """
     await _register_login(client, mock_smtp)
     task = (await _create(client, title="RaceParent")).json()

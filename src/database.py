@@ -13,30 +13,20 @@ metadata = MetaData()
 
 
 class Base(DeclarativeBase):
-    # Явная передача metadata гарантирует, что все модели регистрируются
-    # в одном объекте MetaData — Alembic использует его при генерации миграций.
+    # Единый MetaData для всех моделей (использует Alembic).
     metadata = metadata
 
 
 _is_prod = settings.is_production
-# NullPool нужен только в тестах: pytest-asyncio создаёт новый event loop на каждый
-# тест, а QueuePool держит соединения привязанными к старому loop — при переходе
-# соединение оказывается «чужим» и asyncpg бросает RuntimeError.
-# В dev-режиме QueuePool оставляем: одиночный event loop uvicorn'а живёт весь запуск,
-# и переиспользование соединений даёт ощутимый прирост скорости при разработке.
+# NullPool только в тестах: pytest-asyncio создаёт новый event loop на тест, а QueuePool держал бы соединения старого loop.
 _is_test = settings.api_mode in ("test", "testing")
 
-# echo=True в dev/test режимах: SQLAlchemy логирует все SQL-запросы.
-# В production отключается — в продакшне объём логов SQL нерентабелен.
+# echo=True в dev/test; в production отключено.
 engine_kwargs = {"echo": not _is_prod}
 if _is_test:
     engine_kwargs["poolclass"] = NullPool
 else:
-    # pool_size/max_overflow: явно заданы через settings (см. src/config.py) вместо
-    # неявных дефолтов SQLAlchemy — конкретное значение настраивается per-deployment
-    # через DB_POOL_SIZE/DB_MAX_OVERFLOW в .env, не хардкодится здесь. NullPool
-    # (тестовый режим, ветка выше) не принимает pool_size/max_overflow вовсе —
-    # у него нет пула соединений как такового, поэтому это только для dev/prod.
+    # pool_size/max_overflow задаются через settings; NullPool их не принимает.
     engine_kwargs["pool_size"] = settings.DB_POOL_SIZE
     engine_kwargs["max_overflow"] = settings.DB_MAX_OVERFLOW
 
@@ -47,39 +37,22 @@ engine = create_async_engine(settings.ASYNC_DATABASE_URL, **engine_kwargs)
 create_async_engine(settings.ASYNC_DATABASE_URL, echo=True, poolclass=NullPool)
 """
 
-# expire_on_commit=False: после commit() атрибуты ORM-объектов не инвалидируются.
-# Без этого флага обращение к полю объекта после commit вызовет lazy SELECT —
-# в async-контексте это приводит к MissingGreenlet, т.к. нет активной сессии.
+# expire_on_commit=False: иначе атрибуты после commit() подгружались бы лениво (MissingGreenlet в async).
 async_session_maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
 async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
-    # Генератор-dependency для FastAPI Depends: сессия открывается на время
-    # обработки запроса и закрывается автоматически при выходе из контекста.
+    # Сессия на время запроса.
     async with async_session_maker() as session:
         yield session
 
 
 def run_isolated(coro: Awaitable[_T]) -> _T:
-    """Выполняет одну async-корутину в СВОЁМ event loop (asyncio.run) и
-    гарантированно освобождает пул соединений `engine` сразу после — иначе
-    следующий вызов asyncio.run() в этом же процессе (Celery-воркер выполняет
-    много задач за время жизни процесса, каждая — отдельный asyncio.run(), см.
-    src/tasks/crm_outbox_tasks.py/global_lists_tasks.py) попытался бы
-    переиспользовать asyncpg-соединение из QueuePool, физически привязанное к
-    уже закрытому event loop предыдущего вызова, и упал бы
-    `RuntimeError: ... got Future <...> attached to a different loop` —
-    обнаружено живым прогоном `docker compose up` (юнит-тесты этого не ловят:
-    один процесс pytest = один event loop на тест, но никогда не выполняет
-    ДВА отдельных asyncio.run() подряд в одном процессе поверх одного и того
-    же engine).
+    """Выполняет корутину в своём event loop (asyncio.run) и освобождает пул `engine` после.
 
-    Тот же класс проблемы, из-за которого src/database.py включает NullPool
-    для тестового режима (см. комментарий у engine_kwargs выше) — здесь
-    источник множественных event loop не pytest-asyncio, а повторные вызовы
-    Celery-задач, поэтому чинится не сменой poolclass (engine общий с
-    веб-процессом, где QueuePool наоборот нужен), а явным dispose() после
-    каждого изолированного запуска.
+    Celery-воркер делает много asyncio.run() подряд, и пул иначе переиспользовал бы asyncpg-соединение закрытого loop
+    (RuntimeError «attached to a different loop»). engine общий с веб-процессом, где QueuePool нужен, поэтому
+    чиним явным dispose(), а не сменой poolclass.
     """
     async def _wrapper() -> _T:
         try:

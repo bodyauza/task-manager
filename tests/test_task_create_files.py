@@ -1,16 +1,8 @@
-"""Тесты атомарного создания задачи с файлами одним HTTP-запросом (POST /create-task/).
+"""Тесты атомарного создания задачи с файлами (POST /create-task/).
 
-Покрытие:
-  Создание с ТЗ + иными документами в одном запросе — пути в ответе
-  Создание без файлов по-прежнему работает (файлы полностью опциональны)
-  Невалидный файл блокирует создание целиком (422, задача НЕ создана)
-  Best-effort сбой сохранения одного файла на диске — задача всё равно создаётся,
-    успешные файлы сохранены, сбойный — в file_upload_errors
-  Паритет валидации (пустой title, дубликат title) через multipart
-  CRM-синхронизация (текст + файлы) целиком отправлена в фон (Celery) — веб-
-    процесс сам CRM не вызывает, здесь проверяется, что появились нужные
-    outbox-строки ('create' + 'sync_files' с зависимостью на неё), а не факт
-    прямого CRM-вызова (для этого — tests/test_crm_outbox.py)
+Покрытие: ТЗ и иные документы одним запросом; создание без файлов; невалидный файл блокирует создание (422);
+best-effort сбой сохранения одного файла (задача создаётся, ошибка в file_upload_errors); паритет валидации;
+CRM-синхронизация проверяется по outbox-строкам ('create' и зависимая 'sync_files'), а не по прямому вызову CRM.
 """
 
 import json
@@ -62,8 +54,6 @@ def _multipart(
     return data, (files or None)
 
 
-# ── Атомарное создание с файлами ──────────────────────────────────────────────
-
 @pytest.mark.asyncio
 async def test_create_task_with_spec_and_other_files_success(client, mock_smtp, mock_magic, upload_root):
     await _auth(client, mock_smtp)
@@ -108,6 +98,18 @@ async def test_create_task_invalid_file_blocks_creation(client, mock_smtp, mock_
 
 
 @pytest.mark.asyncio
+async def test_create_task_forbidden_filename_chars_blocks_creation(client, mock_smtp, mock_magic, upload_root):
+    """Запрещённый символ в имени ТЗ блокирует создание целиком: проверка идёт до вставки задачи (validate_files_for_create)."""
+    await _auth(client, mock_smtp)
+    data, files = _multipart(title="Should Not Exist Either", spec=(_pdf(), "tz|1.pdf"))
+    r = await client.post("/create-task/", data=data, files=files)
+    assert r.status_code == 422
+
+    listed = await client.get("/tasks/")
+    assert "Should Not Exist Either" not in [t["title"] for t in listed.json()]
+
+
+@pytest.mark.asyncio
 async def test_create_task_disk_save_failure_partial(client, mock_smtp, mock_magic, upload_root, monkeypatch):
     """Один из нескольких валидных other_files не сохраняется на диск (не вина клиента) —
     задача всё равно создаётся, успешный файл сохранён, сбойный — в file_upload_errors.
@@ -116,10 +118,10 @@ async def test_create_task_disk_save_failure_partial(client, mock_smtp, mock_mag
 
     real_save_file = attachments_module.save_file
 
-    def _flaky_save_file(dest_dir, filename, content):
+    def _flaky_save_file(dest_dir, filename, content, upload_root):
         if filename.endswith("_bad.pdf"):
             raise OSError("simulated disk failure")
-        return real_save_file(dest_dir, filename, content)
+        return real_save_file(dest_dir, filename, content, upload_root)
 
     monkeypatch.setattr(attachments_module, "save_file", _flaky_save_file)
 
@@ -135,7 +137,36 @@ async def test_create_task_disk_save_failure_partial(client, mock_smtp, mock_mag
     assert "bad.pdf" in body["file_upload_errors"]
 
 
-# ── Паритет валидации ─────────────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_create_task_commit_failure_deletes_orphaned_files(
+    client, mock_smtp, mock_magic, upload_root, monkeypatch,
+):
+    """Файлы уже на диске до commit; при его падении транзакция откатывается целиком, и файлы остались бы сиротами. Теперь они удаляются,
+    а сбой всплывает клиенту.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    await _auth(client, mock_smtp)
+
+    original_commit = AsyncSession.commit
+    calls = {"n": 0}
+
+    async def _commit_raises_once(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated commit failure")
+        return await original_commit(self, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "commit", _commit_raises_once)
+
+    data, files = _multipart(spec=(_pdf(), "tz.pdf"), other=[(_pdf(), "a.pdf")])
+    # Голое исключение долетает до httpx как исключение (ASGITransport raise_app_exceptions=True), а не response(500); важно, что сбой не проглочен.
+    with pytest.raises(RuntimeError, match="simulated commit failure"):
+        await client.post("/create-task/", data=data, files=files)
+
+    # Оба файла (ТЗ и «иной документ») успели сохраниться на диск до сбоя commit.
+    assert [p for p in upload_root.rglob("*") if p.is_file()] == []
+
 
 @pytest.mark.asyncio
 async def test_create_task_multipart_empty_title(client, mock_smtp, upload_root):
@@ -156,8 +187,6 @@ async def test_create_task_multipart_duplicate_title(client, mock_smtp, upload_r
     assert r2.status_code == 409
 
 
-# ── CRM-синхронизация ─────────────────────────────────────────────────────────
-
 @pytest.mark.asyncio
 async def test_create_task_with_files_enqueues_create_and_sync_files_rows(
     client, mock_smtp, mock_magic, upload_root,
@@ -167,9 +196,7 @@ async def test_create_task_with_files_enqueues_create_and_sync_files_rows(
     r = await client.post("/create-task/", data=data, files=files)
     assert r.status_code == 201
     body = r.json()
-    # crm_task_id/crm_synced не в ответе (см. TaskResponse) — CRM ещё не
-    # тронута на момент ответа, синхронизация целиком в фоне; статус
-    # проверяется через outbox-строки ниже, не через ответ.
+    # crm_task_id/crm_synced не в ответе; CRM ещё не тронута, статус проверяем по outbox-строкам.
     rows = await _outbox_rows_for_task(body["id"])
     assert [r.operation for r in rows] == ["create", "sync_files"]
     create_row, sync_row = rows
@@ -178,8 +205,9 @@ async def test_create_task_with_files_enqueues_create_and_sync_files_rows(
     # см. src/services/tasks.py::create_task): обработчик прочитает его из БД позже.
     assert sync_row.depends_on_event_id == create_row.id
     assert sync_row.payload["crm_task_id"] is None
-    assert sync_row.payload["specification_path"] is not None
-    assert len(sync_row.payload["other_file_paths"]) == 1
+    # payload несёт флаги затронутых слотов, а не пути.
+    assert sync_row.payload["sync_specification"] is True
+    assert sync_row.payload["sync_other_files"] is True
 
 
 @pytest.mark.asyncio

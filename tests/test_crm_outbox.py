@@ -1,28 +1,17 @@
-"""Тесты durable-retry outbox (src/task_logic/models.py::CrmOutbox) — важнейший
-критерий: CRM-запрос, теряемый сегодня при падении процесса между db.commit()
-и вызовом CRM, должен переживать это падение, потому что строка crm_outbox
-коммитится В ТОЙ ЖЕ транзакции, что и основное изменение Task.
+"""Тесты durable outbox (CrmOutbox): строка коммитится в одной транзакции с изменением, поэтому CRM-запрос переживает падение процесса.
 
 Покрытие:
-  Продюсер (services/tasks.py/subtasks.py) — здесь только то, что специфично
-    именно durable-outbox механике и не покрыто tests/test_task_service.py/
-    test_subtask_service.py: sticky-шардирование (id % N) и зависимость
-    create подзадачи от ещё не готового create родителя (depends_on_event_id).
-    Синхронных попыток вызвать CRM в продюсерах больше нет — веб-процесс CRM
-    вообще не вызывает, только вставляет строку и диспатчит её в Celery (см.
-    src/tasks/crm_outbox_tasks.py::dispatch_outbox_row, замоканную здесь через
-    автоиспользуемую tests/conftest.py::mock_outbox_dispatch).
-  Консьюмер (crm_outbox_tasks._process_outbox_row_async) — повторяет операцию
-    по сохранённому payload, не читая исходную (возможно, уже несуществующую
-    после каскадного удаления) строку Task.
-  reconcile — находит только 'pending' строки старше грейс-периода.
+- продюсер: только специфичное для outbox — sticky-шардирование (id % N) и зависимость create подзадачи от create родителя
+  (остальное — в test_task_service.py/test_subtask_service.py; dispatch замокан через mock_outbox_dispatch);
+- консьюмер (_process_outbox_row_async): повторяет операцию по payload, не читая исходную строку Task;
+- reconcile: находит только 'pending' старше грейс-периода.
 
-Вызывает _process_outbox_row_async/_reconcile_pending_outbox_async напрямую
-(await), не через Celery .delay() — см. предупреждение в src/celery_app.py
-про asyncio.run() внутри уже работающего event loop.
+_process_outbox_row_async/_reconcile_pending_outbox_async вызываются напрямую (await), а не через Celery .delay().
 """
 
+import asyncio
 import datetime
+import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -38,9 +27,7 @@ from tests.conftest import make_user as _make_user
 
 
 class _NoopLock:
-    """Async context manager заглушка для src.tasks.crm_shard_lock.shard_lock —
-    тесты этого модуля не поднимают реальный Redis (тот же принцип, что и для
-    CRM: мокается прямая зависимость, а не внешняя система)."""
+    """Заглушка async context manager для shard_lock: реальный Redis в тестах не поднимается."""
 
     async def __aenter__(self):
         return None
@@ -70,12 +57,7 @@ async def _outbox_rows(session, task_id: int) -> list[CrmOutbox]:
     return await _outbox_rows_for(session, "task", task_id)
 
 
-# ── Продюсер: sticky-шардирование и зависимость подзадачи от родителя ───────────
-#
-# Payload/pending-статус вставляемых строк и факт диспатча уже подробно
-# проверены в tests/test_task_service.py и tests/test_subtask_service.py (там
-# же — mock_outbox_dispatch из conftest.py, автоиспользуемый и здесь). Здесь —
-# только то, что специфично именно этому модулю: шардирование id % N и
+# Продюсер: payload и диспатч проверены в test_task_service.py/test_subtask_service.py; здесь — шардирование id % N и
 # depends_on_event_id между create подзадачи и create родителя.
 
 async def test_create_task_inserts_pending_create_row_with_shard():
@@ -113,9 +95,7 @@ async def test_create_subtask_inserts_create_row_when_parent_synced():
 
 
 async def test_create_subtask_create_row_depends_on_parent_pending_create():
-    """Родитель ещё не синхронизирован (его собственное 'create' — pending) —
-    create подзадачи получает depends_on_event_id, указывающий на строку
-    родителя."""
+    """Родитель ещё не синхронизирован (его create — pending): create подзадачи получает depends_on_event_id на строку родителя."""
     async with async_session_maker() as session:
         user = await _make_user(session)
         task = await task_service.create_task(session, user, TaskCreate(title="Parent2", description="d"))
@@ -134,17 +114,11 @@ async def test_create_subtask_create_row_depends_on_parent_pending_create():
         assert rows[0].depends_on_event_id == parent_rows[0].id
 
 
-# ── dispatch_outbox_row: устойчивость к недоступности Celery/Redis ──────────────
-
 async def test_dispatch_outbox_row_swallows_apply_async_failure(caplog):
-    """Ключевой тест: apply_async может бросить исключение (брокер Celery/
-    Redis временно недоступен) — dispatch_outbox_row обязана перехватить его
-    сама (см. её докстринг), а не дать ему улететь наверх. Строка к этому
-    моменту уже закоммичена в PostgreSQL — необработанное исключение здесь
-    превратило бы уже состоявшееся успешное создание/изменение в ложный HTTP
-    500, будто ничего не сохранилось (mock_outbox_dispatch в conftest.py
-    подменяет саму функцию целиком и поэтому не мог бы поймать регрессию
-    внутри неё — нужен тест именно настоящей dispatch_outbox_row)."""
+    """apply_async может бросить исключение (брокер недоступен): dispatch_outbox_row обязана перехватить его, иначе уже
+    состоявшееся изменение превратилось бы в ложный 500. mock_outbox_dispatch подменяет функцию целиком,
+    поэтому тестируется настоящая dispatch_outbox_row.
+    """
     from src.tasks.crm_outbox_tasks import dispatch_outbox_row
 
     row = CrmOutbox(
@@ -155,14 +129,44 @@ async def test_dispatch_outbox_row_swallows_apply_async_failure(caplog):
         "src.tasks.crm_outbox_tasks.process_outbox_row.apply_async",
         side_effect=Exception("Celery broker unreachable"),
     ):
-        dispatch_outbox_row(row)  # не должно бросить исключение
+        await dispatch_outbox_row(row)  # не должно бросить исключение
 
     # Сбой не проглочен молча: он залогирован, и строка остаётся pending для reconcile.
     assert "немедленный диспатч не удался" in caplog.text
     assert "Celery broker unreachable" in caplog.text
 
 
-# ── Консьюмер: _process_outbox_row_async ─────────────────────────────────────────
+async def test_dispatch_outbox_row_does_not_block_event_loop():
+    """apply_async — синхронный сетевой вызов; без asyncio.to_thread внутри dispatch_outbox_row он блокирует event loop.
+    apply_async имитирует задержку time.sleep() (asyncio.sleep блокировку не воспроизвёл бы).
+
+    Разница — в общем времени gather(): при неблокирующем loop apply_async и тики идут параллельно (≈ 0.5 с), иначе
+    последовательно (≈ 0.9 с). Порог 0.8 с рассчитан с запасом на нагрузку при параллельном прогоне.
+    """
+    from src.tasks.crm_outbox_tasks import dispatch_outbox_row
+
+    row = CrmOutbox(
+        id=1, aggregate_type="task", aggregate_id=1, operation="create", shard="shard_0",
+        payload={"title": "X", "description": "d", "completed": False, "project": None},
+    )
+
+    async def _ticker():
+        for _ in range(40):
+            await asyncio.sleep(0.01)
+
+    def _blocking_apply_async(*args, **kwargs):
+        time.sleep(0.5)
+
+    with patch(
+        "src.tasks.crm_outbox_tasks.process_outbox_row.apply_async",
+        side_effect=_blocking_apply_async,
+    ):
+        start = time.perf_counter()
+        await asyncio.gather(dispatch_outbox_row(row), _ticker())
+        elapsed = time.perf_counter() - start
+
+    assert elapsed < 0.8, f"gather() занял {elapsed:.3f} с — apply_async, похоже, блокирует event loop"
+
 
 async def test_process_outbox_row_update_calls_task_manager_and_marks_done():
     async with async_session_maker() as session:
@@ -188,15 +192,21 @@ async def test_process_outbox_row_update_calls_task_manager_and_marks_done():
         assert row.attempts == 1
 
 
-async def test_process_outbox_row_sync_files_reads_paths_from_payload():
+async def test_sync_files_task_reads_current_state_from_db():
+    """payload несёт только флаги sync_specification/sync_other_files; пути обработчик читает из БД в момент обработки."""
     async with async_session_maker() as session:
+        user = await _make_user(session)
+        task = Task(
+            title="SyncState", description="d", owner_id=user.id, crm_task_id=42, crm_shard="shard_0",
+            specification_path="tasks/1/specification/x.pdf", other_file_paths=["tasks/1/other/y.pdf"],
+        )
+        session.add(task)
+        await session.commit()
+        task_id = task.id
+
         row = CrmOutbox(
-            aggregate_type="task", aggregate_id=1, operation="sync_files", status="pending",
-            payload={
-                "crm_task_id": 42,
-                "specification_path": "tasks/1/specification/x.pdf",
-                "other_file_paths": ["tasks/1/other/y.pdf"],
-            },
+            aggregate_type="task", aggregate_id=task_id, operation="sync_files", status="pending",
+            payload={"crm_task_id": 42, "sync_specification": True, "sync_other_files": True},
         )
         session.add(row)
         await session.commit()
@@ -213,8 +223,320 @@ async def test_process_outbox_row_sync_files_reads_paths_from_payload():
     assert str(kwargs["specification_abs_path"]).replace("\\", "/").endswith(
         "tasks/1/specification/x.pdf"
     )
+    assert kwargs["clear_specification"] is False
     assert len(kwargs["other_file_abs_paths"]) == 1
 
+    async with async_session_maker() as session:
+        row = (await session.execute(select(CrmOutbox).where(CrmOutbox.id == outbox_id))).scalar_one()
+        assert row.status == "done"
+
+
+async def test_sync_files_task_ignores_insertion_order_uses_current_db_state():
+    """У задачи две pending sync_files-строки, но Task.specification_path уже отражает последнее состояние:
+    какую бы строку воркер ни обработал, в CRM уйдёт одно и то же актуальное состояние.
+    """
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        task = Task(
+            title="OrderIndependent", description="d", owner_id=user.id, crm_task_id=42, crm_shard="shard_0",
+            specification_path="tasks/1/specification/new.pdf",
+        )
+        session.add(task)
+        await session.commit()
+        task_id = task.id
+
+        older = CrmOutbox(
+            aggregate_type="task", aggregate_id=task_id, operation="sync_files", status="pending",
+            payload={"crm_task_id": 42, "sync_specification": True},
+        )
+        session.add(older)
+        await session.commit()
+        older_id = older.id
+
+        newer = CrmOutbox(
+            aggregate_type="task", aggregate_id=task_id, operation="sync_files", status="pending",
+            payload={"crm_task_id": 42, "sync_specification": True},
+        )
+        session.add(newer)
+        await session.commit()
+
+    fake_task_mgr = AsyncMock()
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=fake_task_mgr):
+        from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+        await _process_outbox_row_async(older_id)  # обрабатываем СТАРУЮ строку первой
+
+    fake_task_mgr.update_task.assert_called_once()
+    kwargs = fake_task_mgr.update_task.call_args.kwargs
+    # Старая строка всё равно отправляет АКТУАЛЬНОЕ состояние ("new.pdf"), не то,
+    # что могло бы быть снимком на момент её вставки.
+    assert str(kwargs["specification_abs_path"]).replace("\\", "/").endswith("new.pdf")
+
+    async with async_session_maker() as session:
+        row = (await session.execute(select(CrmOutbox).where(CrmOutbox.id == older_id))).scalar_one()
+        assert row.status == "done"
+
+
+async def test_sync_files_task_closes_internal_create_dependent_gap():
+    """Внутриагрегатная строка create+sync_files (crm_task_id=None в payload): путь читается из БД так же, как crm_task_id,
+    поэтому замена файла до первой обработки create не теряется.
+    """
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        # crm_task_id уже проставлен, а specification_path отражает файл, заменённый после вставки sync_files-строки.
+        task = Task(
+            title="GapClosed", description="d", owner_id=user.id, crm_task_id=99, crm_shard="shard_0",
+            specification_path="tasks/1/specification/replaced.pdf",
+        )
+        session.add(task)
+        await session.commit()
+        task_id = task.id
+
+        row = CrmOutbox(
+            aggregate_type="task", aggregate_id=task_id, operation="sync_files", status="pending",
+            payload={"crm_task_id": None, "sync_specification": True},
+        )
+        session.add(row)
+        await session.commit()
+        outbox_id = row.id
+
+    fake_task_mgr = AsyncMock()
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=fake_task_mgr):
+        from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+        await _process_outbox_row_async(outbox_id)
+
+    kwargs = fake_task_mgr.update_task.call_args.kwargs
+    assert kwargs["task_id"] == 99  # crm_task_id прочитан из актуальной Task, не из payload (там None)
+    assert str(kwargs["specification_abs_path"]).replace("\\", "/").endswith("replaced.pdf")
+
+
+async def test_update_task_with_null_crm_id_reads_it_from_entity():
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        task = Task(title="T", description="d", owner_id=user.id, crm_task_id=77, crm_shard="shard_0")
+        session.add(task)
+        await session.commit()
+        row = CrmOutbox(
+            aggregate_type="task", aggregate_id=task.id, operation="update", status="pending",
+            payload={"crm_task_id": None, "title": "Renamed", "description": None,
+                     "completed": None, "project": None},
+        )
+        session.add(row)
+        await session.commit()
+        outbox_id = row.id
+
+    fake_task_mgr = AsyncMock()
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=fake_task_mgr):
+        from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+        await _process_outbox_row_async(outbox_id)
+
+    kwargs = fake_task_mgr.update_task.call_args.kwargs
+    assert kwargs["task_id"] == 77
+    assert kwargs["title"] == "Renamed"
+
+
+async def test_update_subtask_with_null_crm_id_reads_it_from_entity():
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        task = Task(title="T", description="d", owner_id=user.id, crm_task_id=10, crm_shard="shard_0")
+        session.add(task)
+        await session.commit()
+        subtask = Subtask(title="S", task_id=task.id, crm_subtask_id=55)
+        session.add(subtask)
+        await session.commit()
+        row = CrmOutbox(
+            aggregate_type="subtask", aggregate_id=subtask.id, operation="update", status="pending",
+            payload={"crm_subtask_id": None, "title": "Renamed", "description": None, "completed": None},
+        )
+        session.add(row)
+        await session.commit()
+        outbox_id = row.id
+
+    fake_mgr = AsyncMock()
+    with patch("src.tasks.crm_outbox_tasks.SubtaskManager", return_value=fake_mgr):
+        from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+        await _process_outbox_row_async(outbox_id)
+
+    kwargs = fake_mgr.update_subtask.call_args.kwargs
+    assert kwargs["subtask_id"] == 55
+    assert kwargs["title"] == "Renamed"
+
+
+async def test_sync_files_task_entity_deleted_is_noop():
+    """delete_task удаляет Task синхронно, до обработки строки: задача читается всегда, и её отсутствие — тихий 'done' без обращения к CRM."""
+    async with async_session_maker() as session:
+        row = CrmOutbox(
+            aggregate_type="task", aggregate_id=999999, operation="sync_files", status="pending",
+            payload={"crm_task_id": 42, "sync_specification": True},
+        )
+        session.add(row)
+        await session.commit()
+        outbox_id = row.id
+
+    fake_task_mgr = AsyncMock()
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=fake_task_mgr):
+        from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+        await _process_outbox_row_async(outbox_id)
+
+    fake_task_mgr.update_task.assert_not_called()
+    async with async_session_maker() as session:
+        row = (await session.execute(select(CrmOutbox).where(CrmOutbox.id == outbox_id))).scalar_one()
+        assert row.status == "done"
+
+
+async def test_sync_files_task_clears_specification_when_current_state_none():
+    """sync_specification=True, но specification_path сейчас None (файл удалён): обработчик сам видит «пусто» и чистит поле в CRM."""
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        task = Task(
+            title="ClearedSpec", description="d", owner_id=user.id, crm_task_id=42, crm_shard="shard_0",
+            specification_path=None,
+        )
+        session.add(task)
+        await session.commit()
+        task_id = task.id
+
+        row = CrmOutbox(
+            aggregate_type="task", aggregate_id=task_id, operation="sync_files", status="pending",
+            payload={"crm_task_id": 42, "sync_specification": True},
+        )
+        session.add(row)
+        await session.commit()
+        outbox_id = row.id
+
+    fake_task_mgr = AsyncMock()
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=fake_task_mgr):
+        from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+        await _process_outbox_row_async(outbox_id)
+
+    kwargs = fake_task_mgr.update_task.call_args.kwargs
+    assert kwargs["specification_abs_path"] is None
+    assert kwargs["clear_specification"] is True
+
+
+async def test_sync_files_task_skips_untouched_slot():
+    """sync_other_files нет в payload (событие только про ТЗ): поле «иных документов» в CRM не уходит, даже если в БД оно заполнено."""
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        task = Task(
+            title="UntouchedSlot", description="d", owner_id=user.id, crm_task_id=42, crm_shard="shard_0",
+            specification_path="tasks/1/specification/x.pdf",
+            other_file_paths=["tasks/1/other/a.pdf", "tasks/1/other/b.pdf"],
+        )
+        session.add(task)
+        await session.commit()
+        task_id = task.id
+
+        row = CrmOutbox(
+            aggregate_type="task", aggregate_id=task_id, operation="sync_files", status="pending",
+            payload={"crm_task_id": 42, "sync_specification": True},  # sync_other_files отсутствует
+        )
+        session.add(row)
+        await session.commit()
+        outbox_id = row.id
+
+    fake_task_mgr = AsyncMock()
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=fake_task_mgr):
+        from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+        await _process_outbox_row_async(outbox_id)
+
+    kwargs = fake_task_mgr.update_task.call_args.kwargs
+    assert kwargs["other_file_abs_paths"] is None  # не тронуто, хотя в БД список непустой
+
+
+async def test_sync_files_task_file_not_found_is_ordinary_failure():
+    """Остаточный FileNotFoundError — обычный сбой: попытка потрачена, строка остаётся pending, last_error заполнен."""
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        task = Task(
+            title="GoneFile", description="d", owner_id=user.id, crm_task_id=42, crm_shard="shard_0",
+            specification_path="tasks/1/specification/gone.pdf",
+        )
+        session.add(task)
+        await session.commit()
+        task_id = task.id
+
+        row = CrmOutbox(
+            aggregate_type="task", aggregate_id=task_id, operation="sync_files", status="pending",
+            payload={"crm_task_id": 42, "sync_specification": True},
+        )
+        session.add(row)
+        await session.commit()
+        outbox_id = row.id
+
+    fake_task_mgr = AsyncMock()
+    fake_task_mgr.update_task.side_effect = FileNotFoundError(
+        "[Errno 2] No such file or directory: 'tasks/1/specification/gone.pdf'"
+    )
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=fake_task_mgr):
+        from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+        await _process_outbox_row_async(outbox_id)
+
+    async with async_session_maker() as session:
+        row = (await session.execute(select(CrmOutbox).where(CrmOutbox.id == outbox_id))).scalar_one()
+        assert row.status == "pending"
+        assert row.attempts == 1
+        assert "FileNotFoundError" in row.last_error
+
+
+async def test_sync_files_subtask_reads_current_state_from_db():
+    """Симметрично test_sync_files_task_reads_current_state_from_db, для
+    _do_sync_files_subtask."""
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        task = Task(title="Parent", description="d", owner_id=user.id, crm_task_id=1, crm_shard="shard_0")
+        session.add(task)
+        await session.commit()
+        subtask = Subtask(
+            title="Sub", description="d", task_id=task.id, crm_subtask_id=77,
+            specification_path="subtasks/1/specification/x.pdf", other_file_paths=["subtasks/1/other/y.pdf"],
+        )
+        session.add(subtask)
+        await session.commit()
+        subtask_id = subtask.id
+
+        row = CrmOutbox(
+            aggregate_type="subtask", aggregate_id=subtask_id, operation="sync_files", status="pending",
+            payload={"crm_subtask_id": 77, "sync_specification": True, "sync_other_files": True},
+        )
+        session.add(row)
+        await session.commit()
+        outbox_id = row.id
+
+    fake_subtask_mgr = AsyncMock()
+    with patch("src.tasks.crm_outbox_tasks.SubtaskManager", return_value=fake_subtask_mgr):
+        from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+        await _process_outbox_row_async(outbox_id)
+
+    fake_subtask_mgr.update_subtask.assert_called_once()
+    kwargs = fake_subtask_mgr.update_subtask.call_args.kwargs
+    assert kwargs["subtask_id"] == 77
+    assert str(kwargs["specification_abs_path"]).replace("\\", "/").endswith(
+        "subtasks/1/specification/x.pdf"
+    )
+    assert len(kwargs["other_file_abs_paths"]) == 1
+
+    async with async_session_maker() as session:
+        row = (await session.execute(select(CrmOutbox).where(CrmOutbox.id == outbox_id))).scalar_one()
+        assert row.status == "done"
+
+
+async def test_sync_files_subtask_entity_deleted_is_noop():
+    """Симметрично test_sync_files_task_entity_deleted_is_noop."""
+    async with async_session_maker() as session:
+        row = CrmOutbox(
+            aggregate_type="subtask", aggregate_id=999999, operation="sync_files", status="pending",
+            payload={"crm_subtask_id": 77, "sync_specification": True},
+        )
+        session.add(row)
+        await session.commit()
+        outbox_id = row.id
+
+    fake_subtask_mgr = AsyncMock()
+    with patch("src.tasks.crm_outbox_tasks.SubtaskManager", return_value=fake_subtask_mgr):
+        from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+        await _process_outbox_row_async(outbox_id)
+
+    fake_subtask_mgr.update_subtask.assert_not_called()
     async with async_session_maker() as session:
         row = (await session.execute(select(CrmOutbox).where(CrmOutbox.id == outbox_id))).scalar_one()
         assert row.status == "done"
@@ -245,9 +567,7 @@ async def test_process_outbox_row_delete_cascades_subtasks_then_task():
 
 
 async def test_process_outbox_row_already_done_is_noop():
-    """Гонка: синхронная попытка в исходном запросе успела завершиться (пометив
-    строку 'done') ДО того, как reconcile успел её подхватить — повторного
-    обращения к CRM быть не должно."""
+    """Синхронная попытка успела пометить строку 'done' до reconcile — повторного обращения к CRM быть не должно."""
     async with async_session_maker() as session:
         row = CrmOutbox(
             aggregate_type="task", aggregate_id=1, operation="update", status="done",
@@ -310,12 +630,8 @@ async def test_process_outbox_row_marks_failed_after_max_attempts():
         assert row.attempts == MAX_ATTEMPTS
 
 
-# ── Консьюмер: create (идемпотентность через find_task/find_subtask) ────────────
-
 async def test_process_outbox_row_create_task_finds_existing_record_instead_of_duplicating():
-    """Retry 'create' после сбоя между «CRM создала запись» и «мы записали
-    crm_task_id» не должен создать дубликат — find_task находит уже
-    существующую запись первой."""
+    """Retry 'create' после сбоя между созданием в CRM и записью crm_task_id не создаёт дубликат: find_task находит запись по Local ID."""
     from src.tasks.crm_outbox_tasks import _process_outbox_row_async
 
     async with async_session_maker() as session:
@@ -339,7 +655,7 @@ async def test_process_outbox_row_create_task_finds_existing_record_instead_of_d
         await _process_outbox_row_async(outbox_id)
 
     fake_task_mgr.create_task.assert_not_called()
-    fake_task_mgr.find_task.assert_called_once_with("Found", "d")
+    fake_task_mgr.find_task.assert_called_once_with(task_id)
 
     async with async_session_maker() as session:
         row = (await session.execute(select(CrmOutbox).where(CrmOutbox.id == outbox_id))).scalar_one()
@@ -349,10 +665,148 @@ async def test_process_outbox_row_create_task_finds_existing_record_instead_of_d
         assert task.sync_status == "synced"
 
 
+async def test_create_task_finds_by_local_id_and_creates_with_local_id():
+    """find_task ищет по точному Local ID (= row.aggregate_id), а create_task передаёт тот же local_id при создании записи."""
+    from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        task = Task(title="WithLocalId", description="d", owner_id=user.id, crm_task_id=None, crm_shard="shard_0")
+        session.add(task)
+        await session.commit()
+        task_id = task.id
+
+        row = CrmOutbox(
+            aggregate_type="task", aggregate_id=task_id, operation="create", shard="shard_0",
+            payload={
+                "title": "WithLocalId", "description": "d", "completed": False, "project": None,
+                "creator_email": "alice@example.com",
+            },
+        )
+        session.add(row)
+        await session.commit()
+        outbox_id = row.id
+
+    fake_task_mgr = AsyncMock()
+    fake_task_mgr.find_task.return_value = None  # не найдено — реальный create_task
+    fake_task_mgr.create_task.return_value = {"id": "78"}
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=fake_task_mgr):
+        await _process_outbox_row_async(outbox_id)
+
+    fake_task_mgr.find_task.assert_called_once_with(task_id)
+    fake_task_mgr.create_task.assert_called_once_with(
+        local_id=task_id, title="WithLocalId", description="d",
+        completed=False, project=None, creator_email="alice@example.com",
+    )
+
+
+async def test_create_task_rejects_adopting_crm_id_already_owned_by_another_task():
+    """Явная проверка владельца — резервный барьер на случай, если find_task вернёт запись другой локальной задачи (например, ошибка
+    конфигурации CRM_TASK_FIELD_LOCAL_ID): «усыновление» отклоняется явной ошибкой.
+    """
+    from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        owner_task = Task(
+            title="Owner", description="d", owner_id=user.id, crm_task_id=77, crm_shard="shard_0",
+        )
+        adopter_task = Task(
+            title="Adopter", description="d2", owner_id=user.id, crm_task_id=None, crm_shard="shard_0",
+        )
+        session.add_all([owner_task, adopter_task])
+        await session.commit()
+        adopter_id = adopter_task.id
+
+        row = CrmOutbox(
+            aggregate_type="task", aggregate_id=adopter_id, operation="create", shard="shard_0",
+            payload={"title": "Adopter", "description": "d2", "completed": False, "project": None},
+        )
+        session.add(row)
+        await session.commit()
+        outbox_id = row.id
+
+    fake_task_mgr = AsyncMock()
+    fake_task_mgr.find_task.return_value = {"id": "77"}  # find_task "вернул" чужую запись
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=fake_task_mgr):
+        await _process_outbox_row_async(outbox_id)
+
+    fake_task_mgr.create_task.assert_not_called()  # find_task уже что-то "нашёл" — insert не нужен
+    async with async_session_maker() as session:
+        row = (await session.execute(select(CrmOutbox).where(CrmOutbox.id == outbox_id))).scalar_one()
+        assert row.status == "pending"  # обычный сбой попытки, не done
+        assert "усыновление" in row.last_error
+
+        adopter = (await session.execute(select(Task).where(Task.id == adopter_id))).scalar_one()
+        assert adopter.crm_task_id is None  # НЕ присвоен чужой crm_id
+
+        owner = (await session.execute(select(Task).where(Task.title == "Owner"))).scalar_one()
+        assert owner.crm_task_id == 77  # владелец не тронут
+
+
+async def test_process_outbox_row_final_commit_integrity_error_marks_failed_with_diagnostics():
+    """Unique-индекс срабатывает только на финальном commit (conflicting_owner ничего не видит) — смоделировано monkeypatch AsyncSession.commit.
+    Ранее такой commit был вне try/except: транзакция откатывалась целиком и строка вечно оставалась pending.
+    Теперь — терминальный 'failed' с понятным last_error.
+    """
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        task = Task(
+            title="RaceVictim", description="d", owner_id=user.id, crm_task_id=None, crm_shard="shard_0",
+        )
+        session.add(task)
+        await session.commit()
+        task_id = task.id
+
+        row = CrmOutbox(
+            aggregate_type="task", aggregate_id=task_id, operation="create", shard="shard_0",
+            payload={"title": "RaceVictim", "description": "d", "completed": False, "project": None},
+        )
+        session.add(row)
+        await session.commit()
+        outbox_id = row.id
+
+    fake_task_mgr = AsyncMock()
+    fake_task_mgr.find_task.return_value = None  # conflicting_owner-проверка проходит без возражений
+    fake_task_mgr.create_task.return_value = {"id": "500"}
+
+    original_commit = AsyncSession.commit
+    calls = {"n": 0}
+
+    async def _commit_raises_once(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise IntegrityError(
+                "INSERT", {},
+                Exception('duplicate key value violates unique constraint "ix_task_crm_task_id_unique"'),
+            )
+        return await original_commit(self, *args, **kwargs)
+
+    with patch("src.tasks.crm_outbox_tasks.TaskManager", return_value=fake_task_mgr), \
+         patch.object(AsyncSession, "commit", new=_commit_raises_once):
+        await _process_outbox_row_async(outbox_id)
+
+    # Первый commit упал (перехвачен новым except), второй (внутри него) реально закоммитил.
+    assert calls["n"] == 2
+
+    async with async_session_maker() as session:
+        row = (await session.execute(select(CrmOutbox).where(CrmOutbox.id == outbox_id))).scalar_one()
+        assert row.status == "failed"          # терминальное состояние, не тихий бесконечный retry
+        assert row.attempts == 1
+        assert "IntegrityError" in row.last_error
+        assert "unique constraint" in row.last_error
+
+        refreshed_task = (await session.execute(select(Task).where(Task.id == task_id))).scalar_one()
+        assert refreshed_task.sync_status == "failed"  # _refresh_sync_status пересчитан после rollback
+
+
 async def test_process_outbox_row_create_subtask_reads_fresh_parent_crm_task_id():
-    """_do_create_subtask должен использовать актуальный task.crm_task_id из
-    БД, а не то, что было в payload на момент вставки (его там и не было —
-    родитель тогда ещё не был синхронизирован)."""
+    """_do_create_subtask использует актуальный task.crm_task_id из БД, а не payload (родитель при вставке ещё не был синхронизирован)."""
     from src.tasks.crm_outbox_tasks import _process_outbox_row_async
 
     async with async_session_maker() as session:
@@ -379,20 +833,58 @@ async def test_process_outbox_row_create_subtask_reads_fresh_parent_crm_task_id(
     with patch("src.tasks.crm_outbox_tasks.SubtaskManager", return_value=fake_subtask_mgr):
         await _process_outbox_row_async(outbox_id)
 
+    fake_subtask_mgr.find_subtask.assert_called_once_with(subtask_id)
     fake_subtask_mgr.create_subtask.assert_called_once_with(
-        parent_item_id=42, title="Sub", description="d", completed=False, creator_email=None,
+        parent_item_id=42, local_id=subtask_id, title="Sub", description="d", completed=False, creator_email=None,
     )
     async with async_session_maker() as session:
         subtask = (await session.execute(select(Subtask).where(Subtask.id == subtask_id))).scalar_one()
         assert subtask.crm_subtask_id == 88
 
 
-# ── Консьюмер: идемпотентность delete (фикс известного ограничения) ─────────────
+async def test_create_subtask_rejects_adopting_crm_id_already_owned_by_another_subtask():
+    """Симметрично версии для задач: резервный барьер против «усыновления» чужого crm_id."""
+    from src.tasks.crm_outbox_tasks import _process_outbox_row_async
+
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        task = Task(title="Parent", description="d", owner_id=user.id, crm_task_id=42, crm_shard="shard_0")
+        session.add(task)
+        await session.flush()
+        owner_sub = Subtask(title="OwnerSub", description="d", task_id=task.id, crm_subtask_id=77)
+        adopter_sub = Subtask(title="AdopterSub", description="d2", task_id=task.id, crm_subtask_id=None)
+        session.add_all([owner_sub, adopter_sub])
+        await session.commit()
+        adopter_id = adopter_sub.id
+
+        row = CrmOutbox(
+            aggregate_type="subtask", aggregate_id=adopter_id, operation="create", shard="shard_0",
+            payload={"title": "AdopterSub", "description": "d2", "completed": False},
+        )
+        session.add(row)
+        await session.commit()
+        outbox_id = row.id
+
+    fake_subtask_mgr = AsyncMock()
+    fake_subtask_mgr.find_subtask.return_value = {"id": "77"}
+    with patch("src.tasks.crm_outbox_tasks.SubtaskManager", return_value=fake_subtask_mgr):
+        await _process_outbox_row_async(outbox_id)
+
+    fake_subtask_mgr.create_subtask.assert_not_called()
+    async with async_session_maker() as session:
+        row = (await session.execute(select(CrmOutbox).where(CrmOutbox.id == outbox_id))).scalar_one()
+        assert row.status == "pending"
+        assert "усыновление" in row.last_error
+
+        adopter = (await session.execute(select(Subtask).where(Subtask.id == adopter_id))).scalar_one()
+        assert adopter.crm_subtask_id is None
+
+        owner = (await session.execute(select(Subtask).where(Subtask.title == "OwnerSub"))).scalar_one()
+        assert owner.crm_subtask_id == 77
+
 
 async def test_process_outbox_row_delete_treats_already_absent_record_as_success():
-    """Фикс: раньше CRMRecordNotFoundError не отличался от реального сбоя —
-    повтор удаления уже отсутствующей в CRM записи 'проваливался' бы вечно.
-    Теперь это трактуется как достигнутая цель — строка помечается 'done'."""
+    """CRMRecordNotFoundError — достигнутая цель: строка помечается 'done', а не проваливается вечно."""
     from src.crm.client import CRMRecordNotFoundError
     from src.tasks.crm_outbox_tasks import _process_outbox_row_async
 
@@ -419,8 +911,6 @@ async def test_process_outbox_row_delete_treats_already_absent_record_as_success
         assert row.attempts == 1  # не выросло дальше при повторных вызовах — цель достигнута с первого раза
 
 
-# ── Консьюмер: depends_on_event_id (зависимости) ─────────────────────────────────
-
 async def test_process_outbox_row_waits_when_dependency_still_pending():
     from src.tasks.crm_outbox_tasks import _process_outbox_row_async
 
@@ -436,7 +926,7 @@ async def test_process_outbox_row_waits_when_dependency_still_pending():
         dependent = CrmOutbox(
             aggregate_type="task", aggregate_id=1, operation="sync_files", status="pending", shard="shard_0",
             depends_on_event_id=dep_id,
-            payload={"crm_task_id": None, "specification_path": "x.pdf", "other_file_paths": None},
+            payload={"crm_task_id": None, "sync_specification": True},
         )
         session.add(dependent)
         await session.commit()
@@ -468,7 +958,7 @@ async def test_process_outbox_row_becomes_blocked_when_dependency_failed():
         dependent = CrmOutbox(
             aggregate_type="task", aggregate_id=1, operation="sync_files", status="pending", shard="shard_0",
             depends_on_event_id=dep_id,
-            payload={"crm_task_id": None, "specification_path": "x.pdf", "other_file_paths": None},
+            payload={"crm_task_id": None, "sync_specification": True},
         )
         session.add(dependent)
         await session.commit()
@@ -496,12 +986,12 @@ async def test_reconcile_blocked_outbox_unblocks_when_dependency_done():
         blocked = CrmOutbox(
             aggregate_type="task", aggregate_id=1, operation="sync_files", status="blocked", shard="shard_0",
             depends_on_event_id=dep_id,
-            payload={"crm_task_id": None, "specification_path": "x.pdf", "other_file_paths": None},
+            payload={"crm_task_id": None, "sync_specification": True},
         )
         still_blocked = CrmOutbox(
             aggregate_type="task", aggregate_id=2, operation="sync_files", status="blocked", shard="shard_0",
             depends_on_event_id=None,
-            payload={"crm_task_id": None, "specification_path": "y.pdf", "other_file_paths": None},
+            payload={"crm_task_id": None, "sync_specification": True},
         )
         session.add_all([blocked, still_blocked])
         await session.commit()
@@ -515,8 +1005,6 @@ async def test_reconcile_blocked_outbox_unblocks_when_dependency_done():
         row = (await session.execute(select(CrmOutbox).where(CrmOutbox.id == blocked_id))).scalar_one()
         assert row.status == "pending"
 
-
-# ── Консьюмер: reconcile — что именно попадает в выборку ────────────────────────
 
 async def test_reconcile_dispatches_only_pending_rows_older_than_grace_period():
     from src.tasks.crm_outbox_tasks import _reconcile_pending_outbox_async
@@ -553,8 +1041,6 @@ async def test_reconcile_dispatches_only_pending_rows_older_than_grace_period():
     assert fresh_pending_id not in result  # моложе грейс-периода — не трогаем
     assert dispatched == result
 
-
-# ── reconcile: экспоненциальная пауза перед повтором ────────────────────────────
 
 def test_retry_delay_seconds_is_exponential_with_cap():
     from src.tasks.crm_outbox_tasks import _retry_delay_seconds
@@ -596,7 +1082,58 @@ async def test_reconcile_waits_exponential_pause_after_failed_attempts():
     assert dispatched == result
 
 
-# ── last_error ─────────────────────────────────────────────────────────────────
+async def _add_stalled_row(session, aggregate_id: int, dispatched_ago_s) -> int:
+    """attempts=0 (ни разу не дошла до реальной попытки CRM-вызова — застряла
+    на _has_older_unfinished/acquire_slot/зависимости) с заданным dispatched_at."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    dispatched_at = None if dispatched_ago_s is None else now - datetime.timedelta(seconds=dispatched_ago_s)
+    row = CrmOutbox(
+        aggregate_type="task", aggregate_id=aggregate_id, operation="update", status="pending",
+        attempts=0, payload={"crm_task_id": aggregate_id},
+        created_at=now - datetime.timedelta(hours=1),
+        dispatched_at=dispatched_at,
+    )
+    session.add(row)
+    await session.commit()
+    return row.id
+
+
+async def test_reconcile_does_not_redispatch_stalled_row_before_cooldown():
+    """Строка attempts=0, недавно поставленная в очередь тем же reconcile (dispatched_at свежий), но всё ещё pending, реально застряла:
+    без dispatched_at она переставлялась бы на каждом тике.
+    """
+    from src.tasks.crm_outbox_tasks import _STALLED_REDISPATCH_COOLDOWN_SECONDS, _reconcile_pending_outbox_async
+
+    async with async_session_maker() as session:
+        never_dispatched = await _add_stalled_row(session, 1, dispatched_ago_s=None)
+        just_dispatched = await _add_stalled_row(session, 2, dispatched_ago_s=5)
+        cooldown_elapsed = await _add_stalled_row(
+            session, 3, dispatched_ago_s=_STALLED_REDISPATCH_COOLDOWN_SECONDS + 1,
+        )
+
+    dispatched: list[int] = []
+    result = await _reconcile_pending_outbox_async(dispatch=dispatched.append)
+
+    assert set(result) == {never_dispatched, cooldown_elapsed}
+    assert just_dispatched not in result
+    assert dispatched == result
+
+
+async def test_reconcile_stamps_dispatched_at_on_rows_it_queues():
+    from src.tasks.crm_outbox_tasks import _reconcile_pending_outbox_async
+
+    async with async_session_maker() as session:
+        row_id = await _add_stalled_row(session, 1, dispatched_ago_s=None)
+
+    before = datetime.datetime.now(datetime.timezone.utc)
+    result = await _reconcile_pending_outbox_async(dispatch=lambda _id: None)
+    assert row_id in result
+
+    async with async_session_maker() as session:
+        row = (await session.execute(select(CrmOutbox).where(CrmOutbox.id == row_id))).scalar_one()
+        assert row.dispatched_at is not None
+        assert row.dispatched_at >= before - datetime.timedelta(seconds=5)
+
 
 async def test_process_outbox_row_stores_last_error_and_clears_it_on_success():
     from src.tasks.crm_outbox_tasks import LAST_ERROR_MAX_LEN, _process_outbox_row_async
@@ -630,8 +1167,6 @@ async def test_process_outbox_row_stores_last_error_and_clears_it_on_success():
         assert row.last_error is None
 
 
-# ── create: гонка «агрегат удалён, пока воркер создавал запись в CRM» ───────────
-
 async def _make_task_with_create_row(title: str = "Racy") -> tuple[int, int]:
     async with async_session_maker() as session:
         user = await _make_user(session)
@@ -654,9 +1189,7 @@ async def _delete_task_locally(task_id: int) -> None:
 
 
 async def test_create_task_compensates_orphan_when_task_deleted_meanwhile():
-    """Задача удалена локально ДО записи crm_task_id: запись, только что
-    созданная воркером в CRM, удаляется сразу; строка create — done, лишних
-    outbox-строк нет."""
+    """Задача удалена до записи crm_task_id: созданная воркером запись в CRM удаляется сразу; create — done, лишних строк нет."""
     from src.tasks.crm_outbox_tasks import _process_outbox_row_async
 
     task_id, outbox_id = await _make_task_with_create_row()
@@ -698,8 +1231,8 @@ async def test_create_task_compensation_failure_queues_delete_row():
 
 
 async def test_create_task_does_not_delete_record_it_only_found():
-    """find_task нашёл запись эвристикой (не создана этой попыткой) и задачи уже
-    нет — удалять её вслепую нельзя (могла принадлежать другой задаче)."""
+    """find_task нашёл уже существующую запись (не создана этой попыткой) и
+    задачи уже нет — удалять её вслепую нельзя."""
     from src.tasks.crm_outbox_tasks import _process_outbox_row_async
 
     task_id, outbox_id = await _make_task_with_create_row()
@@ -792,10 +1325,7 @@ async def test_create_subtask_waits_for_web_delete_lock_then_compensates():
 
 
 async def test_create_task_waits_for_web_delete_lock_then_compensates():
-    """Гонка целиком: веб-сторона держит FOR UPDATE на строке задачи (как
-    services/tasks.py::delete_task) — воркер, уже вызвавший CRM, ждёт замок и
-    после commit удаления компенсирует сироту, а не пишет crm_task_id в
-    несуществующую строку."""
+    """Гонка целиком: веб-сторона держит FOR UPDATE (как delete_task), воркер ждёт замок и после commit удаления компенсирует сироту."""
     import asyncio
 
     from src.tasks.crm_outbox_tasks import _process_outbox_row_async
@@ -820,9 +1350,7 @@ async def test_create_task_waits_for_web_delete_lock_then_compensates():
 
 
 async def test_create_task_worker_lock_makes_web_delete_see_crm_id():
-    """Обратный порядок: воркер успевает первым — веб-удаление (FOR UPDATE)
-    ждёт его commit и видит уже записанный crm_task_id (достаточно для
-    постановки 'delete'-события)."""
+    """Обратный порядок: воркер успевает первым — веб-удаление ждёт его commit и видит записанный crm_task_id."""
     from src.tasks.crm_outbox_tasks import _process_outbox_row_async
 
     task_id, outbox_id = await _make_task_with_create_row()
@@ -841,8 +1369,6 @@ async def test_create_task_worker_lock_makes_web_delete_see_crm_id():
         assert task.sync_status == "synced"
     fake.delete_task.assert_not_called()
 
-
-# ── sync_status: failed при исчерпании попыток, восстановление при успехе ───────
 
 async def _task_and_update_row(attempts: int, sync_status: str = "synced") -> tuple[int, int]:
     async with async_session_maker() as session:
@@ -878,10 +1404,7 @@ async def test_exhausted_attempts_mark_task_sync_status_failed():
 
 
 async def test_newer_event_of_same_task_is_not_overtaken_by_older_pending_sibling():
-    """Структурный запрет на обгон (_has_older_unfinished): более новое событие
-    той же задачи не начинает попытку, пока более старое ещё не завершилось —
-    не постфактум-проверка перед записью статуса (как было раньше), а отказ
-    выполниться вообще. Обработчик CRM не должен быть вызван."""
+    """Запрет на обгон (_has_older_unfinished): более новое событие не начинает попытку, пока старое не завершилось; CRM не вызывается."""
     from src.tasks.crm_outbox_tasks import _process_outbox_row_async
 
     task_id, older_id = await _task_and_update_row(attempts=0, sync_status="pending")
@@ -935,14 +1458,9 @@ async def test_newer_event_waits_while_older_sibling_is_blocked():
 
 
 async def test_after_older_event_fails_newer_event_can_proceed_and_sync():
-    """Сквозной сценарий (воспроизводит живой баг задачи №28):
-    более старое событие исчерпывает попытки первым — раз оно было единственным
-    событием агрегата на тот момент, sync_status честно становится 'failed'
-    (порождать нечего — младшее событие физически не могло выполниться раньше,
-    см. докстринг _refresh_sync_status). После этого более новое событие уже
-    не заблокировано (_has_older_unfinished больше не видит незавершённых
-    старших) — выполняется и пересчитывает sync_status заново в 'synced', без
-    отдельного шага «довести до synced», который требовался раньше."""
+    """Сквозной сценарий (живой баг): более старое событие исчерпывает попытки — sync_status 'failed'; после этого более новое не заблокировано,
+    выполняется и пересчитывает статус в 'synced'.
+    """
     from src.tasks.crm_outbox_tasks import MAX_ATTEMPTS, _process_outbox_row_async
 
     task_id, older_id = await _task_and_update_row(attempts=MAX_ATTEMPTS - 1, sync_status="pending")
@@ -1023,9 +1541,7 @@ async def test_successful_retry_restores_failed_sync_status():
 
 
 async def test_concurrent_pending_events_do_not_mark_synced_prematurely():
-    """Два параллельных update одной задачи, оба pending: если #1 завершается
-    первым, sync_status НЕ должен стать 'synced', пока #2 ещё не выполнено —
-    иначе индикатор соврал бы, что синхронизация полностью завершена."""
+    """Два параллельных update, оба pending: если #1 завершился первым, sync_status не должен стать 'synced', пока #2 не выполнено."""
     from src.tasks.crm_outbox_tasks import _process_outbox_row_async
 
     async with async_session_maker() as session:

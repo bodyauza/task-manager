@@ -1,25 +1,6 @@
-"""Хранилище истории панели WS (чат + CRUD-события задач/подзадач) — Redis List.
+"""История WS-панели (чат и события задач/подзадач) в Redis List `chat:history`.
 
-RPUSH добавляет новую запись в конец списка "chat:history", LTRIM
-обрезает список до settings.CHAT_HISTORY_MAX_LEN самых свежих записей —
-история заведомо ограничена, не бесконечный архив.
-
-Персистируются два рода событий: сообщения чата (тип "chat", из
-src.realtime.router::_publish_chat_message; запись несёт внутренний
-sender_user_id, который /chat/history превращает в is_own и не отдаёт наружу)
-и события действий над задачами/подзадачами — CRUD (task_created/updated/
-deleted, subtask_created/updated/deleted) и файловые (task_files_updated/
-subtask_files_updated) из src.realtime.events::broadcast_task_event
-(_PERSISTED_EVENT_TYPES там же).
-Модуль здесь не разбирает форму payload — append_event() принимает уже
-готовый dict целиком, откуда бы он ни пришёл.
-
-Отдельный module-level singleton _get_redis(), как и в
-src.realtime.connection_manager/src.crm.client/src.tasks.crm_rate_limit —
-свой клиент на каждый модуль, использующий Redis, чтобы тесты могли
-патчить _get_redis() каждого модуля независимо (см. mock_realtime_redis в
-tests/conftest.py для того же приёма в connection_manager.py; для этого
-модуля — отдельная фикстура, см. tests/test_chat_history.py).
+RPUSH + LTRIM до settings.CHAT_HISTORY_MAX_LEN последних записей. Форму payload модуль не разбирает.
 """
 
 import json
@@ -33,8 +14,6 @@ from src.config import settings
 _HISTORY_KEY = "chat:history"
 _SEQ_KEY = "chat:history:next_id"
 
-# Константы запроса, не Settings — защита от чрезмерного limit в самом
-# запросе, не параметр деплоя.
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
 
@@ -49,16 +28,9 @@ def _get_redis() -> redis.Redis:
 
 
 async def append_event(payload: dict[str, Any]) -> dict[str, Any]:
-    """Персистирует одну запись (чат-сообщение ИЛИ CRUD-событие задачи/
-    подзадачи — см. докстринг модуля) поверх уже готового payload, добавляя
-    к нему id/created_at. Возвращает сохранённую запись целиком — вызывающий
-    код (router.py::_publish_chat_message, events.py::broadcast_task_event)
-    использует её, чтобы подмешать те же id/created_at в payload live-рассылки.
+    """Сохраняет запись, добавляя id и created_at, и возвращает её целиком.
 
-    INCR + RPUSH + LTRIM — три отдельные команды, не атомарный Lua-скрипт:
-    осознанный компромисс (крайне редкая гонка порядка двух записей при
-    конкурентной отправке с разных uvicorn-воркеров — приемлемо для этой
-    истории).
+    INCR + RPUSH + LTRIM — не атомарно: редкая гонка порядка между воркерами допустима.
     """
     message_id = await _get_redis().incr(_SEQ_KEY)
     entry: dict[str, Any] = {
@@ -72,17 +44,9 @@ async def append_event(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 async def get_history_page(before_id: int | None, limit: int) -> list[dict[str, Any]]:
-    """До `limit` сообщений старше before_id, в хронологическом порядке
-    (старые → новые — порядок, удобный клиенту для вставки в НАЧАЛО
-    #messages без разворота массива на JS-стороне).
+    """До `limit` записей старше before_id (None — самая свежая страница) в хронологическом порядке.
 
-    before_id=None — самая свежая страница (открытие страницы/переподключение).
-    before_id=<id> — сообщения строго старше этого id (пролистывание вверх;
-    курсор — минимальный id уже отрисованных на клиенте сообщений).
-
-    before_id, указывающий на сообщение, которое уже вытеснено LTRIM в
-    append_event, — не ошибка: возвращается [] или укороченная страница,
-    клиент трактует это как «дальше истории нет».
+    Вытесненный LTRIM курсор даёт пустую или короткую страницу — это не ошибка.
     """
     limit = max(1, min(limit, MAX_PAGE_SIZE))
     r = _get_redis()
@@ -92,12 +56,9 @@ async def get_history_page(before_id: int | None, limit: int) -> list[dict[str, 
 
     last_id_raw = await r.get(_SEQ_KEY)
     last_id = int(last_id_raw) if last_id_raw is not None else 0
-    # skip — сколько сообщений с id >= before_id нужно пропустить с конца списка,
-    # чтобы дальше читать именно то, что СТРОГО СТАРШЕ курсора (+1, а не только
-    # last_id - before_id: иначе сообщение с id == before_id само попадало бы
-    # в страницу как "старое", хотя это ровно та граница, которую клиент уже видел).
+    # skip — сколько записей с id >= before_id пропустить с конца, чтобы читать строго старше курсора.
     skip = last_id - before_id + 1
     if skip <= 0:
-        return []  # курсор новее самого свежего сообщения — не штатный случай при обычной работе клиента
+        return []
     raw = await r.lrange(_HISTORY_KEY, -(skip + limit), -(skip + 1))
     return [json.loads(item) for item in raw]

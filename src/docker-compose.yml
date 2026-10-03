@@ -25,8 +25,16 @@ services:
     build:
       context: ..
       dockerfile: src/Dockerfile
+    # Порт опубликован ТОЛЬКО на loopback хоста — этот docker-compose.yml
+    # предназначен для локальной разработки (env_file: .dev.env,
+    # DB_HOST=host.docker.internal), не для прода (см. «Deployment on a server
+    # running Ubuntu OS» в README.md — там перед uvicorn стоит Nginx с
+    # client_max_body_size и TLS). Без этого ограничения uvicorn был бы
+    # доступен с любого адреса, минуя и Nginx, и лимит тела запроса из
+    # MaxBodySizeMiddleware (см. src/middlewares.py) —
+    # тот же принцип, что и у redis/flower ниже.
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       redis:
         condition: service_healthy

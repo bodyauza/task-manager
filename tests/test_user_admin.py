@@ -1,7 +1,5 @@
-"""Тесты формы создания пользователя и правки пароля в sqladmin
-(src/admin/user_admin.py::UserAdmin): создание идёт через UserManager.create(),
-пароль хешируется тем же PasswordHelper, что и при регистрации, валидация та
-же, что у API, пароль не попадает в ответы/логи.
+"""Тесты формы создания пользователя и правки пароля в sqladmin (UserAdmin): создание через UserManager.create(), тот же PasswordHelper,
+те же правила валидации, пароль не попадает в ответы и логи.
 """
 
 import logging
@@ -45,8 +43,6 @@ async def _post_create(client: AsyncClient, **overrides):
     return await client.post("/admin/user/create", data=_create_form(**overrides), follow_redirects=False)
 
 
-# ── Формы ───────────────────────────────────────────────────────────────────
-
 async def test_create_form_has_expected_fields(admin_client: AsyncClient):
     r = await admin_client.get("/admin/user/create")
     assert r.status_code == 200
@@ -69,8 +65,6 @@ async def test_edit_form_has_password_roles_and_is_active_but_no_email(admin_cli
 async def test_delete_stays_disabled(admin_client: AsyncClient):
     assert (await admin_client.delete("/admin/user/delete?pks=1")).status_code == 403
 
-
-# ── Создание ────────────────────────────────────────────────────────────────
 
 async def test_create_user_hashes_password_and_sets_defaults(admin_client: AsyncClient):
     r = await _post_create(admin_client)
@@ -146,8 +140,6 @@ async def test_create_requires_admin_login(client: AsyncClient):
     assert r.status_code in (302, 401, 403)
     assert await _get_user(NEW_EMAIL) is None
 
-
-# ── Правка пароля ───────────────────────────────────────────────────────────
 
 async def _make_target(admin_client: AsyncClient) -> User:
     assert (await _post_create(admin_client)).status_code == 302

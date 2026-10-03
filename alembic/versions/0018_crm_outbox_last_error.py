@@ -4,9 +4,7 @@ Revision ID: 0018
 Revises: 0017
 Create Date: 2026-09-20
 
-Nullable Text: заполняется обработчиком при неудачной попытке
-(src/tasks/crm_outbox_tasks.py::_process_outbox_row_async), очищается при
-успехе. Backfill не нужен — у существующих строк причина сбоя неизвестна (NULL).
+Nullable Text: заполняется обработчиком при неудаче, очищается при успехе; у существующих строк причина неизвестна (NULL).
 """
 from typing import Sequence, Union
 

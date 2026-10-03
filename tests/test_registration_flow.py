@@ -1,7 +1,8 @@
-# Покрывает трёхшаговый регистрационный flow:
-#   POST /auth/register/request-code  — отправка кода на email
-#   POST /auth/register/verify-code   — проверка кода, выдача reg_token cookie
-#   POST /auth/register/complete      — создание записи в person
+# Трёхшаговый регистрационный flow: POST /auth/register/request-code (отправка кода), verify-code (проверка, reg_token cookie), complete (создание person).
+import asyncio
+import logging
+from unittest.mock import AsyncMock, patch
+
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -13,8 +14,6 @@ from tests.conftest import promote_to_admin
 VALID_EMAIL    = "new@example.com"
 VALID_PASSWORD = "Password1!"
 
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async def _request_code(client: AsyncClient, email: str = VALID_EMAIL):
     return await client.post(
@@ -39,8 +38,6 @@ async def _complete(
         body["patronymic"] = patronymic
     return await client.post("/auth/register/complete", json=body)
 
-
-# ─── request-code ─────────────────────────────────────────────────────────────
 
 async def test_request_code_success(client: AsyncClient, mock_smtp: dict):
     r = await _request_code(client)
@@ -67,6 +64,19 @@ async def test_request_code_duplicate_email(client: AsyncClient, registered_user
     assert r.json()["detail"] == "EMAIL_ALREADY_REGISTERED"
 
 
+async def test_request_code_smtp_failure_returns_503_without_leaking_email(client: AsyncClient, caplog):
+    """Сбой SMTP → 503 SMTP_ERROR; сырой адрес не попадает в лог — ни из нашего сообщения, ни из текста исключения (aiosmtplib возвращает получателя)."""
+    failing_send = AsyncMock(side_effect=Exception(f"Recipient refused: {VALID_EMAIL}"))
+    with patch("src.auth.registration_endpoints.send_confirmation_code", failing_send), \
+            caplog.at_level(logging.ERROR):
+        r = await _request_code(client)
+
+    assert r.status_code == 503
+    assert r.json()["detail"] == "SMTP_ERROR"
+    assert VALID_EMAIL not in caplog.text
+    assert "n***@example.com" in caplog.text
+
+
 async def test_request_code_rate_limit(client: AsyncClient, mock_smtp: dict):
     await _request_code(client)               # первый — OK
     r = await _request_code(client)           # второй в пределах 60 с — 429
@@ -76,7 +86,34 @@ async def test_request_code_rate_limit(client: AsyncClient, mock_smtp: dict):
     assert int(detail.split(":")[1]) > 0
 
 
-# ─── verify-code ──────────────────────────────────────────────────────────────
+async def test_request_code_ip_rate_limit_blocks_after_n_different_emails(client: AsyncClient):
+    """Лимит «1 на email раз в 60 с» не мешает перебирать разные email с одного клиента; общий IP-лимит
+    (registration_rate_limit.py, MAX_REQUESTS_PER_WINDOW=5) должен остановить это.
+    """
+    from src.auth.registration_rate_limit import MAX_REQUESTS_PER_WINDOW
+
+    for i in range(MAX_REQUESTS_PER_WINDOW):
+        r = await _request_code(client, email=f"ip-limit-{i}@example.com")
+        assert r.status_code == 200, f"запрос {i}: {r.status_code} {r.text}"
+
+    r = await _request_code(client, email="ip-limit-one-too-many@example.com")
+    assert r.status_code == 429
+    assert r.json()["detail"] == "RATE_LIMIT_IP"
+
+
+async def test_request_code_concurrent_first_requests_do_not_500(client: AsyncClient):
+    """Два параллельных первых запроса кода на один email раньше давали IntegrityError → 500. Теперь ровно один 200, остальные — 429 RATE_LIMIT."""
+    responses = await asyncio.gather(*[
+        _request_code(client, email="double-click@example.com") for _ in range(5)
+    ])
+    statuses = [r.status_code for r in responses]
+    assert statuses.count(200) == 1
+    assert statuses.count(429) == 4
+    assert all(
+        r.json()["detail"].startswith("RATE_LIMIT:")
+        for r in responses if r.status_code == 429
+    )
+
 
 async def test_verify_code_success(client: AsyncClient, mock_smtp: dict):
     await _request_code(client)
@@ -123,9 +160,7 @@ async def test_verify_code_max_attempts_blocks(client: AsyncClient, mock_smtp: d
             "/auth/register/verify-code",
             json={"email": VALID_EMAIL, "code": "000000"},
         )
-    # 4-й вызов: attempts>=3 уже зафиксированы — TOO_MANY_ATTEMPTS.
-    # Запись НЕ удаляется (см. test_max_attempts_does_not_bypass_rate_limit ниже) —
-    # именно created_at этой записи держит 60-секундный кулдаун следующего request-code.
+    # 4-й вызов: attempts>=3 уже зафиксированы — TOO_MANY_ATTEMPTS. Запись не удаляется: её created_at держит 60-секундный кулдаун.
     r = await client.post(
         "/auth/register/verify-code",
         json={"email": VALID_EMAIL, "code": "000000"},
@@ -135,13 +170,8 @@ async def test_verify_code_max_attempts_blocks(client: AsyncClient, mock_smtp: d
 
 
 async def test_max_attempts_does_not_bypass_rate_limit(client: AsyncClient, mock_smtp: dict):
-    """Регрессия: исчерпание попыток кода не должно обнулять 60-секундный
-    кулдаун request-code для того же email.
-
-    Раньше TOO_MANY_ATTEMPTS удалял pending-запись, и следующий request-code
-    не находил её и пропускал проверку кулдауна целиком — мгновенный новый
-    код без ожидания, цикл "request-code → 4×неверный код → request-code" можно
-    было повторять без пауз, теряя единственный дроссель против брутфорса кода.
+    """Исчерпание попыток кода не должно обнулять 60-секундный кулдаун request-code для того же email
+    (иначе цикл «запрос кода → 4 неверных → запрос кода» шёл бы без пауз).
     """
     await _request_code(client)
 
@@ -154,6 +184,29 @@ async def test_max_attempts_does_not_bypass_rate_limit(client: AsyncClient, mock
     r = await _request_code(client)
     assert r.status_code == 429
     assert r.json()["detail"].startswith("RATE_LIMIT:")
+
+
+async def test_verify_code_concurrent_wrong_attempts_respect_limit(client: AsyncClient, mock_smtp: dict):
+    """Гонка SELECT-проверка-UPDATE позволяла параллельным запросам обойти лимит в 3 попытки. Атомарный
+    `UPDATE ... WHERE attempts < _MAX_ATTEMPTS ... RETURNING` пропускает ровно _MAX_ATTEMPTS = 3 запроса.
+    """
+    await _request_code(client)
+
+    responses = await asyncio.gather(*[
+        client.post(
+            "/auth/register/verify-code",
+            json={"email": VALID_EMAIL, "code": "000000"},
+        )
+        for _ in range(20)
+    ])
+    details = [r.json()["detail"] for r in responses]
+    assert sum(d.startswith("INVALID_CODE:") for d in details) == 3
+    assert sum(d == "TOO_MANY_ATTEMPTS" for d in details) == 17
+
+    # Лимит соблюдён по-настоящему: даже ВЕРНЫЙ код после этого не проходит.
+    r = await _verify_code(client, mock_smtp)
+    assert r.status_code == 400
+    assert r.json()["detail"] == "TOO_MANY_ATTEMPTS"
 
 
 async def test_verify_code_invalid_format(client: AsyncClient, mock_smtp: dict):
@@ -173,8 +226,6 @@ async def test_verify_code_too_short(client: AsyncClient, mock_smtp: dict):
     )
     assert r.status_code == 422
 
-
-# ─── complete ─────────────────────────────────────────────────────────────────
 
 async def test_complete_success(client: AsyncClient, mock_smtp: dict):
     await _request_code(client)
@@ -236,8 +287,6 @@ async def test_complete_missing_firstname(client: AsyncClient, mock_smtp: dict):
     assert r.status_code == 422
 
 
-# ─── full flow + login ────────────────────────────────────────────────────────
-
 async def test_full_registration_then_login(client: AsyncClient, mock_smtp: dict):
     r1 = await _request_code(client)
     assert r1.status_code == 200
@@ -287,8 +336,6 @@ async def test_code_consumed_after_verify(client: AsyncClient, mock_smtp: dict):
     assert r.json()["detail"] == "NO_PENDING_REGISTRATION"
 
 
-# ─── patronymic ───────────────────────────────────────────────────────────────
-
 async def test_complete_with_patronymic(client: AsyncClient, mock_smtp: dict):
     # Отчество передано — регистрация должна завершиться с кодом 201.
     await _request_code(client)
@@ -307,9 +354,7 @@ async def test_complete_without_patronymic(client: AsyncClient, mock_smtp: dict)
 
 
 async def test_patronymic_stored_and_returned(client: AsyncClient, mock_smtp: dict):
-    # После регистрации с отчеством значение должно возвращаться в GET /users/
-    # (поле patronymic включено в UserRead).
-    # Для доступа к /users/ пользователь повышается до admin.
+    # Отчество возвращается в GET /users/ (patronymic входит в UserRead); для доступа пользователь повышается до admin.
     email = "patronymic@example.com"
     await _request_code(client, email=email)
     await _verify_code(client, mock_smtp, email=email)

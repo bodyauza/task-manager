@@ -1,8 +1,4 @@
-"""Тесты поля «Проект»:
-резолвинг CRM-ID → project_id через локальную таблицу project (без похода в
-CRM, см. src/services/tasks.py::_resolve_project), и сквозной HTTP-флоу
-create/update/list/search/get с этим полем.
-"""
+"""Тесты поля «Проект»: резолвинг CRM-ID → project_id через таблицу project (без похода в CRM) и сквозной HTTP-флоу create/update/list/search/get."""
 
 import json
 
@@ -20,18 +16,13 @@ EMAIL = "project_field@example.com"
 
 
 async def _seed_project(crm_id: str = "3", label: str = "Альфа", is_active: bool = True) -> Project:
-    # session.refresh() не нужен: async_session_maker сконфигурирован с
-    # expire_on_commit=False (src/database.py) — project.id уже заполнен через
-    # INSERT ... RETURNING id при commit(), тот же принцип, что и везде в
-    # services/tasks.py (см. комментарии там про db.refresh()).
+    # session.refresh() не нужен: expire_on_commit=False, project.id заполнен через INSERT ... RETURNING.
     async with async_session_maker() as session:
         project = Project(crm_id=crm_id, label=label, is_active=is_active)
         session.add(project)
         await session.commit()
         return project
 
-
-# ── _resolve_project (юнит, без HTTP) ───────────────────────────────────────────
 
 async def test_resolve_project_none_returns_none():
     async with async_session_maker() as session:
@@ -40,9 +31,7 @@ async def test_resolve_project_none_returns_none():
 
 async def test_resolve_project_empty_string_returns_none_without_query():
     async with async_session_maker() as session:
-        # "" не должно совпасть ни с одной строкой project, даже пустой crm_id
-        # там в принципе невозможен (NOT NULL) — но проверяем именно поведение,
-        # не полагаясь на отсутствие данных.
+        # "" не должно совпасть ни с одной строкой project; проверяем поведение, а не отсутствие данных.
         assert await task_service._resolve_project("", session) is None
 
 
@@ -65,9 +54,7 @@ async def test_resolve_project_found_returns_row():
 
 
 async def test_resolve_project_inactive_raises_422():
-    """Деактивированная опция (пропала из последнего ответа CRM,
-    src/tasks/global_lists_tasks.py::_upsert_project_rows) не должна быть
-    выбираемой для НОВОГО назначения — is_active=False фильтруется в WHERE."""
+    """Деактивированная опция (пропала из ответа CRM) не выбирается для нового назначения: is_active=False фильтруется в WHERE."""
     from fastapi import HTTPException
 
     await _seed_project(crm_id="5", label="Устаревший", is_active=False)
@@ -76,8 +63,6 @@ async def test_resolve_project_inactive_raises_422():
             await task_service._resolve_project("5", session)
         assert exc_info.value.status_code == 422
 
-
-# ── create_task / update_task (сервисный слой) ──────────────────────────────────
 
 async def test_create_task_with_project_sets_project_id_and_response_fields():
     project = await _seed_project(crm_id="3", label="Альфа")
@@ -134,10 +119,41 @@ async def test_update_task_project_empty_string_clears_it():
         assert result.project_option_id is None
         db_task = (await session.execute(select(Task).where(Task.id == created.id))).scalar_one()
         assert db_task.project_id is None
-        # update-outbox-строка не создаётся: задача ещё не синхронизирована с CRM
-        # (crm_task_id is None) — синхронизировать в CRM пока нечего.
         rows = await _outbox_rows_for(session, "task", created.id)
-        assert not any(r.operation == "update" for r in rows)
+        create_row = next(r for r in rows if r.operation == "create")
+        update_row = next(r for r in rows if r.operation == "update")
+        assert update_row.depends_on_event_id == create_row.id
+        assert update_row.payload["project"] == ""
+
+
+async def test_update_task_explicit_project_null_clears_it_in_crm_too(mock_outbox_dispatch):
+    """Явный `null` для "project" означает «очистить поле» и в БД, и в CRM (payload несёт "", а не None, иначе CRM оставила бы старое значение).
+    Задача здесь уже синхронизирована (crm_task_id задан).
+    """
+    project = await _seed_project(crm_id="11", label="Alpha")
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        created = await task_service.create_task(
+            session, user, TaskCreate(title="Orig2", description="d", project="11"),
+        )
+        db_task = await session.get(Task, created.id)
+        db_task.crm_task_id = 7  # симулирует уже выполненный Celery 'create'
+        await session.commit()
+        assert db_task.project_id == project.id  # предпосылка: проект реально был выбран
+        mock_outbox_dispatch.reset_mock()
+
+        result = await task_service.update_task(session, user, created.id, TaskUpdate(project=None))
+
+        assert result.project is None
+        rows = await _outbox_rows_for(session, "task", created.id)
+        update_rows = [r for r in rows if r.operation == "update"]
+        assert len(update_rows) == 1
+        # "" — явная очистка для TaskManager.update_task, а не None ("не трогать
+        # поле" — так payload выглядел бы, если бы "project" не передавался вовсе).
+        assert update_rows[0].payload["project"] == ""
+
+        db_task_after = (await session.execute(select(Task).where(Task.id == created.id))).scalar_one()
+        assert db_task_after.project_id is None
 
 
 async def test_update_task_without_project_key_leaves_it_unchanged():
@@ -154,8 +170,6 @@ async def test_update_task_without_project_key_leaves_it_unchanged():
         assert result.project == "Альфа"
         assert result.project_option_id == "3"
 
-
-# ── list_tasks / search_tasks / get_task — project_option_id для предзаполнения ─
 
 async def test_list_tasks_includes_project_option_id():
     await _seed_project(crm_id="3", label="Альфа")
@@ -181,19 +195,13 @@ async def test_search_tasks_returns_task_response_with_project():
 
 
 async def test_get_task_deactivated_project_still_resolves_via_relationship():
-    """Строка project с is_active=False не удаляется (см. Project.__doc__) —
-    задача, созданная ДО деактивации, должна продолжать показывать метку через
-    уже установленный FK, а не терять её."""
+    """Строка project с is_active=False не удаляется: задача, созданная до деактивации, продолжает показывать метку через FK."""
     await _seed_project(crm_id="9", label="Скоро устареет")
     async with async_session_maker() as session:
         user = await _make_user(session)
         created = await task_service.create_task(session, user, TaskCreate(title="Historic", description="d", project="9"))
 
-        # Опция пропала из CRM после того, как задача её выбрала. Перечитываем
-        # строку в ЭТОЙ сессии, а не мутируем detached-объект из _seed_project
-        # (объект другой, уже закрытой сессии) — добавление detached-инстанса с
-        # уже существующим PK в новую сессию через session.add() не гарантирует
-        # чистое переприсоединение в SQLAlchemy, это анти-паттерн.
+        # Опция пропала из CRM после выбора задачей. Перечитываем строку в этой сессии, а не мутируем detached-объект из _seed_project.
         project = (
             await session.execute(select(Project).where(Project.crm_id == "9"))
         ).scalar_one()
@@ -204,8 +212,6 @@ async def test_get_task_deactivated_project_still_resolves_via_relationship():
         assert result.project == "Скоро устареет"
         assert result.project_option_id == "9"
 
-
-# ── HTTP-уровень ─────────────────────────────────────────────────────────────
 
 async def test_http_create_task_with_project(client, mock_smtp):
     await _seed_project(crm_id="3", label="Альфа")

@@ -11,6 +11,5 @@ class RoleAdmin(ModelView, model=Role):
     column_list = [Role.id, Role.name]
     column_searchable_list = [Role.name]
     column_sortable_list = [Role.id, Role.name]
-    # users — обратная сторона m2m: назначение ролей делается со стороны
-    # UserAdmin.roles, а не вложенным списком всех пользователей на форме роли.
+    # users — обратная сторона m2m: роли назначаются со стороны UserAdmin.roles.
     form_excluded_columns = [Role.users]

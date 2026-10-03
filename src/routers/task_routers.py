@@ -29,11 +29,8 @@ router = APIRouter(tags=["Working with tasks"])
     responses=responses(401, 409, c409="Задача с таким названием у этого владельца уже существует"),
 )
 async def create_task(
-    # multipart/form-data: тело задачи — JSON-строка в form-поле "data", а не
-    # Annotated[TaskCreate, Form()] — FastAPI 0.115 не разворачивает Pydantic-модель
-    # в form-поля, когда рядом с ней в сигнатуре есть File(...)-параметры (проверено
-    # эмпирически). Позволяет создать задачу и файлы вложений одним HTTP-запросом
-    # (атомарно на стороне сервиса — см. services/tasks.py::create_task).
+    # multipart/form-data: тело задачи — JSON-строка в form-поле "data" (FastAPI 0.115 не разворачивает
+    # Pydantic-модель в form-поля рядом с File(...)). Задача и файлы создаются одним запросом.
     data: str = Form(
         ...,
         description='JSON-строка задачи: {"title": str (1–100), "description": str (≤ 2000), "project": str | null}',
@@ -79,9 +76,9 @@ async def read_tasks(
 )
 async def search_tasks_by_title(
     response: Response,
-    title: str,  # ← Query, обязательный: нет default → FastAPI требует его в URL
-    skip: int = Query(0, ge=0),  # ← Query, опциональный: default=0, валидация ≥ 0
-    limit: int = Query(5, ge=1, le=100),  # ← Query, опциональный: default=5, валидация 1–100
+    title: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(5, ge=1, le=100),
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):

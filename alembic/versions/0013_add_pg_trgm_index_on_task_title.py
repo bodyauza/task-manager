@@ -4,15 +4,8 @@ Revision ID: 0013
 Revises: 0012
 Create Date: 2026-07-17
 
-task.title уже проиндексирован обычным B-tree (index=True в модели), но
-search_tasks() (src/services/tasks.py) ищет через
-Task.title.ilike(f"%{title}%") — паттерн с ведущим "%" не может
-использовать B-tree (он ускоряет только сравнения с известным префиксом),
-поэтому такой поиск всегда делает Seq Scan по всей таблице task независимо
-от наличия обычного индекса. pg_trgm разбивает строку на триграммы
-(последовательности из 3 символов) и строит по ним GIN-индекс, который
-Postgres умеет использовать для ILIKE с шаблоном в любом месте строки,
-включая ведущий "%".
+search_tasks() ищет через Task.title.ilike(f"%{title}%"): паттерн с ведущим "%" не использует B-tree и даёт Seq Scan.
+GIN-индекс по триграммам (pg_trgm) ускоряет ILIKE с шаблоном в любом месте строки.
 """
 from typing import Sequence, Union
 
@@ -25,9 +18,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # pg_trgm — "доверенное" (trusted) расширение начиная с PostgreSQL 13:
-    # устанавливается обычным пользователем с правом CREATE на базу, без
-    # необходимости в правах суперпользователя.
+    # pg_trgm — trusted-расширение с PostgreSQL 13: ставится пользователем с правом CREATE на базу, без суперпользователя.
     op.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
     op.create_index(
         "ix_task_title_trgm",
@@ -40,6 +31,4 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_index("ix_task_title_trgm", table_name="task")
-    # Расширение pg_trgm не удаляем: им могут пользоваться другие объекты БД,
-    # созданные вручную вне Alembic — DROP EXTENSION был бы неявным и
-    # потенциально разрушительным побочным эффектом отката одной узкой миграции.
+    # Расширение не удаляем: им могут пользоваться объекты вне Alembic, а DROP EXTENSION был бы разрушительным побочным эффектом отката.

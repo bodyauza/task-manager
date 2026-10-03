@@ -15,7 +15,7 @@ function renderSpecification(relPath) {
     const block = document.getElementById('specCurrent');
     if (relPath) {
         const link = document.getElementById('specLink');
-        link.href        = `/uploads/${relPath}`;           // routers/uploads.py, требует access_token
+        link.href        = `/uploads/${encodeUploadPath(relPath)}`;  // routers/uploads.py, требует access_token
         link.textContent = relPath.split('/').pop();        // только имя файла для отображения
         block.style.display = 'flex';                       // показываем блок с файлом
     } else {
@@ -56,11 +56,14 @@ let uploadedOtherCount = 0;
 // Те же ограничения, что и на сервере (src/utils/file_utils.py: MAX_FILE_SIZE, ALLOWED) —
 // продублированы здесь только для мгновенной обратной связи на клиенте. Сервер остаётся
 // источником истины и всё равно перепроверит и размер, и MIME-тип по сигнатуре байтов.
-// OTHER_FILES_MAX_SIZE — общая константа из common.js.
-const OTHER_FILES_ALLOWED_EXT = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.jpg', '.jpeg', '.png', '.txt'];
+// OTHER_FILES_MAX_SIZE и OTHER_FILES_ALLOWED_EXT — общие константы из common.js.
 
 function validateOtherFileClientSide(file) {
     // Возвращает текст ошибки или null, если файл прошёл клиентскую пре-проверку.
+    const forbidden = findForbiddenFilenameChars(file.name);
+    if (forbidden.length) {
+        return `имя содержит недопустимые символы: ${forbidden.join(' ')}`;
+    }
     const dotIndex = file.name.lastIndexOf('.');
     const ext = dotIndex >= 0 ? file.name.slice(dotIndex).toLowerCase() : '';
     if (!OTHER_FILES_ALLOWED_EXT.includes(ext)) {
@@ -117,7 +120,7 @@ function renderOtherFiles(paths) {
         const li   = document.createElement('li');
         const a    = document.createElement('a');
         a.className   = 'file-link';
-        a.href        = `/uploads/${relPath}`;
+        a.href        = `/uploads/${encodeUploadPath(relPath)}`;
         a.target      = '_blank';
         a.textContent = name;
         const btn = document.createElement('button');
@@ -142,6 +145,11 @@ document.addEventListener('DOMContentLoaded', function() {
         if (specUploadInProgress) { showToast('Файл уже загружается, подождите', 'warning'); return; }
         const input = document.getElementById('specInput');
         if (!input.files.length) { showToast('Выберите файл', 'warning'); return; }
+        const forbidden = findForbiddenFilenameChars(input.files[0].name);
+        if (forbidden.length) {
+            showToast(`Имя файла содержит недопустимые символы: ${forbidden.join(' ')}`, 'warning');
+            return;
+        }
         specUploadInProgress = true;
         try {
             const fd = new FormData();

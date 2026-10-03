@@ -5,14 +5,14 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Respon
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.auth.auth_config import current_user       # DI: возвращает текущего аутентифицированного User
+from src.auth.auth_config import current_user
 from src.auth.user_models import User
-from src.database import get_async_session          # DI: выдаёт AsyncSession из пула
+from src.database import get_async_session
 from src.openapi_responses import responses
 from src.services import subtasks as subtask_service
 from src.task_logic.subtask_schemas import SubtaskCreate, SubtaskResponse, SubtaskUpdate
 
-router = APIRouter(tags=["Working with subtasks"])  # тег группирует эндпоинты в Swagger UI
+router = APIRouter(tags=["Working with subtasks"])
 
 
 @router.post(
@@ -30,8 +30,7 @@ router = APIRouter(tags=["Working with subtasks"])  # тег группируе�
                         c409="Подзадача с таким названием в этой задаче уже существует"),
 )
 async def create_subtask(
-    # multipart/form-data — см. пояснение в routers/task_routers.py::create_task.
-    # task_id остаётся внутри JSON-строки "data" (SubtaskCreate не меняется).
+    # multipart/form-data — см. routers/task_routers.py::create_task. task_id остаётся внутри JSON-строки "data".
     data: str = Form(
         ...,
         description='JSON-строка подзадачи: {"task_id": int, "title": str (1–100), "description": str (≤ 2000)}',
@@ -39,8 +38,8 @@ async def create_subtask(
     ),
     specification: Optional[UploadFile] = File(None),
     other_files: List[UploadFile] = File([]),
-    user: User = Depends(current_user),             # требует аутентификации; 401 если токен недействителен
-    db: AsyncSession = Depends(get_async_session),  # сессия выдаётся на время запроса
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_session),
 ):
     try:
         subtask = SubtaskCreate.model_validate_json(data)
@@ -57,15 +56,15 @@ async def create_subtask(
     responses=responses(401),
 )
 async def read_subtasks(
-    response: Response,                             # объект HTTP-ответа: для записи заголовков
-    task_id: int,                                   # query-параметр: ?task_id=5
-    skip: int = Query(0, ge=0),                     # смещение (offset) для пагинации; >= 0
-    limit: int = Query(20, ge=1, le=100),           # размер страницы; от 1 до 100
+    response: Response,
+    task_id: int,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
     subtasks, total = await subtask_service.list_subtasks(db, task_id, skip, limit)
-    response.headers["X-Total-Count"] = str(total)  # фронтенд читает заголовок для пагинации
+    response.headers["X-Total-Count"] = str(total)
     return subtasks
 
 
@@ -76,7 +75,7 @@ async def read_subtasks(
     responses=responses(401, 404),
 )
 async def get_subtask(
-    subtask_id: int,                                # path-параметр: /subtasks/42
+    subtask_id: int,
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
@@ -92,7 +91,7 @@ async def get_subtask(
 )
 async def update_subtask(
     subtask_id: int,
-    subtask_update: SubtaskUpdate,                  # тело: только изменяемые поля (partial update)
+    subtask_update: SubtaskUpdate,
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):

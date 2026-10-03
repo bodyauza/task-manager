@@ -4,12 +4,10 @@ from typing import Optional
 from pydantic import ConfigDict, Field, field_validator
 from fastapi_users import schemas
 
-# Базовая проверка синтаксиса: допускает user@domain.tld.
-# Полноценная верификация email — только через отправку письма с кодом подтверждения.
+# Базовая проверка синтаксиса email; полная верификация — через письмо с кодом.
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
 
-# Lookahead (?=...) проверяет наличие каждого класса символов независимо от позиции,
-# поэтому порядок символов в пароле не важен.
+# Lookahead (?=...) проверяет наличие каждого класса символов независимо от позиции.
 PASSWORD_REGEX = re.compile(
     r"^(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()\-_=+\[\]{};:'\",.<>/?]).{5,}$"
 )
@@ -34,15 +32,11 @@ class UserRead(schemas.BaseUser[int]):
     username: str
     firstname: str
     lastname: str
-    # None если пользователь не указал отчество при регистрации или оно не хранится в БД.
     patronymic: Optional[str] = None
-    # Источник — User.role_ids (property в auth/user_models.py, читает user.roles).
-    # from_attributes=True вызывает getattr(user, "role_ids") как обычный атрибут —
-    # роли пользователя many-to-many (user_role), поэтому список, а не одно значение.
+    # Источник — User.role_ids (читает user.roles).
     role_ids: list[int]
     is_active: bool = True
-    # exclude=True: поле скрыто из JSON-ответов API, но сохраняется в БД.
-    # fastapi-users требует is_superuser в модели; права в проекте задаются через roles/require_role().
+    # exclude=True: поле скрыто из JSON; fastapi-users требует is_superuser в модели.
     is_superuser: bool = Field(default=False, exclude=True)
     is_verified: bool = False
 
@@ -50,21 +44,14 @@ class UserRead(schemas.BaseUser[int]):
 
 
 class UserCreate(schemas.BaseUserCreate):
-    # username не передаётся клиентом: вычисляется в UserManager.create()
-    # как email.split("@")[0] и записывается в БД.
+    # username не передаётся клиентом: вычисляется в UserManager.create().
     username: Optional[str] = None
     firstname: str
     lastname: str
-    # None если отчество не передано — Pydantic не подставляет пустую строку.
     patronymic: Optional[str] = None
     email: str
-    # max_length=72 — практическое ограничение, единое для регистрации, API и
-    # админ-формы (admin/user_admin.py) и продублированное в HTML/JS формы
-    # регистрации. Пароли хешируются argon2id (стандартный PasswordHelper
-    # fastapi-users), у которого нет лимита в 72 байта. Лимит нужен как разумная
-    # верхняя граница длины (защита от чрезмерно длинного ввода и нагрузки на
-    # хеширование) и на случай bcrypt-хешей: verify_and_update по-прежнему их
-    # понимает, а bcrypt учитывает только первые 72 байта пароля.
+    # max_length=72 — общий лимит для регистрации, API и админ-формы (продублирован в HTML/JS): защита от чрезмерно длинного ввода
+    # и от bcrypt-хешей, которые учитывают только первые 72 байта.
     password: str = Field(..., min_length=5, max_length=72)
     is_active: Optional[bool] = True
     is_verified: Optional[bool] = False

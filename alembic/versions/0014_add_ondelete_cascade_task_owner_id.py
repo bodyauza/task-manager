@@ -4,14 +4,8 @@ Revision ID: 0014
 Revises: 0013
 Create Date: 2026-08-30
 
-До этой миграции task.owner_id -> person.id не имел ondelete: удаление
-пользователя работало только через ORM (session.delete(user) запускает
-cascade="all, delete-orphan" на User.tasks), а прямой SQL
-DELETE FROM person WHERE id=... падал с IntegrityError, если у пользователя
-оставались задачи. ON DELETE CASCADE на уровне БД закрывает этот путь и,
-в паре с passive_deletes=True на User.tasks (src/auth/user_models.py), убирает
-лишний SELECT+N×DELETE, которые ORM иначе выполняет в Python при удалении
-пользователя через session.delete().
+Удаление пользователя работало только через ORM; прямой DELETE FROM person падал, если у пользователя были задачи.
+Каскад на уровне БД закрывает этот путь и вместе с passive_deletes=True на User.tasks убирает лишний SELECT и N×DELETE.
 """
 from typing import Sequence, Union
 

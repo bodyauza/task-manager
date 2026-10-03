@@ -1,11 +1,7 @@
-"""Запуск и остановка приложения: src/main.py (create_initial_roles, lifespan) и
-фоновая подписка ConnectionManager на Redis Pub/Sub (start_listening/
-stop_listening/_pubsub_loop).
+"""Запуск и остановка приложения: create_initial_roles, lifespan и фоновая подписка ConnectionManager на Redis Pub/Sub.
 
-httpx.ASGITransport не запускает lifespan, а conftest сам вставляет роли перед
-каждым тестом, поэтому раньше этот код не выполнялся ни разу: идемпотентность
-создания ролей при старте, порядок «роли → подписка → …→ отписка → закрытие
-CRM-клиента» и сама подписка на канал были не проверены.
+httpx.ASGITransport не запускает lifespan, а conftest сам вставляет роли, поэтому этот код раньше не выполнялся:
+идемпотентность ролей, порядок «роли → подписка → … → отписка → закрытие CRM-клиента» и сама подписка не проверялись.
 """
 
 import asyncio
@@ -34,8 +30,6 @@ async def _roles() -> dict[int, str]:
         return {r.id: r.name for r in (await session.execute(select(Role))).scalars().all()}
 
 
-# ── create_initial_roles ─────────────────────────────────────────────────────
-
 async def test_create_initial_roles_creates_user_and_admin_on_empty_table():
     await _clear_roles()
     assert await _roles() == {}
@@ -46,10 +40,9 @@ async def test_create_initial_roles_creates_user_and_admin_on_empty_table():
 
 
 async def test_create_initial_roles_is_idempotent(caplog):
-    """Повторный запуск приложения не дублирует записи и не падает. Ошибки внутри
-    create_initial_roles глотаются (только лог), поэтому одной проверки итогового
-    состояния мало: попытка повторной вставки тоже оставила бы 2 роли — отсутствие
-    записи об ошибке и «уже существуют» в логе доказывает, что вставки не было."""
+    """Повторный запуск не дублирует роли и не падает. Ошибки create_initial_roles только логируются, поэтому одной проверки состояния мало:
+    отсутствие записи об ошибке и «уже существуют» в логе доказывают, что вставки не было.
+    """
     await _clear_roles()
     await create_initial_roles()
 
@@ -118,8 +111,6 @@ async def test_registration_fails_clearly_when_roles_were_never_created(client, 
     assert await _roles() == {1: "user", 2: "admin"}
 
 
-# ── lifespan ─────────────────────────────────────────────────────────────────
-
 async def test_lifespan_orders_startup_and_shutdown_steps():
     calls: list[str] = []
 
@@ -164,8 +155,6 @@ def test_app_is_wired_to_run_lifespan_on_startup_and_shutdown():
             assert calls == ["roles", "start_listening"]      # старт выполнен до приёма запросов
         assert calls == ["roles", "start_listening", "stop_listening", "close_http_client"]
 
-
-# ── ConnectionManager: подписка на Redis Pub/Sub ─────────────────────────────
 
 class FakePubSub:
     """Модель redis.asyncio.PubSub: подписка, поток сообщений, отписка, закрытие."""
@@ -259,4 +248,64 @@ async def test_start_listening_is_idempotent():
 async def test_stop_listening_without_start_is_a_noop():
     manager = ConnectionManager()
     await manager.stop_listening()                       # не должно бросить
+    assert manager._pubsub_task is None
+
+
+class _BrokenPubSub(FakePubSub):
+    async def listen(self):
+        raise ConnectionError("redis down")
+        yield
+
+
+async def test_pubsub_loop_reconnects_after_failure_and_keeps_delivering():
+    manager = ConnectionManager()
+    socket = _FakeSocket()
+    manager.register(1, socket, "alice@example.com")
+    foreign = {"type": "message", "data": json.dumps(
+        {"origin": "another-worker", "payload": {"type": "ping"}, "exclude_user_id": None}
+    )}
+    broken = _BrokenPubSub([])
+    healthy = FakePubSub([foreign])
+    client = MagicMock()
+    client.pubsub.side_effect = [broken, healthy]
+
+    with patch("src.realtime.connection_manager._get_redis", return_value=client), \
+         patch("src.realtime.connection_manager._PUBSUB_BACKOFF_START", 0.01):
+        manager.start_listening()
+        await _wait_until(lambda: len(socket.sent) >= 1)
+        await manager.stop_listening()
+
+    assert broken.closed is True
+    assert healthy.subscribed == ["task_events"]
+    assert [json.loads(frame) for frame in socket.sent] == [{"type": "ping"}]
+
+
+async def test_pubsub_loop_retries_when_subscribe_itself_fails():
+    manager = ConnectionManager()
+    healthy = FakePubSub([])
+    client = MagicMock()
+    client.pubsub.side_effect = [ConnectionError("down"), healthy]
+
+    with patch("src.realtime.connection_manager._get_redis", return_value=client), \
+         patch("src.realtime.connection_manager._PUBSUB_BACKOFF_START", 0.01):
+        manager.start_listening()
+        await asyncio.wait_for(healthy.ready.wait(), 3)
+        await manager.stop_listening()
+
+    assert healthy.subscribed == ["task_events"]
+
+
+async def test_stop_listening_during_backoff_exits_cleanly():
+    manager = ConnectionManager()
+    broken = _BrokenPubSub([])
+    client = MagicMock()
+    client.pubsub.return_value = broken
+
+    with patch("src.realtime.connection_manager._get_redis", return_value=client), \
+         patch("src.realtime.connection_manager._PUBSUB_BACKOFF_START", 30.0):
+        manager.start_listening()
+        await asyncio.wait_for(broken.ready.wait(), 3)
+        await asyncio.sleep(0.05)
+        await asyncio.wait_for(manager.stop_listening(), 3)
+
     assert manager._pubsub_task is None

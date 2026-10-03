@@ -1,26 +1,16 @@
-"""Эндпоинты загрузки и удаления файлов для задач.
+"""Эндпоинты загрузки и удаления файлов задач — тонкий адаптер над src/services/attachments.py.
 
-Тонкий HTTP-адаптер над src/services/attachments.py: вся логика валидации,
-защиты от гонок (FOR NO KEY UPDATE) и CRM-синхронизации живёт там один раз,
-параметризованная TASK_ATTACHMENTS — этот роутер лишь достаёт зависимости
-FastAPI и передаёт их дальше.
-
-Маршруты:
-    POST   /tasks/{task_id}/specification          — загрузить/заменить файл ТЗ
-    DELETE /tasks/{task_id}/specification          — удалить файл ТЗ
-    POST   /tasks/{task_id}/files                  — добавить «Иные документы» (до 10 файлов)
-    DELETE /tasks/{task_id}/files/{filename}       — удалить один файл из «Иных документов»
-
-Файлы хранятся в src/uploads/tasks/{task_id}/.
-В БД хранятся только пути относительно uploads/ — байты файлов в БД не попадают.
+POST/DELETE /tasks/{task_id}/specification, POST /tasks/{task_id}/files (до 10 файлов),
+DELETE /tasks/{task_id}/files/{filename}. Файлы лежат в src/uploads/tasks/{task_id}/,
+в БД — только относительные пути.
 """
 
 from fastapi import APIRouter, Depends, File, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.auth.auth_config import current_user        # DI: текущий аутентифицированный пользователь
+from src.auth.auth_config import current_user
 from src.auth.user_models import User
-from src.database import get_async_session            # DI: асинхронная сессия SQLAlchemy
+from src.database import get_async_session
 from src.openapi_responses import responses
 from src.services import attachments
 from src.services.attachments import TASK_ATTACHMENTS
@@ -38,13 +28,13 @@ router = APIRouter(tags=["Task files"])
     "/tasks/{task_id}/specification",
     status_code=200,
     summary="Загрузить или заменить ТЗ задачи",
-    description="`multipart/form-data`, поле `file`. Форматы: pdf, doc, docx, xls, xlsx, jpg, jpeg, png, txt; до 100 МБ.",
+    description="`multipart/form-data`, поле `file`. Форматы: pdf, jpg, jpeg, png; до 10 МБ.",
     responses=responses(401, 404, 413, 422),
 )
 async def upload_task_specification(
     task_id: int,
-    file: UploadFile = File(...),                    # multipart/form-data, поле "file"
-    user: User = Depends(current_user),              # 401 если токен отсутствует или просрочен
+    file: UploadFile = File(...),
+    user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
     return await attachments.upload_specification(db, user, task_id, file, TASK_ATTACHMENTS)
@@ -73,7 +63,7 @@ async def delete_task_specification(
 )
 async def upload_task_files(
     task_id: int,
-    files: list[UploadFile] = File(...),             # multipart/form-data, поле "files" (список)
+    files: list[UploadFile] = File(...),
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
@@ -88,7 +78,7 @@ async def upload_task_files(
 )
 async def delete_task_file(
     task_id: int,
-    filename: str,                                    # имя файла с UUID-префиксом (path-параметр)
+    filename: str,
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):

@@ -1,7 +1,4 @@
-"""Юнит-тесты src.services.subtasks: создание/чтение/обновление/удаление
-подзадач без HTTP-слоя (см. test_task_service.py — тот же подход: сервис не
-принимает CRM-абстракцию и сам CRM не вызывает, только вставляет CrmOutbox и
-диспатчит её в Celery — см. mock_outbox_dispatch в tests/conftest.py)."""
+"""Юнит-тесты src.services.subtasks без HTTP-слоя: сервис вставляет CrmOutbox и диспатчит её в Celery (mock_outbox_dispatch), CRM не вызывает."""
 
 import pytest
 from fastapi import HTTPException
@@ -35,8 +32,6 @@ async def _make_task(session, user: User, title: str = "Parent", crm_task_id: in
     await session.refresh(task)
     return task
 
-
-# ── create_subtask ───────────────────────────────────────────────────────────
 
 async def test_create_subtask_enqueues_outbox_when_parent_task_synced(mock_outbox_dispatch):
     async with async_session_maker() as session:
@@ -75,9 +70,8 @@ async def test_create_subtask_without_parent_outbox_row_has_no_dependency(mock_o
         rows = await _outbox_rows_for(session, "subtask", result.id)
         assert len(rows) == 1
         assert rows[0].status == "pending"
-        # Родитель создан напрямую в БД (без outbox-строки create) — зависеть подзадаче не от чего.
-        # Настоящий сценарий зависимости от pending-create родителя — tests/test_crm_outbox.py::
-        # test_create_subtask_create_row_depends_on_parent_pending_create.
+        # Родитель создан напрямую в БД (без create-строки), зависеть не от чего. Зависимость от pending-create родителя —
+        # test_crm_outbox.py::test_create_subtask_create_row_depends_on_parent_pending_create.
         assert rows[0].depends_on_event_id is None
 
 
@@ -91,8 +85,6 @@ async def test_create_subtask_parent_task_not_found_raises_404():
             )
         assert exc_info.value.status_code == 404
 
-
-# ── list_subtasks / get_subtask ──────────────────────────────────────────────
 
 async def test_list_subtasks_pagination():
     async with async_session_maker() as session:
@@ -113,8 +105,6 @@ async def test_get_subtask_not_found_raises_404():
             await subtask_service.get_subtask(session, 9999)
         assert exc_info.value.status_code == 404
 
-
-# ── update_subtask ───────────────────────────────────────────────────────────
 
 async def test_update_subtask_not_found_raises_404():
     async with async_session_maker() as session:
@@ -147,7 +137,7 @@ async def test_update_subtask_enqueues_outbox_when_previously_synced(mock_outbox
         mock_outbox_dispatch.assert_called_once()
 
 
-async def test_update_subtask_not_synced_skips_outbox(mock_outbox_dispatch):
+async def test_update_subtask_before_create_enqueues_dependent_update(mock_outbox_dispatch):
     async with async_session_maker() as session:
         user = await _make_user(session)
         task = await _make_task(session, user, crm_task_id=None)
@@ -157,11 +147,13 @@ async def test_update_subtask_not_synced_skips_outbox(mock_outbox_dispatch):
         await subtask_service.update_subtask(session, user, created.id, SubtaskUpdate(title="Renamed"))
 
         rows = await _outbox_rows_for(session, "subtask", created.id)
-        assert not any(r.operation == "update" for r in rows)
-        mock_outbox_dispatch.assert_not_called()
+        create_row = next(r for r in rows if r.operation == "create")
+        update_row = next(r for r in rows if r.operation == "update")
+        assert update_row.depends_on_event_id == create_row.id
+        assert update_row.payload["crm_subtask_id"] is None
+        assert update_row.payload["title"] == "Renamed"
+        mock_outbox_dispatch.assert_called_once()
 
-
-# ── delete_subtask ───────────────────────────────────────────────────────────
 
 async def test_delete_subtask_removes_row_and_enqueues_outbox(mock_outbox_dispatch):
     async with async_session_maker() as session:

@@ -1,10 +1,6 @@
-"""
-Юнит-тесты CRM-клиента src/crm/task_service.py (TaskManager); SubtaskManager —
-в test_crm_subtask.py.
+"""Юнит-тесты TaskManager (src/crm/task_service.py); SubtaskManager — в test_crm_subtask.py.
 
-Все HTTP-вызовы перехватываются через unittest.mock (httpx-клиент): реальных
-запросов нет. Тесты работают с менеджером напрямую, минуя приложение, поэтому
-каждый тест сам настраивает свой mock для полного контроля сценария.
+HTTP-вызовы перехватываются через unittest.mock, реальных запросов нет; каждый тест сам настраивает mock.
 """
 import json
 
@@ -14,15 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.crm.task_service import TaskManager
 
-# Ключи полей CRM выводятся из констант TaskManager, а не хардкодятся строками:
-# сторонние разработчики меняют FIELD_TITLE/FIELD_DESCR/FIELD_DONE в task_service.py
-# под свой demo-инстанс CRM, и эти тесты продолжают проходить без правок.
-_FIELD_TITLE = f"field_{TaskManager.FIELD_TITLE}"
-_FIELD_DESCR = f"field_{TaskManager.FIELD_DESCR}"
-_FIELD_DONE  = f"field_{TaskManager.FIELD_DONE}"
+# Ключи полей CRM берутся из констант TaskManager, а не хардкодятся, чтобы тесты не зависели от настроек инстанса CRM.
+_FIELD_TITLE    = f"field_{TaskManager.FIELD_TITLE}"
+_FIELD_DESCR    = f"field_{TaskManager.FIELD_DESCR}"
+_FIELD_DONE     = f"field_{TaskManager.FIELD_DONE}"
+_FIELD_LOCAL_ID = f"field_{TaskManager.FIELD_LOCAL_ID}"
 
-
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _resp(data, status_code: int = 200) -> MagicMock:
     mock = MagicMock()
@@ -45,15 +38,7 @@ def _err_resp(msg: str) -> MagicMock:
 
 
 def _patch_httpx(return_value=None, side_effect=None):
-    """Патчит module-level singleton _shared_http_client напрямую — _get_shared_http_client()
-    возвращает его без вызова конструктора httpx.AsyncClient.
-
-    Клиент — не атрибут класса CRMClient (см. src/crm/client.py: cls._http = ... в
-    classmethod создавал бы отдельный атрибут в каждом подклассе, а не мутировал
-    бы базовый — отсюда и перенос на module-level переменную), а module-level
-    переменная в src.crm.client. patch() подменяет её значение и восстанавливает
-    исходное (None) после patcher.stop().
-    """
+    """Патчит module-level singleton _shared_http_client: _get_shared_http_client() возвращает его без вызова конструктора httpx.AsyncClient."""
     mock_http = AsyncMock()
     if side_effect:
         mock_http.post = AsyncMock(side_effect=side_effect)
@@ -65,20 +50,19 @@ def _patch_httpx(return_value=None, side_effect=None):
     return patcher, mock_http
 
 
-# ── TaskManager.create_task ───────────────────────────────────────────────────
-
 @pytest.mark.asyncio
 async def test_create_task_success_dict_data():
     """create_task возвращает CRM-ID из ответа формата data: {id: ...}."""
     patcher, mock_http = _patch_httpx(_resp({"id": "17"}))
     try:
-        result = await TaskManager().create_task(title="Task A", description="Desc A")
+        result = await TaskManager().create_task(local_id=1, title="Task A", description="Desc A")
         assert result["id"] == 17
         payload = mock_http.post.call_args.kwargs["json"]
         assert payload["action"] == "insert"
         assert payload["entity_id"] == TaskManager.ENTITY_ID
         assert payload["items"][0][_FIELD_TITLE] == "Task A"
         assert payload["items"][0][_FIELD_DONE] == "false"
+        assert payload["items"][0][_FIELD_LOCAL_ID] == "1"
     finally:
         patcher.stop()
 
@@ -88,7 +72,7 @@ async def test_create_task_success_list_data():
     """create_task корректно извлекает CRM-ID из ответа формата data: [{id: ...}]."""
     patcher, _ = _patch_httpx(_resp([{"id": "99"}]))
     try:
-        result = await TaskManager().create_task(title="Task B", description="Desc B", completed=True)
+        result = await TaskManager().create_task(local_id=2, title="Task B", description="Desc B", completed=True)
         assert result["id"] == 99
     finally:
         patcher.stop()
@@ -99,7 +83,7 @@ async def test_create_task_connection_error():
     patcher, _ = _patch_httpx(side_effect=httpx.ConnectError("refused"))
     try:
         with pytest.raises(Exception, match="Connection error"):
-            await TaskManager().create_task(title="T", description="D")
+            await TaskManager().create_task(local_id=1, title="T", description="D")
     finally:
         patcher.stop()
 
@@ -109,7 +93,7 @@ async def test_create_task_crm_api_error():
     patcher, _ = _patch_httpx(_err_resp("Duplicate title"))
     try:
         with pytest.raises(Exception, match="CRM API error"):
-            await TaskManager().create_task(title="Existing", description="D")
+            await TaskManager().create_task(local_id=1, title="Existing", description="D")
     finally:
         patcher.stop()
 
@@ -121,7 +105,7 @@ async def test_create_task_with_creator_email():
     patcher, mock_http = _patch_httpx(_resp({"id": "1"}))
     try:
         await TaskManager().create_task(
-            title="T", description="D", creator_email="user@example.com"
+            local_id=1, title="T", description="D", creator_email="user@example.com"
         )
         payload = mock_http.post.call_args.kwargs["json"]
         assert payload["items"][0][_FIELD_CREATOR_EMAIL] == "user@example.com"
@@ -135,14 +119,36 @@ async def test_create_task_without_creator_email_omits_field():
     _FIELD_CREATOR_EMAIL = f"field_{TaskManager.FIELD_CREATOR_EMAIL}"
     patcher, mock_http = _patch_httpx(_resp({"id": "1"}))
     try:
-        await TaskManager().create_task(title="T", description="D")
+        await TaskManager().create_task(local_id=1, title="T", description="D")
         payload = mock_http.post.call_args.kwargs["json"]
         assert _FIELD_CREATOR_EMAIL not in payload["items"][0]
     finally:
         patcher.stop()
 
 
-# ── TaskManager.update_task ───────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_find_task_searches_by_local_id():
+    """find_task ищет по точному Local ID (`field_{FIELD_LOCAL_ID}`), а не по title/description; условие "include" — точное совпадение."""
+    patcher, mock_http = _patch_httpx(_resp([{"id": "42"}]))
+    try:
+        result = await TaskManager().find_task(7)
+        assert result == {"id": "42"}
+        payload = mock_http.post.call_args.kwargs["json"]
+        assert payload["action"] == "select"
+        assert payload["select_fields"] == str(TaskManager.FIELD_LOCAL_ID)
+        assert payload["filters"] == {str(TaskManager.FIELD_LOCAL_ID): {"value": "7", "condition": "include"}}
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_find_task_returns_none_when_not_found():
+    patcher, _ = _patch_httpx(_resp([]))
+    try:
+        assert await TaskManager().find_task(999) is None
+    finally:
+        patcher.stop()
+
 
 @pytest.mark.asyncio
 async def test_update_task_success():
@@ -163,10 +169,9 @@ async def test_update_task_success():
 
 @pytest.mark.asyncio
 async def test_update_task_empty_id_raises():
-    """Регрессия: если задачу удалили в CRM напрямую, CRM отвечает
-    "success" с пустым data.id вместо ошибки — expect_id должен превратить это в Exception,
-    чтобы _do_update_task (src/tasks/crm_outbox_tasks.py) не принял это за успех и
-    оставил строку crm_outbox на повторную попытку, а не пометил её 'done'."""
+    """Если задачу удалили в CRM напрямую, CRM отвечает «success» с пустым data.id; expect_id превращает это в Exception,
+    чтобы строка outbox осталась на повтор, а не стала 'done'.
+    """
     patcher, _ = _patch_httpx(_resp({"id": ""}))
     try:
         with pytest.raises(Exception, match="no valid id"):
@@ -196,8 +201,6 @@ async def test_update_task_connection_error():
     finally:
         patcher.stop()
 
-
-# ── TaskManager.delete_task ───────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_delete_task_success():
@@ -246,7 +249,34 @@ async def test_delete_task_crm_api_error():
         patcher.stop()
 
 
-# ── TaskManager._bool_to_crm ─────────────────────────────────────────────────
+# TaskManager.backfill_local_id — одноразовая миграция (scripts/backfill_crm_local_id.py): дозаписывает Local ID в записи,
+# созданные до его появления.
+
+@pytest.mark.asyncio
+async def test_backfill_local_id_success():
+    patcher, mock_http = _patch_httpx(_resp({"id": "17"}))
+    try:
+        result = await TaskManager().backfill_local_id(task_id=17, local_id=5)
+        assert result["status"] == "success"
+        payload = mock_http.post.call_args.kwargs["json"]
+        assert payload["action"] == "update"
+        assert payload["data"][_FIELD_LOCAL_ID] == "5"
+        assert payload["update_by_field"] == {"id": 17}
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_backfill_local_id_empty_id_raises():
+    """Та же проверка expect_id, что и в update_task/delete_task — запись,
+    отсутствующая в CRM на момент миграции, не должна тихо считаться успехом."""
+    patcher, _ = _patch_httpx(_resp({"id": ""}))
+    try:
+        with pytest.raises(Exception, match="no valid id"):
+            await TaskManager().backfill_local_id(task_id=17, local_id=5)
+    finally:
+        patcher.stop()
+
 
 def test_bool_to_crm_true():
     assert TaskManager._bool_to_crm(True) == "true"

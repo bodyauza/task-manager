@@ -1,11 +1,7 @@
 """Redlock-мьютекс на шард (src/tasks/crm_shard_lock.py::shard_lock).
 
-В остальных тестах (test_crm_outbox.py) shard_lock подменён заглушкой, поэтому
-само тело — получение лока, таймаут, освобождение, закрытие клиента — раньше не
-выполнялось ни разу. Здесь redis-клиент заменён самодельным FakeRedis, который
-моделирует ровно то, что использует shard_lock: client.lock(...), acquire(),
-release(), aclose(). Семантика настоящего redis-py Lock (SET NX PX, токен) этими
-тестами НЕ проверяется — для неё нужен живой Redis.
+В test_crm_outbox.py shard_lock подменён заглушкой, поэтому его тело (лок, таймаут, release, закрытие клиента) здесь выполняется
+на самодельном FakeRedis (lock/acquire/release/aclose). Семантика redis-py Lock (SET NX PX) не проверяется — нужен живой Redis.
 """
 
 from unittest.mock import AsyncMock, patch
@@ -125,10 +121,7 @@ async def test_shard_lock_different_shards_do_not_block_each_other(redis_server)
 
 
 async def test_shard_lock_creates_and_closes_a_new_client_per_call(redis_server):
-    """Клиент не хранится между вызовами (module-level singleton): каждая Celery-задача
-    выполняется в СВОЁМ asyncio.run(), а соединение redis-py, открытое в одном
-    event loop, при переиспользовании в следующем падает «Event loop is closed»
-    (баг, найденный живым прогоном docker compose)."""
+    """Клиент не хранится между вызовами: каждая Celery-задача идёт в своём asyncio.run(), и соединение старого loop падает «Event loop is closed»."""
     async with shard_lock("shard_0"):
         pass
     async with shard_lock("shard_0"):
@@ -138,8 +131,6 @@ async def test_shard_lock_creates_and_closes_a_new_client_per_call(redis_server)
     assert redis_server.clients[0] is not redis_server.clients[1]
     assert all(client.closed for client in redis_server.clients)
 
-
-# ── Использование в обработчике outbox ───────────────────────────────────────
 
 async def _pending_update_row(shard: str = "shard_1") -> int:
     async with async_session_maker() as session:

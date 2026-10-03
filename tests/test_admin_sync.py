@@ -1,9 +1,4 @@
-"""Тесты admin-only обзора статуса CRM-синхронизации
-(src/routers/admin.py::admin_tasks_sync_status/admin_subtasks_sync_status/
-admin_crm_sync_page, src/services/admin_sync.py) — единственное место в
-проекте, где статус CRM-синхронизации вообще виден (обычные TaskResponse/
-SubtaskResponse его не отдают, см. tests/test_tasks.py/test_subtasks.py).
-"""
+"""Тесты admin-only обзора статуса CRM-синхронизации (src/routers/admin.py, src/services/admin_sync.py)."""
 
 import datetime
 import json
@@ -55,8 +50,6 @@ async def _add_outbox_row(
         await session.commit()
 
 
-# ── JSON: /admin/crm-sync-status/tasks ──────────────────────────────────────
-
 async def test_admin_tasks_sync_status_unauthenticated(client: AsyncClient):
     r = await client.get("/admin/crm-sync-status/tasks")
     assert r.status_code == 401
@@ -94,11 +87,7 @@ async def test_admin_tasks_sync_status_reflects_latest_outbox_row(client: AsyncC
     await _set_task_crm_id(task["id"], 42)
     await client.post("/auth/logout")
 
-    # Две строки crm_outbox ПОВЕРХ уже существующей 'create'-строки (её
-    # вставляет сам create_task) — реалистичная история retry. Даты — заведомо
-    # позже "сейчас" (не абсолютные в прошлом), иначе они оказались бы старше
-    # автоматической 'create'-строки (updated_at=now() на момент create_task
-    # выше) и не стали бы последними по ORDER BY updated_at DESC.
+    # Две строки crm_outbox поверх 'create'-строки; даты заведомо позже now(), чтобы они были последними по ORDER BY updated_at DESC.
     now = datetime.datetime.now(datetime.timezone.utc)
     old_ts = now + datetime.timedelta(minutes=1)
     new_ts = now + datetime.timedelta(minutes=2)
@@ -135,8 +124,6 @@ async def test_admin_tasks_sync_status_no_outbox_history(client: AsyncClient, mo
     assert row["sync_status"] == "pending"
 
 
-# ── JSON: /admin/crm-sync-status/subtasks ───────────────────────────────────
-
 async def test_admin_subtasks_sync_status_unauthenticated(client: AsyncClient):
     r = await client.get("/admin/crm-sync-status/subtasks")
     assert r.status_code == 401
@@ -169,8 +156,6 @@ async def test_admin_subtasks_sync_status_shows_task_title(client: AsyncClient, 
     assert row["sync_status"] == "pending"   # см. services/subtasks.py::create_subtask
 
 
-# ── HTML: /admin/crm-sync ────────────────────────────────────────────────────
-
 async def test_admin_crm_sync_page_unauthenticated(client: AsyncClient):
     r = await client.get("/admin/crm-sync")
     assert r.status_code == 401
@@ -190,8 +175,6 @@ async def test_admin_crm_sync_page_as_admin(client: AsyncClient, mock_smtp: dict
     assert "tasksSyncTable" in r.text
     assert "subtasksSyncTable" in r.text
 
-
-# ── Навбар: ссылка видна только администратору ──────────────────────────────
 
 async def test_navbar_admin_link_hidden_for_regular_user(client: AsyncClient, mock_smtp: dict):
     await _register_login(client, mock_smtp, USER_EMAIL)

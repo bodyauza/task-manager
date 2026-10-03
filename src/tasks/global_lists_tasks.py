@@ -1,20 +1,8 @@
-"""Периодическая синхронизация локальной таблицы project с CRM.
+"""Периодическая синхронизация таблицы project с CRM.
 
-Запускается ТОЛЬКО Celery Beat (src/celery_app.py::beat_schedule) — не веб-
-процессом и не по запросу пользователя напрямую (кроме ручного admin-триггера
-через POST /admin/crm-options/refresh, src/routers/pages.py, который просто
-ставит эту же задачу в очередь раньше расписания). Один запуск на весь деплой
-независимо от числа UVICORN_WORKERS-процессов — иначе каждый воркер по
-своему расписанию писал бы в одну и ту же таблицу.
-
-Celery-задачи по умолчанию синхронные — src.celery_app.run_celery_task()
-оборачивает async-тело в свой asyncio.run(), освобождает пул соединений
-SQLAlchemy и закрывает общий httpx-клиент CRM сразу после (см. её докстринг —
-без этого второй и последующие вызовы в одном и том же Celery-воркере падают
-RuntimeError из-за переиспользования asyncpg-соединения/httpx-клиента от
-закрытого event loop). Само тело использует async_session_maker() напрямую
-(без FastAPI Depends/запроса), тот же приём, что уже применяет
-create_initial_roles() в src/main.py вне HTTP-запроса.
+Запускается Celery Beat (src/celery_app.py) и вручную через POST /admin/crm-options/refresh, который ставит ту же задачу
+в очередь. Один запуск на деплой независимо от числа UVICORN_WORKERS. Тело задачи выполняется через run_celery_task()
+и использует async_session_maker() напрямую.
 """
 
 import logging
@@ -34,12 +22,8 @@ logger = logging.getLogger(__name__)
 
 
 async def _upsert_project_rows(db: AsyncSession, choices: Dict[str, str]) -> None:
-    """Upsert по crm_id: новые строки — INSERT, изменившиеся метки — UPDATE
-    (переименование в CRM подхватывается здесь автоматически для ВСЕХ задач,
-    ссылающихся на этот project_id, — не нужно ждать, пока кто-то отредактирует
-    задачу заново). Опции, пропавшие из choices, переводятся в is_active=false,
-    а не удаляются — на них могут ссылаться существующие Task.project_id
-    (удаление физически сломало бы FK).
+    """Upsert по crm_id: новые строки — INSERT, изменившиеся метки — UPDATE (переименование подхватывается для всех задач).
+    Пропавшие из choices опции получают is_active=false, а не удаляются (на них ссылаются Task.project_id).
     """
     seen_ids = set(choices.keys())
     if choices:
@@ -52,9 +36,7 @@ async def _upsert_project_rows(db: AsyncSession, choices: Dict[str, str]) -> Non
             set_={"label": stmt.excluded.label, "is_active": True, "synced_at": stmt.excluded.synced_at},
         )
         await db.execute(stmt)
-    # notin_(()) на пустом множестве — валидный SQL (WHERE false), но seen_ids
-    # пустым бывает только если CRM вернула пустой список опций; в этом случае
-    # предложение ниже корректно деактивирует все текущие строки.
+    # notin_(()) на пустом множестве — валидный SQL; пустой seen_ids бывает, только если CRM вернула пустой список, и тогда все строки деактивируются.
     await db.execute(
         update(Project).where(Project.crm_id.notin_(seen_ids)).values(is_active=False)
     )

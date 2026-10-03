@@ -21,10 +21,7 @@ _admin_only = require_role("admin")
 
 
 async def _project_options(db: AsyncSession = Depends(get_async_session)) -> dict:
-    """{crm_id: label} по активным строкам project — прямой запрос к локальной
-    таблице, без похода в CRM — таблица наполняется отдельно, Celery Beat
-    (src/tasks/global_lists_tasks.py::sync_project_table).
-    """
+    """{crm_id: label} по активным строкам локальной таблицы project (наполняется Celery Beat)."""
     rows = (
         await db.execute(select(Project.crm_id, Project.label).where(Project.is_active.is_(True)))
     ).all()
@@ -34,12 +31,8 @@ async def _project_options(db: AsyncSession = Depends(get_async_session)) -> dic
 async def _is_admin(
     user: User = Depends(current_user), db: AsyncSession = Depends(get_async_session),
 ) -> bool:
-    """Только для решения «показывать ли ссылку на admin-страницу в навбаре»
-    (_navbar.html) — НЕ заменяет require_role("admin") как защиту самого
-    admin-эндпоинта (тот использует _admin_only отдельно). Явный select(),
-    а не user.roles: связь не lazy="selectin" — синхронное обращение к ней в
-    Jinja2 упало бы MissingGreenlet (тот же приём, что и в require_role() и
-    profile_page ниже).
+    """Нужно только чтобы решить, показывать ли ссылку на admin-страницу в навбаре; защитой эндпоинта служит require_role.
+    Явный select(), а не user.roles — иначе MissingGreenlet в Jinja2.
     """
     role = (
         await db.execute(
@@ -71,8 +64,7 @@ async def complete_registration_page(
     request: Request,
     reg_token: Optional[str] = Cookie(default=None),
 ):
-    # Server-side guard: без reg_token пользователь не должен попасть на эту страницу.
-    # Полная валидация (подпись + срок) происходит при POST /auth/register/complete.
+    # Без reg_token на страницу попадать нельзя; полная валидация — при POST /auth/register/complete.
     if reg_token is None:
         return RedirectResponse(url="/register", status_code=302)
     return templates.TemplateResponse(request, "complete-registration.html")
@@ -85,7 +77,6 @@ async def task_board(
     project_options: dict = Depends(_project_options),
     is_admin: bool = Depends(_is_admin),
 ):
-    # current_page передаётся в _navbar.html для выделения активной ссылки меню.
     return templates.TemplateResponse(
         request, "task-board.html",
         {"user": user.id, "current_page": "tasks", "project_options": project_options, "is_admin": is_admin},
@@ -167,21 +158,13 @@ async def profile_page(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    # Явный select().join() вместо user.roles: пользователь теперь может иметь
-    # несколько ролей (many-to-many, user_role) — тот же приём, что в require_role()
-    # (src/auth/auth_config.py), и та же причина, по которой это не user.roles
-    # напрямую — обращение к незагруженной lazy-relationship в async-коде роняет
-    # запрос MissingGreenlet.
+    # Явный select().join(), а не user.roles: ленивая связь в async роняет MissingGreenlet.
     roles = (await db.execute(
         select(Role).join(user_role).where(user_role.c.person_id == user.id)
     )).scalars().all()
-    is_admin = any(role.name == "admin" for role in roles)  # уже загружено выше — без доп. запроса
+    is_admin = any(role.name == "admin" for role in roles)
 
-    # Jinja2 рендерит шаблон синхронно. Если передать ORM-объект напрямую,
-    # обращение к «ленивым» атрибутам внутри шаблона вызовет MissingGreenlet:
-    # SQLAlchemy не может выполнить SELECT вне async-контекста. Все нужные значения
-    # извлекаются здесь, пока сессия открыта, и передаются в шаблон как обычные
-    # Python-значения.
+    # Jinja2 рендерит синхронно: значения извлекаем здесь, пока сессия открыта (иначе MissingGreenlet на ленивых атрибутах).
     response = templates.TemplateResponse(
         request,
         "profile.html",

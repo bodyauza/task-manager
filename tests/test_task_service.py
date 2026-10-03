@@ -1,14 +1,7 @@
-"""Юнит-тесты src.services.tasks: создание/чтение/обновление/удаление задач
-без HTTP-слоя.
+"""Юнит-тесты src.services.tasks без HTTP-слоя.
 
-Сервисный слой больше не принимает CRM-абстракцию как параметр и сам CRM
-никогда не вызывает (см. src/tasks/crm_outbox_tasks.py::dispatch_outbox_row) —
-он лишь вставляет строку CrmOutbox в той же транзакции, что и основное
-изменение, и диспатчит её в Celery. Эти тесты поэтому проверяют не факт CRM-
-вызова (это дело tests/test_crm_outbox.py — обработчиков _do_create_task и
-т.п.), а то, что нужная строка CrmOutbox появилась с правильным payload, и что
-dispatch_outbox_row была вызвана для неё (мок из tests/conftest.py::
-mock_outbox_dispatch — реального Celery/Redis в тестах нет).
+Сервис CRM не вызывает: он вставляет строку CrmOutbox в одной транзакции с изменением и диспатчит её в Celery. Тесты проверяют
+содержимое строки и факт вызова dispatch_outbox_row (mock_outbox_dispatch); обработчики — в test_crm_outbox.py.
 """
 
 import pytest
@@ -35,8 +28,6 @@ async def _outbox_rows_for(session, aggregate_type: str, aggregate_id: int) -> l
 
 _make_user = make_user
 
-
-# ── create_task ──────────────────────────────────────────────────────────────
 
 async def test_create_task_success(mock_outbox_dispatch):
     async with async_session_maker() as session:
@@ -75,8 +66,6 @@ async def test_create_task_duplicate_title_raises_409_before_second_outbox_row()
         assert len(rows) == 1
 
 
-# ── list_tasks / get_task ────────────────────────────────────────────────────
-
 async def test_list_tasks_pagination():
     async with async_session_maker() as session:
         user = await _make_user(session)
@@ -95,8 +84,6 @@ async def test_get_task_not_found_raises_404():
             await task_service.get_task(session, 9999)
         assert exc_info.value.status_code == 404
 
-
-# ── update_task ──────────────────────────────────────────────────────────────
 
 async def test_update_task_not_found_raises_404():
     async with async_session_maker() as session:
@@ -132,22 +119,38 @@ async def test_update_task_enqueues_outbox_when_previously_synced(mock_outbox_di
         mock_outbox_dispatch.assert_called_once()
 
 
-async def test_update_task_not_synced_skips_outbox(mock_outbox_dispatch):
+async def test_update_task_before_create_enqueues_dependent_update(mock_outbox_dispatch):
     async with async_session_maker() as session:
         user = await _make_user(session)
         created = await task_service.create_task(session, user, TaskCreate(title="Orig", description="d"))
         mock_outbox_dispatch.reset_mock()
 
-        result = await task_service.update_task(session, user, created.id, TaskUpdate(title="Renamed"))
+        await task_service.update_task(session, user, created.id, TaskUpdate(title="Renamed"))
 
-        # crm_task_id всё ещё None (create ушёл в фон, ничего его не завершило) —
-        # синхронизировать нечего, outbox-строка для update не создаётся.
+        rows = await _outbox_rows_for(session, "task", created.id)
+        create_row = next(r for r in rows if r.operation == "create")
+        update_row = next(r for r in rows if r.operation == "update")
+        assert update_row.depends_on_event_id == create_row.id
+        assert update_row.payload["crm_task_id"] is None
+        assert update_row.payload["title"] == "Renamed"
+        mock_outbox_dispatch.assert_called_once()
+
+
+async def test_update_task_without_crm_id_and_without_pending_create_skips_outbox(mock_outbox_dispatch):
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        created = await task_service.create_task(session, user, TaskCreate(title="Orig", description="d"))
+        for row in await _outbox_rows_for(session, "task", created.id):
+            row.status = "done"
+        await session.commit()
+        mock_outbox_dispatch.reset_mock()
+
+        await task_service.update_task(session, user, created.id, TaskUpdate(title="Renamed"))
+
         rows = await _outbox_rows_for(session, "task", created.id)
         assert not any(r.operation == "update" for r in rows)
         mock_outbox_dispatch.assert_not_called()
 
-
-# ── delete_task ──────────────────────────────────────────────────────────────
 
 async def test_delete_task_removes_row_and_enqueues_outbox(mock_outbox_dispatch):
     async with async_session_maker() as session:

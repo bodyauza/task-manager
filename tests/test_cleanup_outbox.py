@@ -1,10 +1,6 @@
-"""Тесты src.tasks.crm_outbox_tasks._cleanup_done_outbox_async — Celery Beat-
-задача (раз в сутки, 03:00 UTC, см. src/celery_app.py::beat_schedule), которая
-удаляет старые 'done'-строки crm_outbox, чтобы таблица не росла бесконечно.
+"""Тесты _cleanup_done_outbox_async — удаление старых 'done'-строк crm_outbox (Beat, раз в сутки).
 
-retention_days передаётся явно в каждом тесте (не через crm_settings/env) —
-тот же приём, что и src/tasks/sharding.py::shard_names(count): тестируемость
-без monkeypatch/reload процесса.
+retention_days передаётся явно в каждом тесте — без monkeypatch/reload.
 """
 
 import datetime
@@ -46,11 +42,7 @@ async def _make_row(
         )
         session.add(row)
         await session.commit()
-        # updated_at имеет server_default=func.now(): чтобы задать своё значение
-        # "задним числом", он выставляется ОТДЕЛЬНЫМ UPDATE после INSERT — прямой
-        # присвоение перед первым commit просто использовалось бы в INSERT (тоже
-        # сработало бы), но явный UPDATE нагляднее показывает намерение "давно
-        # обработанная строка", не полагаясь на порядок присвоения атрибутов.
+        # updated_at имеет server_default=func.now(): задаём его «задним числом» отдельным UPDATE после INSERT.
         row.updated_at = updated_at
         await session.commit()
         return row.id
@@ -96,9 +88,7 @@ async def test_never_deletes_pending_failed_or_blocked_regardless_of_age():
 
 
 async def test_keeps_done_row_that_other_row_depends_on():
-    """Родитель (create, done, старый) ещё занят ссылкой потомка (update,
-    done, старый, depends_on_event_id=parent.id) — первый прогон удаляет
-    только потомка; второй, когда потомка уже нет, удаляет и родителя."""
+    """Родитель (done, старый) ещё занят ссылкой потомка: первый прогон удаляет потомка, второй — и родителя."""
     task_id = await _make_task()
     parent_id = await _make_row(task_id, status="done", operation="create", updated_at=_OLD)
     child_id = await _make_row(
@@ -132,9 +122,7 @@ async def test_dependency_protection_holds_even_with_retention_zero():
 
 
 async def test_batches_across_multiple_passes():
-    """С маленьким _CLEANUP_BATCH удаление старых строк идёт несколькими
-    итерациями внутреннего while — итоговый результат не отличается от
-    одного большого батча."""
+    """С маленьким _CLEANUP_BATCH удаление идёт несколькими итерациями; результат тот же, что у одного большого батча."""
     task_id = await _make_task()
     ids = [await _make_row(task_id, status="done", updated_at=_OLD) for _ in range(5)]
 
@@ -151,20 +139,12 @@ async def test_returns_zero_when_nothing_to_clean():
 
 
 async def test_survives_integrity_error_from_row_inserted_between_select_and_delete():
-    """Гонка, которую NOT EXISTS в SELECT-кандидатах не может исключить: между
-    моментом, когда строка попала в выборку на удаление, и моментом, когда
-    реально выполняется DELETE, ДРУГАЯ транзакция успевает вставить новую
-    строку с depends_on_event_id на эту же строку — DELETE должен упасть с
-    IntegrityError (fk_crm_outbox_depends_on_event_id, RESTRICT), а не молча
-    удалить занятую строку и не закоммитить наполовину гонку.
+    """Гонка, которую NOT EXISTS не исключает: между выборкой кандидата и DELETE другая транзакция вставляет строку с
+    depends_on_event_id на него. DELETE должен упасть с IntegrityError (FK, RESTRICT), а не удалить занятую строку.
 
-    Настоящей многопроцессной гонки здесь нет (один event loop, один тест) —
-    она симулируется детерминированно: AsyncSession.execute патчится так,
-    чтобы ПЕРЕД первым же DELETE-запросом (найденным по типу statement, не по
-    тексту SQL) отдельная сессия успела вставить и закоммитить зависимую
-    строку. С точки зрения PostgreSQL это неотличимо от настоящей гонки двух
-    независимых транзакций — FK проверяется в момент выполнения DELETE,
-    независимо от того, как физически появилась вставленная строка."""
+    Гонка симулируется детерминированно: AsyncSession.execute патчится так, чтобы перед первым DELETE отдельная сессия
+    вставила и закоммитила зависимую строку.
+    """
     task_id = await _make_task()
     victim_id = await _make_row(task_id, status="done", operation="create", updated_at=_OLD)
 
