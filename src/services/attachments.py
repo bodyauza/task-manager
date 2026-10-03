@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.auth.user_models import User
 from src.realtime import broadcast_task_event
 from src.task_logic.models import CrmOutbox, Subtask, Task
-from src.crm.outbox_queries import pending_create_event_id
+from src.crm.outbox_queries import ensure_create_event
 from src.tasks.crm_outbox_tasks import dispatch_outbox_row
 from src.tasks.sharding import ensure_task_shard
 from src.utils.file_utils import (
@@ -109,6 +109,19 @@ SUBTASK_ATTACHMENTS = AttachmentConfig(
 )
 
 
+async def _unlink_quietly(path: Path) -> None:
+    """Удаляет файл с диска ПОСЛЕ успешного commit; сбой файловой системы только логируется.
+
+    К этому моменту изменение уже в БД, outbox-строка диспатчена: исключение (PermissionError и другие OSError;
+    missing_ok их не покрывает) превратило бы сохранённую операцию в 500 и пропустило бы WS-событие. Файл,
+    который не удалось убрать, остаётся на диске без ссылки из БД до удаления всей сущности (cleanup() сносит каталог целиком).
+    """
+    try:
+        await asyncio.to_thread(path.unlink, missing_ok=True)
+    except OSError as exc:
+        logger.warning("Не удалось удалить файл %s после commit: %s", path, exc)
+
+
 async def _enqueue_sync_files(
     db: AsyncSession, config: AttachmentConfig, entity: Any, entity_id: int, crm_id: int, **payload_fields: Any,
 ) -> CrmOutbox:
@@ -131,20 +144,15 @@ async def _enqueue_sync_files(
 
 async def _enqueue_sync_files_pending_create(
     db: AsyncSession, config: AttachmentConfig, entity: Any, entity_id: int, **payload_fields: Any,
-) -> Optional[CrmOutbox]:
+) -> list[CrmOutbox]:
     """Как _enqueue_sync_files, но для сущности без CRM-id (create ещё не выполнен).
 
     Строка зависит от 'create' через depends_on_event_id и несёт crm_id=None — воркер прочитает актуальный
-    id из БД после create. Если create-события нет (штатно не бывает) — логируем и ничего не ставим,
-    чтобы не ронять запрос пользователя.
+    id из БД после create. Если create-события нет (сущность заведена в обход сервисов или до интеграции с CRM),
+    ensure_create_event ставит его по текущему состоянию — иначе файл остался бы только локально.
+    Возвращает новые строки (возможные create-события, затем sync_files) — их нужно передать в dispatch_outbox_row после commit.
     """
-    create_event_id = await pending_create_event_id(db, config.aggregate_type, entity_id)
-    if create_event_id is None:
-        logger.error(
-            "%s %s: не найдено событие 'create' в outbox — sync_files не поставлена",
-            config.singular_name, entity_id,
-        )
-        return None
+    create_event_id, new_rows = await ensure_create_event(db, config.aggregate_type, entity)
 
     outbox_row = CrmOutbox(
         aggregate_type=config.aggregate_type,
@@ -156,7 +164,20 @@ async def _enqueue_sync_files_pending_create(
     )
     db.add(outbox_row)
     entity.sync_status = "pending"
-    return outbox_row
+    return [*new_rows, outbox_row]
+
+
+async def _enqueue_sync(
+    db: AsyncSession, config: AttachmentConfig, entity: Any, entity_id: int, **payload_fields: Any,
+) -> list[CrmOutbox]:
+    """Ставит 'sync_files' для сущности: сразу, если CRM-id известен, иначе зависимой от 'create'.
+
+    Возвращает строки для dispatch_outbox_row после commit.
+    """
+    crm_id = config.get_crm_id(entity)
+    if crm_id is not None:
+        return [await _enqueue_sync_files(db, config, entity, entity_id, crm_id, **payload_fields)]
+    return await _enqueue_sync_files_pending_create(db, config, entity, entity_id, **payload_fields)
 
 
 # Атомарное создание сущности с файлами (POST /create-task/, /create-subtask/)
@@ -292,16 +313,8 @@ async def upload_specification(
 
     # Outbox вставляется в той же транзакции. Если CRM-id ещё нет — строка зависит от 'create'
     # (см. _enqueue_sync_files_pending_create).
-    crm_id = config.get_crm_id(entity)
     # sync_specification — флаг «слот ТЗ затронут»; путь воркер читает из БД.
-    if crm_id is not None:
-        outbox_row = await _enqueue_sync_files(
-            db, config, entity, entity_id, crm_id, sync_specification=True,
-        )
-    else:
-        outbox_row = await _enqueue_sync_files_pending_create(
-            db, config, entity, entity_id, sync_specification=True,
-        )
+    outbox_rows = await _enqueue_sync(db, config, entity, entity_id, sync_specification=True)
 
     # extra захватывается до commit — иначе MissingGreenlet после expire.
     extra = await config.event_extra(db, entity)
@@ -314,12 +327,12 @@ async def upload_specification(
         await delete_orphaned_files(rel_path, None)
         raise
 
-    if outbox_row is not None:
-        await dispatch_outbox_row(outbox_row)
+    for row in outbox_rows:
+        await dispatch_outbox_row(row)
 
     # Старый файл удаляем только после успешного commit (unlink в потоке).
     if old_path:
-        await asyncio.to_thread(old_path.unlink, missing_ok=True)
+        await _unlink_quietly(old_path)
 
     # exclude_user_id не передаётся: актор тоже видит событие в чате.
     await broadcast_task_event(
@@ -348,26 +361,18 @@ async def delete_specification(
     old_path = UPLOAD_ROOT / entity.specification_path
 
     # sync_specification — флаг «слот затронут»; воркер увидит пустой путь и очистит поле в CRM.
-    crm_id = config.get_crm_id(entity)
-    if crm_id is not None:
-        outbox_row = await _enqueue_sync_files(
-            db, config, entity, entity_id, crm_id, sync_specification=True,
-        )
-    else:
-        # CRM-id ещё нет — зависимая от 'create' строка (см. _enqueue_sync_files_pending_create).
-        outbox_row = await _enqueue_sync_files_pending_create(
-            db, config, entity, entity_id, sync_specification=True,
-        )
+    # CRM-id ещё нет — зависимая от 'create' строка (см. _enqueue_sync_files_pending_create).
+    outbox_rows = await _enqueue_sync(db, config, entity, entity_id, sync_specification=True)
 
     extra = await config.event_extra(db, entity)
     title = extra.pop("title")
     entity.specification_path = None
     await db.commit()
 
-    if outbox_row is not None:
-        await dispatch_outbox_row(outbox_row)
+    for row in outbox_rows:
+        await dispatch_outbox_row(row)
 
-    await asyncio.to_thread(old_path.unlink, missing_ok=True)
+    await _unlink_quietly(old_path)
 
     await broadcast_task_event(
         config.event_type, title, sender_email=user.email, actor_id=user.id, action="deleted", **extra,
@@ -456,17 +461,9 @@ async def upload_other_files(
         )
 
     updated = existing + new_paths
-    crm_id = config.get_crm_id(entity)
     # sync_other_files — флаг «слот затронут»; воркер отправит в CRM весь текущий список из БД.
-    if crm_id is not None:
-        outbox_row = await _enqueue_sync_files(
-            db, config, entity, entity_id, crm_id, sync_other_files=True,
-        )
-    else:
-        # CRM-id ещё нет — зависимая от 'create' строка (см. _enqueue_sync_files_pending_create).
-        outbox_row = await _enqueue_sync_files_pending_create(
-            db, config, entity, entity_id, sync_other_files=True,
-        )
+    # CRM-id ещё нет — зависимая от 'create' строка (см. _enqueue_sync_files_pending_create).
+    outbox_rows = await _enqueue_sync(db, config, entity, entity_id, sync_other_files=True)
     extra = await config.event_extra(db, entity)
     title = extra.pop("title")
     entity.other_file_paths = updated
@@ -477,8 +474,8 @@ async def upload_other_files(
         await delete_orphaned_files(None, new_paths)
         raise
 
-    if outbox_row is not None:
-        await dispatch_outbox_row(outbox_row)
+    for row in outbox_rows:
+        await dispatch_outbox_row(row)
 
     await broadcast_task_event(
         config.event_type, title, sender_email=user.email, actor_id=user.id, action="uploaded", **extra,
@@ -511,27 +508,19 @@ async def delete_other_file(
     target_path = UPLOAD_ROOT / target
 
     updated = [p for p in existing if p != target]
-    crm_id = config.get_crm_id(entity)
     # sync_other_files — флаг «слот затронут»; воркер сам прочитает актуальный список.
-    if crm_id is not None:
-        outbox_row = await _enqueue_sync_files(
-            db, config, entity, entity_id, crm_id, sync_other_files=True,
-        )
-    else:
-        # CRM-id ещё нет — зависимая от 'create' строка (см. _enqueue_sync_files_pending_create).
-        outbox_row = await _enqueue_sync_files_pending_create(
-            db, config, entity, entity_id, sync_other_files=True,
-        )
+    # CRM-id ещё нет — зависимая от 'create' строка (см. _enqueue_sync_files_pending_create).
+    outbox_rows = await _enqueue_sync(db, config, entity, entity_id, sync_other_files=True)
     extra = await config.event_extra(db, entity)
     title = extra.pop("title")
     # NULL вместо [] при пустом списке — как начальное состояние колонки.
     entity.other_file_paths = updated if updated else None
     await db.commit()
 
-    if outbox_row is not None:
-        await dispatch_outbox_row(outbox_row)
+    for row in outbox_rows:
+        await dispatch_outbox_row(row)
 
-    await asyncio.to_thread(target_path.unlink, missing_ok=True)
+    await _unlink_quietly(target_path)
 
     await broadcast_task_event(
         config.event_type, title, sender_email=user.email, actor_id=user.id, action="deleted", **extra,

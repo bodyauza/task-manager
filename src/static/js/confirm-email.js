@@ -20,6 +20,8 @@ function formatError(detail) {
         return `Подождите ${sec} секунд перед повторной отправкой`;
     }
     if (detail === 'SMTP_ERROR') return 'Ошибка отправки письма. Обратитесь в техподдержку';
+    if (detail === 'RATE_LIMIT_IP') return 'Слишком много запросов с вашего адреса. Попробуйте позже';
+    if (detail === 'RATE_LIMITER_UNAVAILABLE') return 'Регистрация временно недоступна. Попробуйте позже';
     return detail;
 }
 

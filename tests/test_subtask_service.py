@@ -155,6 +155,60 @@ async def test_update_subtask_before_create_enqueues_dependent_update(mock_outbo
         mock_outbox_dispatch.assert_called_once()
 
 
+async def test_update_subtask_without_create_event_enqueues_create_when_parent_synced(mock_outbox_dispatch):
+    """Подзадача без CRM-id и без create-события (заведена в обход сервисов): правка не теряется — ставится create
+    по текущему состоянию (родитель уже в CRM — без зависимости) и зависимый от него update.
+    """
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        task = await _make_task(session, user, crm_task_id=10)
+        subtask = Subtask(title="Legacy", description="old", task_id=task.id)
+        session.add(subtask)
+        await session.commit()
+        subtask_id = subtask.id
+
+        await subtask_service.update_subtask(session, user, subtask_id, SubtaskUpdate(title="Renamed"))
+
+        rows = await _outbox_rows_for(session, "subtask", subtask_id)
+        create_row = next(r for r in rows if r.operation == "create")
+        update_row = next(r for r in rows if r.operation == "update")
+        assert create_row.payload == {
+            "title": "Renamed", "description": "old", "completed": False, "creator_email": None,
+        }
+        assert create_row.depends_on_event_id is None
+        assert update_row.depends_on_event_id == create_row.id
+        assert (await session.get(Subtask, subtask_id)).sync_status == "pending"
+        dispatched = [call.args[0] for call in mock_outbox_dispatch.await_args_list]
+        assert {r.id for r in dispatched} == {create_row.id, update_row.id}
+
+
+async def test_update_subtask_without_create_event_also_enqueues_parent_create(mock_outbox_dispatch):
+    """Родитель тоже без CRM-id и без create: create подзадачи зависит от созданного create родителя, иначе ему не на что
+    сослаться (parent_item_id).
+    """
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        task = await _make_task(session, user, crm_task_id=None)
+        subtask = Subtask(title="Legacy", description="d", task_id=task.id)
+        session.add(subtask)
+        await session.commit()
+        subtask_id, task_id = subtask.id, task.id
+
+        await subtask_service.update_subtask(session, user, subtask_id, SubtaskUpdate(completed=True))
+
+        parent_create = next(r for r in await _outbox_rows_for(session, "task", task_id) if r.operation == "create")
+        rows = await _outbox_rows_for(session, "subtask", subtask_id)
+        create_row = next(r for r in rows if r.operation == "create")
+        update_row = next(r for r in rows if r.operation == "update")
+        assert parent_create.payload["creator_email"] == user.email
+        assert parent_create.shard == create_row.shard == update_row.shard
+        assert create_row.depends_on_event_id == parent_create.id
+        assert update_row.depends_on_event_id == create_row.id
+        assert create_row.payload["completed"] is True
+        dispatched = {call.args[0].id for call in mock_outbox_dispatch.await_args_list}
+        assert dispatched == {parent_create.id, create_row.id, update_row.id}
+
+
 async def test_delete_subtask_removes_row_and_enqueues_outbox(mock_outbox_dispatch):
     async with async_session_maker() as session:
         user = await _make_user(session)

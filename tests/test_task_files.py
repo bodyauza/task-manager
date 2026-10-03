@@ -565,6 +565,119 @@ async def test_upload_spec_enqueues_dependent_row_when_task_not_in_crm(client, m
 
 
 @pytest.mark.asyncio
+async def test_upload_spec_for_task_without_create_event_enqueues_create_and_dependent_sync(
+    client, mock_smtp, mock_magic, upload_root, mock_outbox_dispatch,
+):
+    """Задача без CRM-id и без create-события (заведена в обход сервисов): раньше sync_files не ставилась вовсе (файл
+    оставался только локально), теперь ставится create по текущему состоянию и зависимая от него sync_files.
+    """
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    tid = task["id"]
+    async with async_session_maker() as session:
+        for row in await _outbox_rows_for_task(tid):
+            await session.delete(await session.get(CrmOutbox, row.id))
+        await session.commit()
+    mock_outbox_dispatch.reset_mock()
+
+    r = await client.post(f"/tasks/{tid}/specification", files=_spec_upload(_pdf()))
+
+    assert r.status_code == 200
+    rows = await _outbox_rows_for_task(tid)
+    create_row = next(r_ for r_ in rows if r_.operation == "create")
+    sync_row = next(r_ for r_ in rows if r_.operation == "sync_files")
+    assert create_row.payload["title"] == task["title"]
+    assert create_row.payload["creator_email"] == EMAIL
+    assert sync_row.depends_on_event_id == create_row.id
+    assert sync_row.payload["sync_specification"] is True
+    dispatched = {call.args[0].id for call in mock_outbox_dispatch.await_args_list}
+    assert dispatched == {create_row.id, sync_row.id}
+
+
+# Сбой удаления старого файла ПОСЛЕ commit не должен давать 500 и пропускать WS-событие.
+
+def _unlink_fails(monkeypatch) -> None:
+    from pathlib import Path
+
+    def _boom(self, missing_ok=False):
+        raise PermissionError("simulated: file is locked")
+
+    monkeypatch.setattr(Path, "unlink", _boom)
+
+
+@pytest.mark.asyncio
+async def test_upload_spec_replace_survives_old_file_unlink_failure(
+    client, mock_smtp, mock_magic, upload_root, monkeypatch, caplog,
+):
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    tid = task["id"]
+    await client.post(f"/tasks/{tid}/specification", files=_spec_upload(_pdf(), "v1.pdf"))
+
+    _unlink_fails(monkeypatch)
+    observer = _ObserverWebSocket()
+    connection_manager.register(_OBSERVER_ID, observer, "observer@example.com")
+    try:
+        with caplog.at_level("WARNING", logger="src.services.attachments"):
+            r = await client.post(f"/tasks/{tid}/specification", files=_spec_upload(_pdf(), "v2.pdf"))
+    finally:
+        connection_manager.unregister(_OBSERVER_ID, observer)
+
+    assert r.status_code == 200
+    assert "v2" in r.json()["specification_path"]
+    async with async_session_maker() as session:
+        assert "v2" in (await session.get(Task, tid)).specification_path  # изменение сохранено в БД
+    assert len(observer.sent) == 1                                          # WS-событие не потеряно
+    assert "Не удалось удалить файл" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_delete_spec_survives_unlink_failure(client, mock_smtp, mock_magic, upload_root, monkeypatch, caplog):
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    tid = task["id"]
+    await client.post(f"/tasks/{tid}/specification", files=_spec_upload(_pdf()))
+
+    _unlink_fails(monkeypatch)
+    observer = _ObserverWebSocket()
+    connection_manager.register(_OBSERVER_ID, observer, "observer@example.com")
+    try:
+        with caplog.at_level("WARNING", logger="src.services.attachments"):
+            r = await client.delete(f"/tasks/{tid}/specification")
+    finally:
+        connection_manager.unregister(_OBSERVER_ID, observer)
+
+    assert r.status_code == 200
+    assert r.json() == {"specification_path": None}
+    assert len(observer.sent) == 1
+    assert "Не удалось удалить файл" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_delete_other_file_survives_unlink_failure(client, mock_smtp, mock_magic, upload_root, monkeypatch, caplog):
+    await _auth(client, mock_smtp)
+    task = await _make_task(client)
+    tid = task["id"]
+    paths = (
+        await client.post(f"/tasks/{tid}/files", files=_other_uploads((_pdf(), "a.pdf")))
+    ).json()["other_file_paths"]
+
+    _unlink_fails(monkeypatch)
+    observer = _ObserverWebSocket()
+    connection_manager.register(_OBSERVER_ID, observer, "observer@example.com")
+    try:
+        with caplog.at_level("WARNING", logger="src.services.attachments"):
+            r = await client.delete(f"/tasks/{tid}/files/{paths[0].split('/')[-1]}")
+    finally:
+        connection_manager.unregister(_OBSERVER_ID, observer)
+
+    assert r.status_code == 200
+    assert r.json()["other_file_paths"] == []
+    assert len(observer.sent) == 1
+    assert "Не удалось удалить файл" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_delete_spec_enqueues_sync_specification_row(client, mock_smtp, mock_magic, upload_root):
     await _auth(client, mock_smtp)
     task = await _make_task(client)

@@ -106,7 +106,7 @@ def _now_utc() -> datetime:
     "/register/request-code",
     status_code=200,
     summary="Шаг 1: отправить код подтверждения на email",
-    responses=responses(400, 409, 429, 503, c400="INVALID_EMAIL", c409="EMAIL_ALREADY_REGISTERED", c429="RATE_LIMIT:<секунд> — повторный запрос раньше чем через 60 с (на этот email), либо RATE_LIMIT_IP — исчерпан общий лимит запросов с этого IP", c503="SMTP_ERROR — не удалось отправить письмо"),
+    responses=responses(400, 409, 429, 503, c400="INVALID_EMAIL", c409="EMAIL_ALREADY_REGISTERED", c429="RATE_LIMIT:<секунд> — повторный запрос раньше чем через 60 с (на этот email), либо RATE_LIMIT_IP — исчерпан общий лимит запросов с этого IP", c503="SMTP_ERROR — не удалось отправить письмо, либо RATE_LIMITER_UNAVAILABLE — недоступно хранилище счётчиков лимита по IP (Redis)"),
 )
 async def request_registration_code(
     request: Request,

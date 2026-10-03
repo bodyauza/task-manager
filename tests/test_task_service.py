@@ -136,20 +136,63 @@ async def test_update_task_before_create_enqueues_dependent_update(mock_outbox_d
         mock_outbox_dispatch.assert_called_once()
 
 
-async def test_update_task_without_crm_id_and_without_pending_create_skips_outbox(mock_outbox_dispatch):
+async def test_update_task_without_crm_id_and_without_create_event_enqueues_create(mock_outbox_dispatch):
+    """Задача без CRM-id и без create-события (заведена в обход сервисов или до интеграции с CRM): правка раньше молча
+    пропускалась, теперь ставится create по текущему состоянию и зависимый от него update.
+    """
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        task = Task(title="Legacy", description="old", owner_id=user.id)
+        session.add(task)
+        await session.commit()
+        task_id = task.id
+        assert await _outbox_rows_for(session, "task", task_id) == []
+
+        await task_service.update_task(session, user, task_id, TaskUpdate(title="Renamed"))
+
+        rows = await _outbox_rows_for(session, "task", task_id)
+        create_row = next(r for r in rows if r.operation == "create")
+        update_row = next(r for r in rows if r.operation == "update")
+        # create несёт ТЕКУЩЕЕ состояние (уже с новым названием) и email владельца, как create из create_task.
+        assert create_row.payload == {
+            "title": "Renamed", "description": "old", "completed": False, "project": None,
+            "creator_email": user.email,
+        }
+        assert create_row.status == "pending"
+        assert create_row.shard is not None
+        assert update_row.depends_on_event_id == create_row.id
+        assert (await session.get(Task, task_id)).sync_status == "pending"
+        # Диспатчатся обе строки: и create, и update.
+        dispatched = [call.args[0] for call in mock_outbox_dispatch.await_args_list]
+        assert {r.id for r in dispatched} == {create_row.id, update_row.id}
+
+
+async def test_update_task_with_pending_create_does_not_add_second_create(mock_outbox_dispatch):
     async with async_session_maker() as session:
         user = await _make_user(session)
         created = await task_service.create_task(session, user, TaskCreate(title="Orig", description="d"))
-        for row in await _outbox_rows_for(session, "task", created.id):
-            row.status = "done"
-        await session.commit()
         mock_outbox_dispatch.reset_mock()
 
         await task_service.update_task(session, user, created.id, TaskUpdate(title="Renamed"))
 
         rows = await _outbox_rows_for(session, "task", created.id)
-        assert not any(r.operation == "update" for r in rows)
-        mock_outbox_dispatch.assert_not_called()
+        assert [r.operation for r in rows] == ["create", "update"]
+        mock_outbox_dispatch.assert_called_once()
+
+
+async def test_update_task_duplicate_title_with_pending_create_returns_409(mock_outbox_dispatch):
+    """Запросы построения outbox-строк выполняют autoflush UPDATE задачи: нарушение uq_task_title_owner должно стать 409, а не 500."""
+    async with async_session_maker() as session:
+        user = await _make_user(session)
+        await task_service.create_task(session, user, TaskCreate(title="First", description="d"))
+        second = await task_service.create_task(session, user, TaskCreate(title="Second", description="d"))
+
+        with pytest.raises(HTTPException) as exc_info:
+            await task_service.update_task(session, user, second.id, TaskUpdate(title="First"))
+
+        assert exc_info.value.status_code == 409
+        rows = await _outbox_rows_for(session, "task", second.id)
+        assert [r.operation for r in rows] == ["create"]
 
 
 async def test_delete_task_removes_row_and_enqueues_outbox(mock_outbox_dispatch):

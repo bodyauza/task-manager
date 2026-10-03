@@ -13,7 +13,7 @@ from src.realtime import broadcast_task_event
 from src.services import attachments
 from src.task_logic.models import CrmOutbox, Subtask, Task
 from src.task_logic.subtask_schemas import SubtaskCreate, SubtaskResponse, SubtaskUpdate
-from src.crm.outbox_queries import pending_create_event_id
+from src.crm.outbox_queries import ensure_create_event, pending_create_event_id
 from src.tasks.crm_outbox_tasks import dispatch_outbox_row
 from src.tasks.sharding import ensure_task_shard
 
@@ -195,14 +195,16 @@ async def update_subtask(
     for key, value in update_data.items():
         setattr(db_subtask, key, value)
 
-    # Outbox вставляется в той же транзакции, что и UPDATE (как в services/tasks.py::update_task).
-    outbox_row: Optional[CrmOutbox] = None
-    depends_on_id: Optional[int] = None
-    if crm_subtask_id is None:
-        depends_on_id = await pending_create_event_id(db, "subtask", subtask_id)
-    if crm_subtask_id is not None or depends_on_id is not None:
+    # Outbox вставляется в той же транзакции, что и UPDATE (как в services/tasks.py::update_task): без CRM-id строка
+    # зависит от create-события, а при его отсутствии ensure_create_event ставит create. Построение строк внутри try:
+    # autoflush их запросов выполняет UPDATE подзадачи, и нарушение уникальности title должно стать 409.
+    outbox_rows: list[CrmOutbox] = []
+    try:
+        depends_on_id: Optional[int] = None
+        if crm_subtask_id is None:
+            depends_on_id, outbox_rows = await ensure_create_event(db, "subtask", db_subtask)
         db_subtask.sync_status = "pending"
-        outbox_row = CrmOutbox(
+        update_row = CrmOutbox(
             aggregate_type="subtask", aggregate_id=subtask_id, operation="update",
             shard=ensure_task_shard(task),
             depends_on_event_id=depends_on_id,
@@ -213,9 +215,8 @@ async def update_subtask(
                 "completed": update_data.get("completed"),
             },
         )
-        db.add(outbox_row)
-
-    try:
+        db.add(update_row)
+        outbox_rows.append(update_row)
         await db.commit()
     except IntegrityError:
         await db.rollback()
@@ -233,8 +234,8 @@ async def update_subtask(
         # exclude_user_id не передаётся: broadcast идёт всем, включая актора.
     )
 
-    if outbox_row is not None:
-        await dispatch_outbox_row(outbox_row)
+    for row in outbox_rows:
+        await dispatch_outbox_row(row)
 
     result = SubtaskResponse.model_validate(db_subtask)
     return result

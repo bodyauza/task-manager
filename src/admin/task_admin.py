@@ -3,6 +3,8 @@
 Запись через форму sqladmin идёт мимо outbox, WebSocket, файлов и CRM, поэтому:
 - не редактируются crm_*_id, crm_shard, sync_status, specification_path/other_file_paths (показываются ссылками)
   и коллекции subtasks (delete-orphan);
+- can_create = False: созданная в форме сущность не получила бы create-события в outbox и не попала бы в CRM —
+  задачи и подзадачи заводятся только через API (services);
 - can_delete = False: удаление в обход services оставило бы сироту в CRM и файлы на диске;
 - редактируются title/description/completed и связи owner, project_ref, task. Эти правки в CRM и по WebSocket не уйдут.
 """
@@ -23,6 +25,7 @@ class TaskAdmin(ModelView, model=Task):
     name_plural = "Задачи"
     icon = "fa-solid fa-list-check"
 
+    can_create = False
     can_delete = False
 
     column_type_formatters = TYPE_FORMATTERS
@@ -50,6 +53,7 @@ class SubtaskAdmin(ModelView, model=Subtask):
     name_plural = "Подзадачи"
     icon = "fa-solid fa-diagram-successor"
 
+    can_create = False
     can_delete = False
 
     column_type_formatters = TYPE_FORMATTERS

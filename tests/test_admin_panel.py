@@ -91,6 +91,12 @@ async def test_project_and_outbox_read_only(admin_client: AsyncClient):
         assert (await admin_client.delete(f"/admin/{path}/delete?pks=1")).status_code == 403
 
 
+async def test_task_and_subtask_create_disabled_in_admin(admin_client: AsyncClient):
+    """Сущность, заведённая в форме sqladmin, не получила бы create-события в outbox и не попала бы в CRM."""
+    for path in ("task", "subtask"):
+        assert (await admin_client.get(f"/admin/{path}/create")).status_code == 403
+
+
 async def test_task_delete_disabled_and_edit_form_excludes_crm_fields(admin_client: AsyncClient):
     async with async_session_maker() as session:
         session.add(Task(title="t", description="d", owner_id=1, crm_task_id=42, sync_status="synced"))

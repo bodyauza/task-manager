@@ -15,7 +15,7 @@ from src.realtime import broadcast_task_event
 from src.services import attachments
 from src.task_logic.models import CrmOutbox, Project, Subtask, Task
 from src.task_logic.task_schemas import TaskCreate, TaskResponse, TaskUpdate
-from src.crm.outbox_queries import pending_create_event_id
+from src.crm.outbox_queries import ensure_create_event
 from src.tasks.crm_outbox_tasks import dispatch_outbox_row
 from src.tasks.sharding import ensure_task_shard
 
@@ -295,15 +295,17 @@ async def update_task(
     for key, value in update_data.items():
         setattr(db_task, key, value)
 
-    # Outbox — в одной транзакции с UPDATE. Если CRM-id ещё нет, но create не завершён, строка зависит от
-    # этого create (depends_on_event_id), и правка не теряется.
-    outbox_row: Optional[CrmOutbox] = None
-    depends_on_id: Optional[int] = None
-    if crm_task_id is None:
-        depends_on_id = await pending_create_event_id(db, "task", task_id)
-    if crm_task_id is not None or depends_on_id is not None:
+    # Outbox — в одной транзакции с UPDATE. Если CRM-id ещё нет, строка зависит от create-события (depends_on_event_id),
+    # и правка не теряется; create у сущности без CRM-записи и без create-события ставит ensure_create_event.
+    # Построение строк внутри try: autoflush их запросов выполняет UPDATE задачи, и нарушение уникальности title
+    # всплывает здесь, а не на commit — оно должно стать 409, а не 500.
+    outbox_rows: list[CrmOutbox] = []
+    try:
+        depends_on_id: Optional[int] = None
+        if crm_task_id is None:
+            depends_on_id, outbox_rows = await ensure_create_event(db, "task", db_task)
         db_task.sync_status = "pending"
-        outbox_row = CrmOutbox(
+        update_row = CrmOutbox(
             aggregate_type="task",
             aggregate_id=task_id,
             operation="update",
@@ -317,9 +319,8 @@ async def update_task(
                 "project": project_crm_id_for_crm,
             },
         )
-        db.add(outbox_row)
-
-    try:
+        db.add(update_row)
+        outbox_rows.append(update_row)
         await db.commit()
     except IntegrityError:
         await db.rollback()
@@ -329,12 +330,9 @@ async def update_task(
         await db.rollback()
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if outbox_row is not None:
-        # CRM вызывает только воркер; статус синхронизации виден только администратору.
-        await dispatch_outbox_row(outbox_row)
-    else:
-        # Нет crm_task_id и незавершённого create — синхронизировать нечего.
-        logger.warning("Task id=%s has no crm_task_id — CRM update skipped", task_id)
+    # CRM вызывает только воркер; статус синхронизации виден только администратору.
+    for row in outbox_rows:
+        await dispatch_outbox_row(row)
 
     # task_id — для task-detail.js (перечитать задачу при правке другим пользователем).
     # actor_id, а не exclude_user_id: событие персистируется, фронт различает своё/чужое по actor_id.

@@ -5,6 +5,8 @@ function formatError(detail) {
     if (detail === 'EMAIL_ALREADY_REGISTERED') return 'Пользователь с таким email уже зарегистрирован';
     if (detail === 'INVALID_EMAIL') return 'Некорректный формат email';
     if (detail === 'SMTP_ERROR') return 'Ошибка отправки письма. Обратитесь в техподдержку';
+    if (detail === 'RATE_LIMIT_IP') return 'Слишком много запросов с вашего адреса. Попробуйте позже';
+    if (detail === 'RATE_LIMITER_UNAVAILABLE') return 'Регистрация временно недоступна. Попробуйте позже';
     if (detail.startsWith('RATE_LIMIT:')) {
         const sec = detail.split(':')[1];
         return `Подождите ${sec} секунд перед повторной отправкой`;
